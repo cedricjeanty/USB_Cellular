@@ -1,0 +1,29 @@
+# Device Settings
+virtual_disk_path: "/dev/mmcblk0p3"  # DATA partition
+mount_point: "/mnt/usb_logs"
+outbox_dir: "/mnt/usb_logs/.airbridge_outbox"  # On USB partition - survives power cuts
+
+# Serial/Modem Settings
+serial:
+  port: "/dev/ttyAMA0"
+  baudrate: 115200
+  timeout: 1
+
+# Upload Settings
+chunk_size: 512000  # 500KB chunks for modem buffer
+
+# Connectivity
+apn: "hologram"
+upload_url: "http://your-server-ip.com/upload"
+
+# Logic Thresholds
+quiet_window_seconds: 30    # Seconds of inactivity before harvesting
+poll_interval: 30           # How often to check the disk status
+boot_upload_timeout: 180    # Seconds to attempt pending uploads on boot before USB mode
+
+ftp:                                                                                     
+    server: "eu-central-1.sftpcloud.io"                                                              
+    port: 21                                                                               
+    username: "ee150b29745b44ccbed1050d03dfbb81"                                                                  
+    password: "j2xOLhBpftkVhbj2bfq8j8ApC3poSn5o"                                                                  
+    remote_path: "/"  

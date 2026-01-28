@@ -1,0 +1,19 @@
+[Unit]
+Description=USB Cellular Airbridge Service
+After=systemd-modules-load.service
+# Start early - before network, we handle cellular ourselves
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/cedric
+ExecStart=/usr/bin/python3 /home/cedric/main.py
+Restart=always
+RestartSec=10
+
+# Logging to journal (persists in RAM with read-only root)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

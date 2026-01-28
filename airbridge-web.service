@@ -1,0 +1,17 @@
+[Unit]
+Description=Airbridge Status Web Server
+After=network.target airbridge.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/cedric
+ExecStart=/usr/bin/python3 /home/cedric/web_status.py
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
