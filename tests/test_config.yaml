@@ -1,0 +1,179 @@
+# Integration Test Configuration
+# Configuration for testing USB Air Bridge device connected via USB and SSH
+
+# Device Connection Settings
+device:
+  # SSH connection to the Air Bridge device
+  ssh_host: "pizerologs.local"
+  ssh_user: "cedric"
+  ssh_port: 22
+  ssh_timeout: 10
+  
+  # USB device detection (auto-detected if null)
+  usb_device_path: null  # Will auto-detect, or specify like "/dev/sdb1"
+  
+  # Local mount point for USB testing
+  local_mount_point: "/tmp/airbridge_test"
+
+# Test Settings
+test_settings:
+  # Test file generation
+  test_file_count: 3
+  test_file_size: 102400  # 100KB
+  test_file_prefix: "test_log_"
+  
+  # Timing settings
+  quiet_window: 30        # Seconds to wait for file system stability
+  harvest_timeout: 90     # Max seconds to wait for file harvesting
+  upload_timeout: 120     # Max seconds to wait for upload completion
+  
+  # Test data generation
+  generate_realistic_data: true
+  include_timestamps: true
+  include_test_metadata: true
+
+# Expected Device Configuration
+# These values should match the actual device configuration
+expected_device_config:
+  # File paths on device
+  virtual_disk_path: "/dev/mmcblk0p3"  # or "/piusb.bin"
+  mount_point: "/mnt/usb_logs"
+  outbox_dir: "/home/cedric/outbox"
+  
+  # Service configuration
+  service_name: "airbridge.service"
+  service_user: "cedric"
+  
+  # Hardware interfaces
+  uart_device: "/dev/ttyAMA0"
+  udc_path: "/sys/class/udc"
+  
+  # Python environment
+  python_executable: "python3"
+  airbridge_module_path: "src"
+
+# Test Scenarios
+test_scenarios:
+  # Basic connectivity tests
+  basic_tests:
+    - ssh_connectivity
+    - device_info
+    - service_status
+    - hardware_interfaces
+    - filesystem_access
+    - python_environment
+  
+  # Full integration test scenarios
+  integration_tests:
+    - file_transfer_and_harvest
+    - cellular_upload_verification
+    - end_to_end_pipeline
+    - error_recovery
+    - log_analysis
+  
+  # Performance and stress tests
+  stress_tests:
+    - large_file_handling
+    - multiple_file_batches
+    - rapid_file_changes
+    - network_interruption_recovery
+
+# Expected Test Results
+expected_results:
+  # Services that should be active
+  required_services:
+    - "airbridge.service"
+  
+  # Files/directories that should exist
+  required_paths:
+    - "/home/cedric"
+    - "/home/cedric/outbox"
+    - "/mnt/usb_logs"
+    - "/dev/ttyAMA0"
+    - "/sys/class/udc"
+  
+  # Python modules that should be importable
+  required_python_modules:
+    - "yaml"
+    - "serial" 
+    - "subprocess"
+    - "airbridge.main"
+    - "airbridge.modem_handler"
+  
+  # Minimum system resources
+  minimum_requirements:
+    free_disk_mb: 100
+    free_memory_mb: 50
+
+# Test Output Configuration
+output:
+  # Logging settings
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  log_to_file: true
+  log_file_path: "integration_test_results.log"
+  
+  # Result reporting
+  generate_report: true
+  report_format: "text"  # text, json, yaml
+  report_file: "test_results_report.txt"
+  
+  # Cleanup settings
+  cleanup_on_success: true
+  cleanup_on_failure: false
+  preserve_logs: true
+
+# Troubleshooting
+troubleshooting:
+  # Common issues and solutions
+  common_issues:
+    ssh_connection_failed:
+      description: "Cannot connect to device via SSH"
+      solutions:
+        - "Check network connectivity: ping pizerologs.local"
+        - "Verify SSH service is running on device"
+        - "Check SSH key authentication or password"
+        - "Ensure device is powered on and network is configured"
+    
+    usb_device_not_detected:
+      description: "USB Air Bridge device not found"
+      solutions:
+        - "Check USB cable connection"
+        - "Verify device is in USB gadget mode"
+        - "Check dmesg for USB connection events"
+        - "Try disconnecting and reconnecting USB"
+    
+    service_not_running:
+      description: "Airbridge service is not active"
+      solutions:
+        - "Check service status: systemctl status airbridge.service"
+        - "Check service logs: journalctl -u airbridge.service"
+        - "Restart service: sudo systemctl restart airbridge.service"
+        - "Check configuration file: /home/cedric/config.yaml"
+    
+    file_harvest_timeout:
+      description: "Files not harvested within expected time"
+      solutions:
+        - "Check USB gadget state and file modification times"
+        - "Verify quiet window timing in configuration"
+        - "Check for file system errors or locks"
+        - "Monitor airbridge service logs for errors"
+
+# Documentation
+documentation:
+  description: |
+    This configuration file defines settings for integration testing of the USB Air Bridge device.
+    The tests assume the device is physically connected via USB and accessible over SSH at the
+    configured hostname.
+    
+  usage: |
+    Integration tests can be run with:
+      python3 integration_test.py
+      python3 ssh_device_test.py
+    
+    Tests will use this configuration to connect to and test the Air Bridge device.
+    
+  requirements: |
+    - USB Air Bridge device connected via USB
+    - SSH access to device (pizerologs.local)
+    - Sudo privileges on both local machine and device
+    - Python 3 with required packages on both systems
