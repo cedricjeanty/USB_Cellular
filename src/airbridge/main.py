@@ -21,7 +21,7 @@ logging.basicConfig(
 log = logging.getLogger('airbridge')
 
 # Load configuration from absolute path
-CONFIG_PATH = "/home/cedric/config.yaml"
+CONFIG_PATH = "/home/cedric/USBCellular/config.yaml"
 with open(CONFIG_PATH, "r") as ymlfile:
     cfg = yaml.safe_load(ymlfile)
 
