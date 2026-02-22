@@ -23,8 +23,14 @@ logging.basicConfig(
 )
 log = logging.getLogger('airbridge')
 
-# Load configuration from absolute path
-CONFIG_PATH = "/home/cedric/USBCellular/config.yaml"
+# Load configuration – try flat home-dir deployment first, then project tree
+for _p in ("/home/cedric/config.yaml", "/home/cedric/USBCellular/config.yaml"):
+    if os.path.exists(_p):
+        CONFIG_PATH = _p
+        break
+else:
+    raise FileNotFoundError("config.yaml not found in ~ or project tree")
+
 with open(CONFIG_PATH, "r") as ymlfile:
     cfg = yaml.safe_load(ymlfile)
 
@@ -50,23 +56,21 @@ def _refresh_display():
 
 
 def _poll_modem_signal():
-    """Update CSQ and carrier in _ds if the modem is already open."""
-    global modem
-    if modem is None:
-        return
+    """Update CSQ and carrier in _ds. Initialises modem serial port if needed."""
     try:
-        ok, resp = modem.send_at('AT+CSQ', timeout=3)
+        m = get_modem()
+        ok, resp = m.send_at('AT+CSQ', timeout=3)
         if ok:
-            m = re.search(r'\+CSQ: ?(\d+)', resp)
-            if m:
-                _ds['csq'] = int(m.group(1))
-        ok, resp = modem.send_at('AT+COPS?', timeout=3)
+            hit = re.search(r'\+CSQ: ?(\d+)', resp)
+            if hit:
+                _ds['csq'] = int(hit.group(1))
+        ok, resp = m.send_at('AT+COPS?', timeout=3)
         if ok:
-            m = re.search(r'\+COPS: \d+,\d+,"([^"]+)"', resp)
-            if m:
-                _ds['carrier'] = m.group(1)
-    except Exception:
-        pass
+            hit = re.search(r'\+COPS: \d+,\d+,"([^"]+)"', resp)
+            if hit:
+                _ds['carrier'] = hit.group(1)
+    except Exception as exc:
+        log.debug(f"Signal poll failed: {exc}")
 
 
 # ── Modem ─────────────────────────────────────────────────────────────────────
@@ -497,6 +501,7 @@ def main():
 
             # Update display every poll cycle
             _ds['usb_active'] = (udc_state == "configured")
+            _poll_modem_signal()
             _refresh_display()
 
             time.sleep(cfg['poll_interval'])

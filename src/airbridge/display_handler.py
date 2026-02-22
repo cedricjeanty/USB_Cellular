@@ -497,11 +497,11 @@ class AirbridgeDisplay:
         # ── Page 0: status bar ────────────────────────────────────────────────
         oled.fill_page(0, 0x00)
 
-        # Left: carrier name (when connected) or "NO SIGNAL"
-        if net_connected and carrier:
+        # Left: carrier name when registered, "NO SIGNAL" when not
+        if carrier:
             left_label = carrier[:8]
-        elif net_connected:
-            left_label = "ONLINE"
+        elif _csq_to_bars(csq) > 0:
+            left_label = "SIGNAL"
         else:
             left_label = "NO SIGNAL"
         oled.text(_CARRIER_X, 0, left_label)
