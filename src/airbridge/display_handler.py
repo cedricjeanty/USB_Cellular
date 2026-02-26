@@ -1,19 +1,19 @@
 """
 display_handler.py - SSD1306 128×64 OLED status display for USB Cellular Airbridge.
 
-Dependencies: python3-smbus only (no Pillow / luma.oled needed).
+Dependencies: python3-smbus or smbus2 (no Pillow / luma.oled needed).
 I2C bus 1, address 0x3C.
 
 Display layout (8 pages × 8 px = 64 px):
 
-  Page 0 │ T-Mobile ████      ▐▐▐░ 85% │  carrier + signal bars / battery
-  Page 1 │─────────────────────────────│  1-px divider then spacer
-  Page 2 │                             │  ╮
-  Page 3 │        USB ACTIVE           │  ╯ 2× tall text (16 px)
-  Page 4 │                             │  spacer
-  Page 5 │ [==========-]  73%          │  pixel progress bar
-  Page 6 │  12.3 MB / 45.7 MB         │  size text
-  Page 7 │                             │  blank
+  Page 0 │ T-Mobile Hologram  ▐▐▐░ │  carrier (≤18 chars) + signal bars flush-right
+  Page 1 │                         │  blank spacer
+  Page 2 │ ╮ USB ACTIVE            │  2× tall text
+  Page 3 │ ╯                       │
+  Page 4 │ USB [==========] 14.2MB │  drive capacity bar
+  Page 5 │                         │  blank spacer
+  Page 6 │ UP0.4MB[======]  R0.0MB │  upload progress (always shown, rem flush-right)
+  Page 7 │                         │  blank
 """
 
 import logging
@@ -177,7 +177,11 @@ class SSD1306:
     """Minimal SSD1306 OLED driver. Uses only python3-smbus."""
 
     def __init__(self, bus=I2C_BUS, addr=OLED_ADDR):
-        import smbus  # Pi-only; deferred so pure helpers are importable anywhere
+        try:
+            import smbus  # python3-smbus
+        except ImportError:
+            import smbus2 as smbus  # fallback (Pi has smbus2 installed)
+        # Pi-only; deferred so pure helpers are importable anywhere
         self._bus  = smbus.SMBus(bus)
         self._addr = addr
         self._buf  = bytearray(COLS * PAGES)  # 1 KB frame-buffer
@@ -341,29 +345,6 @@ def _draw_signal_bars(oled, page, x, csq):
                 oled._buf[idx] = val
 
 
-def _draw_battery(oled, page, x, pct):
-    """
-    Draw a 12 px wide horizontal battery icon at (x, page).
-    Body height: bits 1-6 (6 px, 1 px margins top/bottom).
-    Structure: [left-cap | 8 interior cols | right-cap | nub nub]
-    """
-    fill = round(max(0, min(100, pct)) / 100 * 8)
-    FULL_COL  = 0x7E   # bits 1-6
-    EMPTY_COL = 0x42   # bits 1 and 6 (border only)
-    NUB_COL   = 0x18   # bits 3-4 (centre 2 px)
-
-    cols = (
-        [FULL_COL] +
-        [FULL_COL if i < fill else EMPTY_COL for i in range(8)] +
-        [FULL_COL, NUB_COL, NUB_COL]
-    )  # 12 bytes total
-
-    base = page * COLS + x
-    for k, val in enumerate(cols):
-        idx = base + k
-        if idx < len(oled._buf):
-            oled._buf[idx] = val
-
 
 def _draw_progress_bar(oled, page, x, width, pct):
     """
@@ -398,16 +379,14 @@ def _draw_progress_bar(oled, page, x, width, pct):
 # ─── High-level Airbridge display ─────────────────────────────────────────────
 
 # Pixel positions on the header row (page 0, 128 px wide)
-_CARRIER_X  =  0    # carrier text: up to 8 chars (48 px)
-_BARS_X     = 50    # signal bars: 4 bars × 4 px = 16 px (ends at 66)
-_BAT_X      = 90    # battery icon: 12 px wide (ends at 102)
-_BATPCT_X   = 104   # battery % text: 4 chars × 6 px = 24 px → ends at x=128
+_CARRIER_X  =  0    # carrier text: up to 18 chars (108 px)
+_BARS_X     = 113   # signal bars flush-right: 4 bars × 4 px, last pixel at col 127
 
-# Progress bar geometry (page 5)
-_PBAR_X     =  0
-_PBAR_W     = 102   # 100 interior + 2 end caps (ends at 102)
-_PCT_X      = 104   # percentage text: 4 chars → ends at x=128
-_SIZE_ROW   =  6    # page for "X.X MB / Y.Y MB" text
+# USB capacity bar geometry (page 3)
+_USB_LABEL_X =  0   # "USB" label
+_USB_BAR_X   = 20   # bar starts 2 px after label (3 chars × 6 px + 2)
+
+# Upload progress bar geometry (page 5) — widths computed dynamically in _refresh
 
 
 class AirbridgeDisplay:
@@ -446,7 +425,8 @@ class AirbridgeDisplay:
                usb_active=False,
                mb_uploaded=0.0,
                mb_remaining=0.0,
-               battery_pct=None):
+               drive_mb=0.0,
+               drive_total_mb=0.0):
         """
         Refresh the full display with current system state.
 
@@ -457,13 +437,14 @@ class AirbridgeDisplay:
             usb_active    : True when g_mass_storage gadget is loaded
             mb_uploaded   : Megabytes uploaded this session
             mb_remaining  : Megabytes queued in outbox
-            battery_pct   : 0–100 integer, or None if hardware not fitted
+            drive_mb      : Estimated MB written to virtual disk since last harvest
+            drive_total_mb: Total capacity of virtual disk in MB (0 = unknown)
         """
         if not self._ok():
             return
         try:
             self._refresh(csq, carrier, net_connected, usb_active,
-                          mb_uploaded, mb_remaining, battery_pct)
+                          mb_uploaded, mb_remaining, drive_mb, drive_total_mb)
         except Exception as exc:
             log.warning(f"OLED update error: {exc}")
 
@@ -491,32 +472,26 @@ class AirbridgeDisplay:
     # ── Rendering ──────────────────────────────────────────────────────────────
 
     def _refresh(self, csq, carrier, net_connected, usb_active,
-                 mb_uploaded, mb_remaining, battery_pct):
+                 mb_uploaded, mb_remaining, drive_mb, drive_total_mb):
         oled = self._oled
 
         # ── Page 0: status bar ────────────────────────────────────────────────
         oled.fill_page(0, 0x00)
 
-        # Left: carrier name when registered, "NO SIGNAL" when not
+        # Carrier name / signal status — up to 18 chars before bars
         if carrier:
-            left_label = carrier[:8]
+            left_label = carrier[:18]
         elif _csq_to_bars(csq) > 0:
             left_label = "SIGNAL"
         else:
             left_label = "NO SIGNAL"
         oled.text(_CARRIER_X, 0, left_label)
 
-        # Signal bars (always drawn; empty bars show when no signal)
+        # Signal bars flush to right edge (cols 113–127)
         _draw_signal_bars(oled, 0, _BARS_X, csq)
 
-        # Right: battery icon + percentage (omit if no hardware)
-        if battery_pct is not None:
-            _draw_battery(oled, 0, _BAT_X, battery_pct)
-            oled.text(_BATPCT_X, 0, f"{battery_pct:3d}%")
-
-        # ── Page 1: thin divider line, rest spacer ────────────────────────────
+        # ── Page 1: blank spacer ─────────────────────────────────────────────
         oled.fill_page(1, 0x00)
-        oled.hline(1, bit_row=0)   # single pixel at very top of page 1
 
         # ── Pages 2-3: USB status at 2× scale ────────────────────────────────
         oled.fill_page(2, 0x00)
@@ -524,24 +499,43 @@ class AirbridgeDisplay:
         usb_label = "USB ACTIVE" if usb_active else "USB  IDLE"
         oled.text_2x_centered(2, usb_label)
 
-        # ── Page 4: spacer ────────────────────────────────────────────────────
+        # ── Pages 4-5: USB drive capacity bar ────────────────────────────────
+        # Page 5 is cleared first; overflow from the 3-px downward nudge is
+        # OR'd into it so the bottom of the bar isn't clipped.
         oled.fill_page(4, 0x00)
-
-        # ── Page 5: progress bar + percentage ─────────────────────────────────
         oled.fill_page(5, 0x00)
-        total_mb = mb_uploaded + mb_remaining
-        pct = (mb_uploaded / total_mb * 100) if total_mb > 0 else 0
-        _draw_progress_bar(oled, 5, _PBAR_X, _PBAR_W, pct)
-        oled.text(_PCT_X, 5, f"{pct:3.0f}%")
+        if usb_active or drive_mb > 0.0:
+            oled.text(_USB_LABEL_X, 4, "USB")
+            size_s = _fmt_size(drive_mb) if drive_mb > 0.0 else "--"
+            size_w = len(size_s) * CELL_W
+            size_x = COLS - size_w          # flush-right
+            bar_w  = size_x - 2 - _USB_BAR_X
+            if drive_total_mb > 0.0 and bar_w >= 4:
+                drive_pct = min(100.0, drive_mb / drive_total_mb * 100.0)
+                _draw_progress_bar(oled, 4, _USB_BAR_X, bar_w, drive_pct)
+            oled.text(size_x, 4, size_s)
+            # Nudge content down 3 pixels; carry overflow into the blank page 5.
+            for _c in range(COLS):
+                _orig = oled._buf[4 * COLS + _c]
+                oled._buf[4 * COLS + _c] = (_orig << 3) & 0xFF
+                oled._buf[5 * COLS + _c] |= (_orig >> 5) & 0xFF
 
-        # ── Page 6: size text ─────────────────────────────────────────────────
+        # ── Page 6: upload progress — always rendered ─────────────────────────
+        # "UP0.4MB[======]  R0.0MB" — remaining is flush-right; bar fills the gap.
         oled.fill_page(6, 0x00)
-        size_str = f"{_fmt_size(mb_uploaded)} / {_fmt_size(mb_remaining)}"
-        # centre the text
-        x = max(0, (COLS - len(size_str) * CELL_W) // 2)
-        oled.text(x, 6, size_str)
+        total_mb = mb_uploaded + mb_remaining
+        pct   = (mb_uploaded / total_mb * 100) if total_mb > 0 else 0.0
+        up_s  = "UP" + _fmt_size(mb_uploaded)
+        rem_s = "R"  + _fmt_size(mb_remaining)
+        bar_x = len(up_s) * CELL_W + 2     # 2 px gap after up text
+        rem_x = COLS - len(rem_s) * CELL_W # flush-right
+        bar_w = rem_x - 2 - bar_x          # 2 px gap before rem text
+        oled.text(0,     6, up_s)
+        if bar_w >= 4:
+            _draw_progress_bar(oled, 6, bar_x, bar_w, pct)
+        oled.text(rem_x, 6, rem_s)
 
-        # ── Page 7: blank ─────────────────────────────────────────────────────
+        # ── Page 7: blank ────────────────────────────────────────────────────
         oled.fill_page(7, 0x00)
 
         oled.flush()
@@ -564,21 +558,30 @@ if __name__ == "__main__":
     time.sleep(2)
 
     scenarios = [
+        # Idle — no signal, nothing uploaded, nothing queued
         dict(csq=99,  carrier="",         net_connected=False, usb_active=False,
-             mb_uploaded=0,    mb_remaining=0,    battery_pct=None),
+             mb_uploaded=0,    mb_remaining=0,    drive_mb=0.0,  drive_total_mb=0.0),
+        # USB active, files queued but upload not started yet
         dict(csq=8,   carrier="T-Mobile", net_connected=False, usb_active=True,
-             mb_uploaded=0,    mb_remaining=50.0, battery_pct=82),
+             mb_uploaded=0,    mb_remaining=50.0, drive_mb=14.2, drive_total_mb=256.0),
+        # Uploading: 12.3 of 50 MB done (25%)
         dict(csq=14,  carrier="T-Mobile", net_connected=True,  usb_active=True,
-             mb_uploaded=12.3, mb_remaining=37.7, battery_pct=81),
+             mb_uploaded=12.3, mb_remaining=37.7, drive_mb=8.5,  drive_total_mb=256.0),
+        # Uploading: 40.1 of 50 MB done (80%)
         dict(csq=22,  carrier="T-Mobile", net_connected=True,  usb_active=False,
-             mb_uploaded=40.1, mb_remaining=9.9,  battery_pct=78),
+             mb_uploaded=40.1, mb_remaining=9.9,  drive_mb=0.0,  drive_total_mb=256.0),
+        # Upload complete: 50 MB done, 0 remaining (100%)
         dict(csq=31,  carrier="T-Mobile", net_connected=True,  usb_active=False,
-             mb_uploaded=50.0, mb_remaining=0,    battery_pct=75),
+             mb_uploaded=50.0, mb_remaining=0,    drive_mb=0.0,  drive_total_mb=256.0),
+        # Small file scenario: 52 KB uploaded, full carrier name shown
+        dict(csq=19,  carrier="T-Mobile Hologram", net_connected=False, usb_active=True,
+             mb_uploaded=0.052, mb_remaining=0,   drive_mb=53.7, drive_total_mb=256.0),
     ]
 
     for s in scenarios:
         print(f"  csq={s['csq']:2d}  net={s['net_connected']}  usb={s['usb_active']}  "
-              f"up={s['mb_uploaded']:.1f}MB  left={s['mb_remaining']:.1f}MB")
+              f"up={s['mb_uploaded']:.1f}MB  left={s['mb_remaining']:.1f}MB  "
+              f"drive={s['drive_mb']:.1f}MB")
         disp.update(**s)
         time.sleep(2)
 

@@ -53,10 +53,16 @@ class SIM7000GHandler:
         """Configures the APN and brings up the wireless connection."""
         print("Setting up cellular network...")
 
-        # Check modem is responsive
+        # Check modem is responsive; try ATZ reset if not
         ok, _ = self.send_at("AT", timeout=2)
         if not ok:
-            return False, "Modem not responding"
+            print("Modem unresponsive, attempting ATZ reset...")
+            self.ser.reset_input_buffer()
+            self.ser.write(b"ATZ\r\n")
+            time.sleep(2)
+            ok, _ = self.send_at("AT", timeout=3)
+            if not ok:
+                return False, "Modem not responding"
 
         # Check signal strength
         self.send_at("AT+CSQ")
@@ -134,7 +140,7 @@ class SIM7000GHandler:
             pass
 
     def upload_ftp(self, server, port, username, password, filepath, remote_path="/",
-                   max_retries=3, retry_delay=5):
+                   max_retries=3, retry_delay=5, progress_callback=None):
         """
         Upload a file via FTP with retry and resume capability.
 
@@ -214,6 +220,8 @@ class SIM7000GHandler:
                     if rssi < 5 and rssi != 99:
                         print(f"Warning: Low signal (CSQ={rssi})")
                     last_signal_check = time.time()
+                    if progress_callback:
+                        progress_callback(bytes_sent, filesize, csq=rssi)
 
                 chunk = f.read(max_chunk)
                 if not chunk:
@@ -258,6 +266,8 @@ class SIM7000GHandler:
                 bytes_sent += chunk_len
                 pct = int(100 * bytes_sent / filesize)
                 print(f"Progress: {bytes_sent}/{filesize} bytes ({pct}%)")
+                if progress_callback:
+                    progress_callback(bytes_sent, filesize)
 
                 # Save progress periodically (every ~500KB)
                 if bytes_sent % (500 * 1024) < max_chunk:
@@ -276,6 +286,36 @@ class SIM7000GHandler:
         else:
             self.save_progress(filepath, bytes_sent)
             return False, f"Upload may have failed: {resp}"
+
+    def ftp_file_exists(self, server, port, username, password, filename, remote_path="/"):
+        """
+        Check whether a file already exists on the FTP server using AT+FTPSIZE.
+        Returns True (exists), False (does not exist), or None (check failed /
+        command not supported — caller should treat as unknown and upload anyway).
+        """
+        self.send_at('AT+FTPCID=1')
+        self.send_at(f'AT+FTPSERV="{server}"')
+        self.send_at(f'AT+FTPPORT={port}')
+        self.send_at('AT+FTPMODE=1')
+        self.send_at(f'AT+FTPUN="{username}"')
+        self.send_at(f'AT+FTPPW="{password}"')
+        self.send_at(f'AT+FTPGETNAME="{filename}"')
+        self.send_at(f'AT+FTPGETPATH="{remote_path}"')
+
+        self.ser.reset_input_buffer()
+        self.ser.write(b'AT+FTPSIZE\r\n')
+        print("> AT+FTPSIZE")
+        ok, resp = self.wait_for_response('+FTPSIZE:', timeout=30)
+        if not ok:
+            return None  # Command not supported or timed out
+
+        # +FTPSIZE: <err>,<size>  — err=0 means file found
+        try:
+            after = resp.split('+FTPSIZE:')[-1].strip()
+            err_code = int(after.split(',')[0].strip())
+            return err_code == 0
+        except Exception:
+            return None
 
     def close_bearer(self):
         """Close the GPRS bearer."""

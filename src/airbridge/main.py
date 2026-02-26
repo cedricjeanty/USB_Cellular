@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
 USB Cellular Airbridge - Main Service
-Monitors USB drive for new files, harvests them, uploads via cellular FTP.
+
+USB gadget stays up continuously; harvesting (brief USB takedown) runs only when
+the quiet-window expires, then the gadget comes straight back up.  A background
+daemon thread handles all cellular uploads independently so USB access is never
+blocked by modem operations.
 """
 
 import os
@@ -9,8 +13,10 @@ import re
 import sys
 import time
 import yaml
+import shutil
+import struct
+import threading
 import subprocess
-import zipfile
 import logging
 
 from display_handler import AirbridgeDisplay
@@ -39,7 +45,16 @@ with open(CONFIG_PATH, "r") as ymlfile:
 modem   = None   # lazy-initialised on first use
 display = None   # initialised in main()
 
-# Current display state – updated throughout the state machine
+# Prevents concurrent USB gadget/disk access (main thread harvest only).
+_harvest_lock = threading.Lock()
+
+# Prevents concurrent serial port access between the main thread signal poll
+# and the upload worker's modem operations.  Signal poll uses non-blocking
+# tryacquire — it simply skips the cycle if the upload worker holds the port.
+_modem_lock = threading.Lock()
+
+# Current display state – written by main thread and upload_worker (GIL-safe
+# for individual key assignments).  Only the main thread calls _refresh_display.
 _ds = dict(
     csq=99,
     carrier="",
@@ -47,7 +62,13 @@ _ds = dict(
     usb_active=False,
     mb_uploaded=0.0,
     mb_remaining=0.0,
+    drive_mb=0.0,       # estimated MB on virtual disk since last harvest
+    drive_total_mb=0.0, # total capacity of virtual disk (0 = unknown)
 )
+
+# Filenames successfully uploaded this process lifetime — avoids FTP re-upload
+# without needing a slow AT+FTPSIZE round-trip.  Cleared on service restart.
+_uploaded_this_session: set = set()
 
 
 def _refresh_display():
@@ -56,7 +77,10 @@ def _refresh_display():
 
 
 def _poll_modem_signal():
-    """Update CSQ and carrier in _ds. Initialises modem serial port if needed."""
+    """Update CSQ and carrier in _ds. Skips silently if upload worker owns port."""
+    if not _modem_lock.acquire(blocking=False):
+        log.debug("Signal poll skipped — modem busy")
+        return
     try:
         m = get_modem()
         ok, resp = m.send_at('AT+CSQ', timeout=3)
@@ -69,8 +93,11 @@ def _poll_modem_signal():
             hit = re.search(r'\+COPS: \d+,\d+,"([^"]+)"', resp)
             if hit:
                 _ds['carrier'] = hit.group(1)
+        log.info(f"Signal: CSQ={_ds['csq']} carrier='{_ds['carrier']}'")
     except Exception as exc:
-        log.debug(f"Signal poll failed: {exc}")
+        log.warning(f"Signal poll failed: {exc}")
+    finally:
+        _modem_lock.release()
 
 
 # ── Modem ─────────────────────────────────────────────────────────────────────
@@ -101,6 +128,58 @@ def get_udc_state():
     except Exception as e:
         log.warning(f"Could not read UDC state: {e}")
     return "unknown"
+
+
+def get_fat32_disk_info():
+    """
+    Read FAT32 boot sector and FSInfo to determine used and total space.
+    Safe while the USB gadget is active — read-only access to the raw device.
+
+    Returns (used_mb, total_mb) as floats.
+    Returns (-1.0, -1.0) if the read fails or FSInfo is stale/unavailable.
+    """
+    device = cfg['virtual_disk_path']
+    try:
+        with open(device, 'rb') as f:
+            boot = f.read(512)
+            if len(boot) < 512:
+                return -1.0, -1.0
+
+            bps  = struct.unpack_from('<H', boot, 11)[0]  # bytes per sector
+            spc  = struct.unpack_from('<B', boot, 13)[0]  # sectors per cluster
+            rsvd = struct.unpack_from('<H', boot, 14)[0]  # reserved sectors
+            nfat = struct.unpack_from('<B', boot, 16)[0]  # number of FATs
+            tot  = struct.unpack_from('<I', boot, 32)[0]  # total sectors
+            fsz  = struct.unpack_from('<I', boot, 36)[0]  # FAT size in sectors
+            fsi  = struct.unpack_from('<H', boot, 48)[0]  # FSInfo sector number
+
+            if bps == 0 or spc == 0 or tot == 0:
+                return -1.0, -1.0
+
+            f.seek(fsi * bps)
+            info = f.read(512)
+            if len(info) < 512:
+                return -1.0, -1.0
+
+            # Validate FSInfo signatures
+            if (struct.unpack_from('<I', info,   0)[0] != 0x41615252 or
+                struct.unpack_from('<I', info, 484)[0] != 0x61417272):
+                return -1.0, -1.0
+
+            free_clusters = struct.unpack_from('<I', info, 488)[0]
+            if free_clusters == 0xFFFFFFFF:
+                return -1.0, -1.0  # host hasn't written FSInfo yet
+
+            data_start     = rsvd + nfat * fsz
+            total_clusters = (tot - data_start) // spc
+            used_clusters  = max(0, total_clusters - free_clusters)
+            used_mb        = used_clusters  * spc * bps / 1e6
+            total_mb       = total_clusters * spc * bps / 1e6
+            return used_mb, total_mb
+
+    except Exception as exc:
+        log.debug(f"FAT32 disk info read failed: {exc}")
+        return -1.0, -1.0
 
 
 def get_disk_write_sectors():
@@ -173,7 +252,6 @@ def load_usb_gadget():
     if result.returncode == 0:
         log.info("USB gadget loaded successfully")
         _ds['usb_active'] = True
-        _refresh_display()
         return True
     else:
         log.error(f"Failed to load USB gadget: {result.stderr.decode()}")
@@ -186,211 +264,178 @@ def unload_usb_gadget():
     _ds['usb_active'] = False
 
 
-# ── Core phases ───────────────────────────────────────────────────────────────
+# ── Harvest phase (main thread only) ─────────────────────────────────────────
 
-def harvest_and_upload():
+def harvest_to_outbox():
     """
-    Upload files from USB via cellular, delete only after confirmed upload.
+    Briefly take down the USB gadget, mount the disk, move new files to
+    the outbox, then restore the gadget.  The upload_worker will pick up
+    outbox files independently.
 
-    Key safety: Original files stay on USB until FTP confirms success.
+    Safety: acquires _harvest_lock so no concurrent USB access occurs.
     """
-    log.info("Starting upload cycle...")
-
-    disk_path   = cfg['virtual_disk_path']
+    outbox_dir  = cfg['outbox_dir']
     mount_point = cfg['mount_point']
 
-    # 1. Unload USB gadget
-    log.info("Unloading USB gadget...")
-    unload_usb_gadget()
-    _refresh_display()
-    time.sleep(1)
+    os.makedirs(outbox_dir, exist_ok=True)
 
-    # 2. Mount locally
-    if not mount_usb_disk():
-        log.error("Cannot mount disk, re-enabling gadget")
-        load_usb_gadget()
-        return False
+    with _harvest_lock:
+        log.info("Harvest: unloading USB gadget...")
+        unload_usb_gadget()
+        _ds['usb_active'] = False
+        time.sleep(1)
 
-    # 3. Scan for files to upload
-    files_to_upload = []
-    for root, dirs, files in os.walk(mount_point):
-        dirs[:] = [d for d in dirs if not d.startswith('.')]
-        for file in files:
-            if file.startswith('.') or file in ('desktop.ini', 'Thumbs.db'):
-                continue
-            filepath = os.path.join(root, file)
-            size = os.path.getsize(filepath)
-            log.info(f"  Found: {file} ({size} bytes)")
-            files_to_upload.append(filepath)
+        if not mount_usb_disk():
+            log.error("Harvest: cannot mount disk — restoring gadget")
+            load_usb_gadget()
+            return
 
-    if not files_to_upload:
-        log.info("No files to upload")
+        copied = 0
+        skipped = 0
+        for root, dirs, files in os.walk(mount_point):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            for fname in files:
+                if fname.startswith('.') or fname in ('desktop.ini', 'Thumbs.db'):
+                    continue
+                src  = os.path.join(root, fname)
+                dest = os.path.join(outbox_dir, fname)
+                if os.path.exists(dest):
+                    log.debug(f"Harvest: {fname} already pending, skipping")
+                    skipped += 1
+                    continue
+                try:
+                    shutil.copy2(src, dest)
+                    log.info(f"Harvest: copied {fname} → outbox")
+                    copied += 1
+                except Exception as exc:
+                    log.error(f"Harvest: failed to copy {fname}: {exc}")
+
+        os.sync()
         unmount_usb_disk()
+        log.info(f"Harvest complete: {copied} copied, {skipped} already pending")
+
+        # Update outbox total for the display
+        _ds['mb_remaining'] = _outbox_total_mb()
+
         load_usb_gadget()
-        return True
-
-    # Track upload progress for the display
-    total_bytes = sum(os.path.getsize(f) for f in files_to_upload)
-    _ds['mb_remaining'] = total_bytes / 1e6
-    _ds['mb_uploaded']  = 0.0
-    _refresh_display()
-
-    # 4. Setup cellular network
-    log.info(f"Uploading {len(files_to_upload)} file(s)...")
-    ftp_cfg = cfg['ftp']
-    m = get_modem()
-
-    ok, msg = m.setup_network(apn=cfg['modem']['apn'])
-    if not ok:
-        log.error(f"Network setup failed: {msg}")
-        log.warning("Files remain on USB, will retry next cycle")
-        unmount_usb_disk()
-        load_usb_gadget()
-        return False
-
-    _ds['net_connected'] = True
-    _poll_modem_signal()
-    _refresh_display()
-
-    # 5. Upload each file, delete only on success
-    uploaded_count = 0
-    failed_count   = 0
-
-    for filepath in files_to_upload:
-        filename  = os.path.basename(filepath)
-        file_size = os.path.getsize(filepath)
-        log.info(f"Uploading {filename}...")
-
-        ok, msg = m.upload_ftp(
-            server=ftp_cfg['server'],
-            port=ftp_cfg['port'],
-            username=ftp_cfg['username'],
-            password=ftp_cfg['password'],
-            filepath=filepath,
-            remote_path=ftp_cfg['remote_path'],
-        )
-
-        if ok:
-            log.info(f"Upload successful, removing {filename}")
-            os.remove(filepath)
-            os.sync()
-            uploaded_count       += 1
-            _ds['mb_uploaded']   += file_size / 1e6
-            _ds['mb_remaining']  -= file_size / 1e6
-            _ds['mb_remaining']   = max(0.0, _ds['mb_remaining'])
-        else:
-            log.error(f"Upload FAILED for {filename}: {msg}")
-            log.warning("  -> File remains on USB drive")
-            failed_count += 1
-
-        _refresh_display()
-
-    # 6. Close bearer
-    m.close_bearer()
-    _ds['net_connected'] = False
-
-    # 7. Unmount and re-enable gadget
-    if failed_count == 0:
-        log.info(f"All {uploaded_count} file(s) uploaded successfully.")
-    else:
-        log.error(f"Upload complete: {uploaded_count} succeeded, {failed_count} FAILED")
-
-    log.info("Re-enabling USB gadget...")
-    unmount_usb_disk()
-    load_usb_gadget()
-
-    return failed_count == 0
+        _ds['usb_active'] = True
 
 
-def startup_upload_phase():
+# ── Upload worker (background daemon thread) ──────────────────────────────────
+
+def _outbox_total_mb():
+    """Return the total size of files in the outbox in MB."""
+    outbox_dir = cfg['outbox_dir']
+    if not os.path.isdir(outbox_dir):
+        return 0.0
+    total = sum(
+        os.path.getsize(os.path.join(outbox_dir, f))
+        for f in os.listdir(outbox_dir)
+        if os.path.isfile(os.path.join(outbox_dir, f))
+    )
+    return total / 1e6
+
+
+def upload_worker():
     """
-    Boot-time phase: attempt to upload any pending files before enabling USB gadget.
-    Returns True if we should proceed to USB mode, False to retry.
+    Daemon thread: monitors the outbox and uploads files via cellular FTP.
+    Never touches the USB gadget or virtual disk.
     """
-    upload_timeout = cfg.get('boot_upload_timeout', 180)
-    outbox_dir     = cfg['outbox_dir']
+    outbox_dir = cfg['outbox_dir']
+    ftp_cfg    = cfg['ftp']
+    check_interval = cfg.get('upload_check_interval', 300)
 
-    log.info("Mounting disk to check for pending uploads...")
-    if not mount_usb_disk():
-        log.error("Cannot mount disk during boot phase")
-        return True
+    while True:
+        try:
+            os.makedirs(outbox_dir, exist_ok=True)
+            pending = sorted(
+                os.path.join(outbox_dir, f)
+                for f in os.listdir(outbox_dir)
+                if os.path.isfile(os.path.join(outbox_dir, f))
+            )
 
-    pending = []
-    if os.path.exists(outbox_dir):
-        pending = [os.path.join(outbox_dir, f) for f in os.listdir(outbox_dir)
-                   if f.endswith(('.zip', '.gz'))]
+            if pending:
+                log.info(f"Upload worker: {len(pending)} file(s) to upload")
+                # Update display immediately so the queue is visible during network setup
+                _ds['mb_remaining'] = _outbox_total_mb()
+                network_ok = False
+                with _modem_lock:
+                    m = get_modem()
+                    ok, msg = m.setup_network(apn=cfg['modem']['apn'])
+                    if not ok:
+                        log.warning(f"Upload worker: network setup failed: {msg}. Retrying later.")
+                    else:
+                        network_ok = True
+                        _ds['net_connected'] = True
 
-    if not pending:
-        log.info("No pending uploads found")
-        unmount_usb_disk()
-        return True
+                if not network_ok:
+                    time.sleep(check_interval)
+                    continue
 
-    log.info(f"Found {len(pending)} pending upload(s)")
-    for f in pending:
-        log.info(f"  - {os.path.basename(f)} ({os.path.getsize(f)} bytes)")
+                with _modem_lock:
 
-    total_bytes = sum(os.path.getsize(f) for f in pending if os.path.exists(f))
-    _ds['mb_remaining'] = total_bytes / 1e6
-    _ds['mb_uploaded']  = 0.0
-    _refresh_display()
+                    # Initial signal read now that we own the modem
+                    ok2, csq = m.check_signal()
+                    if ok2:
+                        _ds['csq'] = csq
 
-    log.info(f"Attempting cellular upload (timeout: {upload_timeout}s)...")
-    start_time = time.time()
-    m = get_modem()
+                    for filepath in pending:
+                        if not os.path.exists(filepath):
+                            continue
+                        fname     = os.path.basename(filepath)
+                        file_size = os.path.getsize(filepath)
 
-    log.info("Connecting to cellular network...")
-    ok, msg = m.setup_network(apn=cfg['modem']['apn'])
+                        # Skip files already uploaded this session (avoids costly
+                        # AT+FTPSIZE round-trip which can leave modem in bad state)
+                        if fname in _uploaded_this_session:
+                            log.info(f"Upload worker: {fname} already uploaded, removing from outbox")
+                            os.remove(filepath)
+                            os.sync()
+                            _ds['mb_remaining'] = _outbox_total_mb()
+                            continue
 
-    if not ok:
-        elapsed = time.time() - start_time
-        if elapsed < upload_timeout:
-            log.warning(f"Network setup failed: {msg}")
-            log.info(f"Will retry... ({int(upload_timeout - elapsed)}s remaining)")
-            return False
-        else:
-            log.warning(f"Network timeout after {upload_timeout}s. Proceeding to USB mode.")
-            unmount_usb_disk()
-            return True
+                        # Progress callback: update display as chunks land
+                        _pre_upload_mb = _ds['mb_uploaded']
+                        def _on_progress(sent, total, csq=None, _pre=_pre_upload_mb, _fsz=file_size):
+                            _ds['mb_uploaded']  = _pre + sent / 1e6
+                            # outbox still contains this file during upload; subtract
+                            # bytes already sent to avoid double-counting
+                            _ds['mb_remaining'] = max(0.0, _outbox_total_mb() - sent / 1e6)
+                            if csq is not None:
+                                _ds['csq'] = csq
 
-    _ds['net_connected'] = True
-    _poll_modem_signal()
-    _refresh_display()
+                        log.info(f"Upload worker: uploading {fname}...")
+                        ok, msg = m.upload_ftp(
+                            server=ftp_cfg['server'],
+                            port=ftp_cfg['port'],
+                            username=ftp_cfg['username'],
+                            password=ftp_cfg['password'],
+                            filepath=filepath,
+                            remote_path=ftp_cfg['remote_path'],
+                            progress_callback=_on_progress,
+                        )
 
-    ftp_cfg = cfg['ftp']
-    for filepath in pending:
-        if time.time() - start_time > upload_timeout:
-            log.warning("Upload timeout reached. Remaining files will wait.")
-            break
-        if not os.path.exists(filepath):
-            continue
+                        if ok:
+                            log.info(f"Upload worker: {fname} uploaded OK, removing from outbox")
+                            _uploaded_this_session.add(fname)
+                            os.remove(filepath)
+                            os.sync()
+                            _ds['mb_uploaded']  = _pre_upload_mb + file_size / 1e6
+                            _ds['mb_remaining'] = _outbox_total_mb()
+                        else:
+                            log.error(f"Upload worker: {fname} FAILED: {msg}")
 
-        file_size = os.path.getsize(filepath)
-        log.info(f"Uploading {os.path.basename(filepath)}...")
-        ok, msg = m.upload_ftp(
-            server=ftp_cfg['server'],
-            port=ftp_cfg['port'],
-            username=ftp_cfg['username'],
-            password=ftp_cfg['password'],
-            filepath=filepath,
-            remote_path=ftp_cfg['remote_path'],
-        )
+                    m.close_bearer()
+                    _ds['net_connected'] = False
 
-        if ok:
-            log.info(f"Upload successful. Removing {os.path.basename(filepath)}")
-            os.remove(filepath)
-            os.sync()
-            _ds['mb_uploaded']  += file_size / 1e6
-            _ds['mb_remaining'] -= file_size / 1e6
-            _ds['mb_remaining']  = max(0.0, _ds['mb_remaining'])
-        else:
-            log.error(f"Upload failed: {msg}")
+            else:
+                log.debug("Upload worker: outbox empty, sleeping")
 
-        _refresh_display()
+        except Exception as exc:
+            log.error(f"Upload worker error: {exc}")
+            _ds['net_connected'] = False
 
-    m.close_bearer()
-    _ds['net_connected'] = False
-    unmount_usb_disk()
-    return True
+        time.sleep(check_interval)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -404,38 +449,20 @@ def main():
     log.info(f"Virtual disk: {cfg['virtual_disk_path']}")
     log.info(f"FTP server: {cfg['ftp']['server']}")
     log.info(f"Quiet window: {cfg['quiet_window_seconds']}s")
-    log.info(f"Poll interval: {cfg['poll_interval']}s")
 
     # Initialise display (silent if hardware not present)
     display = AirbridgeDisplay()
     display.show_message("Airbridge", "Starting...", "")
 
-    # Ensure USB gadget is not loaded during startup
+    # Ensure USB gadget is not loaded while we set up
     unload_usb_gadget()
 
-    # === BOOT PHASE: upload any pending files first ===
-    log.info("-" * 40)
-    log.info("BOOT PHASE: Checking for pending uploads...")
-    log.info("-" * 40)
-    display.show_message("Boot phase", "Checking", "outbox...")
+    # Start the upload worker as a daemon so it exits with the main process
+    t = threading.Thread(target=upload_worker, name="upload-worker", daemon=True)
+    t.start()
+    log.info("Upload worker thread started")
 
-    boot_timeout = cfg.get('boot_upload_timeout', 180)
-    boot_start   = time.time()
-
-    while time.time() - boot_start < boot_timeout:
-        if startup_upload_phase():
-            break
-        time.sleep(10)
-
-    _ds['net_connected'] = False
-    _ds['mb_uploaded']   = 0.0
-    _ds['mb_remaining']  = 0.0
-
-    # === USB PHASE: enable gadget and monitor ===
-    log.info("-" * 40)
-    log.info("USB PHASE: Enabling USB mass storage...")
-    log.info("-" * 40)
-
+    # Enable USB gadget
     if not load_usb_gadget():
         log.error("Failed to load USB gadget. Exiting.")
         display.show_message("ERROR", "Gadget load", "failed")
@@ -445,18 +472,34 @@ def main():
     last_seen_sectors  = baseline_sectors
     last_write_time    = None
     host_was_connected = False
+    _signal_tick       = 0   # poll modem signal every 6 cycles (30 s)
 
     log.info("Monitoring for file writes...")
     log.info(f"(Will harvest {cfg['quiet_window_seconds']}s after last write activity)")
 
     while True:
         try:
-            udc_state      = get_udc_state()
+            udc_state       = get_udc_state()
             current_sectors = get_disk_write_sectors()
+
+            # ── Signal poll (every 30 s, non-blocking relative to upload thread) ─
+            _signal_tick += 1
+            if _signal_tick >= 6:
+                _signal_tick = 0
+                _poll_modem_signal()
+
+            # ── Live drive size (FAT32 used + total, falls back to sector delta) ─
+            fat_used, fat_total = get_fat32_disk_info()
+            if fat_used >= 0.0:
+                _ds['drive_mb'] = fat_used
+            elif current_sectors >= 0 and baseline_sectors >= 0:
+                _ds['drive_mb'] = max(
+                    0.0, (current_sectors - baseline_sectors) * 512 / 1e6)
+            _ds['drive_total_mb'] = fat_total if fat_total >= 0.0 else 0.0
 
             if udc_state == "configured":
                 if not host_was_connected:
-                    log.info("Host connected. Waiting for file writes...")
+                    log.info("Host connected — monitoring writes...")
                     host_was_connected = True
                     baseline_sectors   = current_sectors
                     last_seen_sectors  = current_sectors
@@ -473,38 +516,27 @@ def main():
                     quiet_elapsed = time.time() - last_write_time
                     if quiet_elapsed >= cfg['quiet_window_seconds']:
                         total_written = (current_sectors - baseline_sectors) * 512
-                        log.info(f"Quiet window elapsed. "
-                                 f"{total_written} bytes written this session.")
-                        log.info("Starting harvest cycle...")
-
-                        harvest_and_upload()
-
-                        # Reset tracking for next session
+                        log.info(f"Quiet window elapsed "
+                                 f"({total_written} bytes written). Harvesting...")
+                        harvest_to_outbox()
+                        # Reset write tracking (drive size stays — files remain on disk)
                         baseline_sectors   = get_disk_write_sectors()
                         last_seen_sectors  = baseline_sectors
                         last_write_time    = None
                         host_was_connected = False
-                        _ds['mb_uploaded']  = 0.0
-                        _ds['mb_remaining'] = 0.0
 
             else:
-                if host_was_connected:
-                    log.info(f"Host disconnected (state: {udc_state})")
-                    if last_write_time is not None:
-                        total_written = (last_seen_sectors - baseline_sectors) * 512
-                        log.info(f"Harvesting {total_written} bytes on disconnect...")
-                        harvest_and_upload()
-                        _ds['mb_uploaded']  = 0.0
-                        _ds['mb_remaining'] = 0.0
-                    last_write_time = None
+                # Host disconnected — harvest if there was pending write activity
+                if host_was_connected and last_write_time is not None:
+                    total_written = (last_seen_sectors - baseline_sectors) * 512
+                    log.info(f"Host disconnected; harvesting {total_written} bytes...")
+                    harvest_to_outbox()
                 host_was_connected = False
+                last_write_time    = None
 
-            # Update display every poll cycle
             _ds['usb_active'] = (udc_state == "configured")
-            _poll_modem_signal()
             _refresh_display()
-
-            time.sleep(cfg['poll_interval'])
+            time.sleep(5)   # tight poll for responsive drive_mb updates
 
         except KeyboardInterrupt:
             log.info("Shutting down...")
