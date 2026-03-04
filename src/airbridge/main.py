@@ -7,8 +7,9 @@ the quiet-window expires, then the gadget comes straight back up.  A background
 daemon thread handles all WiFi uploads independently so USB access is never
 blocked by network operations.
 
-If no WiFi is available and files are pending, a captive portal AP is started
-so the user can provision credentials via phone.
+If WiFi is lost, a 60 s grace period is observed before the captive portal AP
+starts.  While in AP mode the service periodically retries known saved networks;
+once any connection is available the AP is torn down automatically.
 """
 
 import os
@@ -64,6 +65,7 @@ _ds = dict(
     mb_remaining=0.0,
     drive_mb=0.0,       # estimated MB on virtual disk since last harvest
     drive_total_mb=0.0, # total capacity of virtual disk (0 = unknown)
+    ap_mode=False,      # True while captive portal AP is running
 )
 
 # Filenames successfully uploaded this process lifetime — avoids FTP re-upload.
@@ -73,7 +75,7 @@ _uploaded_this_session: set = set()
 
 def _refresh_display():
     if display is not None:
-        display.update(**_ds)
+        display.update(**{k: v for k, v in _ds.items() if k != 'ap_mode'})
 
 
 def _poll_wifi_status():
@@ -81,12 +83,14 @@ def _poll_wifi_status():
     try:
         from wifi_manager import get_wifi_info, rssi_to_csq, is_connected
         rssi, ssid = get_wifi_info()
-        _ds['csq']           = rssi_to_csq(rssi)
-        _ds['net_connected'] = is_connected()
-        if ssid:
-            _ds['carrier'] = ssid
-        elif not _ds['net_connected']:
-            _ds['carrier'] = "No WiFi"
+        _ds['csq'] = rssi_to_csq(rssi)
+        # upload_worker is authoritative for carrier/net_connected while AP is up
+        if not _ds.get('ap_mode'):
+            _ds['net_connected'] = is_connected()
+            if ssid:
+                _ds['carrier'] = ssid
+            elif not _ds['net_connected']:
+                _ds['carrier'] = "No WiFi"
         log.info(f"WiFi: CSQ={_ds['csq']} SSID='{_ds['carrier']}' connected={_ds['net_connected']}")
     except Exception as exc:
         log.warning(f"WiFi status poll failed: {exc}")
@@ -333,7 +337,14 @@ def upload_worker():
         ssid=cfg.get('wifi_ap', {}).get('ssid', 'AirBridge'),
         channel=cfg.get('wifi_ap', {}).get('channel', 6),
     )
-    portal_active = False
+    portal_active   = False
+    disconnect_time = None   # time.time() when WiFi was first lost; None = connected
+    last_sta_retry  = 0.0    # timestamp of last known-network retry from AP mode
+
+    AP_GRACE_PERIOD = 60     # s disconnected before starting AP
+    STA_RETRY_IN_AP = 300    # s between known-network retries while in AP
+    ADD_NET_WAIT    = 15     # s to wait for NM after add_network()
+    WIFI_POLL       = 15     # s between checks when disconnected
 
     while True:
         try:
@@ -347,42 +358,79 @@ def upload_worker():
             # ── WiFi / portal state machine ───────────────────────────────
             connected = is_connected()
 
-            if not connected:
-                # No WiFi — ensure captive portal AP is up
-                if not portal_active:
-                    log.info("No WiFi — starting captive portal AP")
-                    try:
-                        portal.start()
-                        portal_active = True
-                        _ds['carrier'] = "AirBridge"
-                    except Exception as exc:
-                        log.error(f"Portal start failed: {exc}")
-
+            if connected:
+                if disconnect_time is not None:
+                    log.info("WiFi connected")
+                    disconnect_time = None
+                    _ds['carrier'] = ""
                 if portal_active:
-                    creds = portal.wait_for_credentials(timeout=check_interval)
-                    if creds:
-                        ssid, pwd = creds
-                        log.info(f"Portal: tearing down AP, then connecting to '{ssid}'")
-                        # Stop portal FIRST (restores wlan0 to STA mode),
-                        # then connect to the new network
-                        try:
-                            portal.stop()
-                        except Exception as exc:
-                            log.warning(f"Portal stop error: {exc}")
-                        portal_active = False
-                        portal.credentials = None
-                        time.sleep(5)
-                        add_network(ssid, pwd)
-                        time.sleep(10)  # wait for NM to connect
-            else:
-                # WiFi up — stop portal if it was running
-                if portal_active:
+                    log.info("WiFi up — stopping captive portal AP")
                     try:
                         portal.stop()
                     except Exception as exc:
                         log.warning(f"Portal stop error: {exc}")
                     portal_active = False
                     portal.credentials = None
+                    _ds['ap_mode'] = False
+            else:
+                now = time.time()
+                if disconnect_time is None:
+                    disconnect_time = now
+                    log.info(f"WiFi lost — AP mode in {AP_GRACE_PERIOD}s if not reconnected")
+
+                if now - disconnect_time >= AP_GRACE_PERIOD:
+                    if not portal_active:
+                        log.info(f"No WiFi for {now - disconnect_time:.0f}s — starting captive portal AP")
+                        try:
+                            portal.start()
+                            portal_active = True
+                            last_sta_retry = now
+                            _ds['ap_mode'] = True
+                            _ds['carrier'] = cfg.get('wifi_ap', {}).get('ssid', 'AirBridge')
+                        except Exception as exc:
+                            log.error(f"Portal start failed: {exc}")
+
+                    if portal_active:
+                        if portal.credentials is not None:
+                            ssid, pwd = portal.credentials
+                            log.info(f"Portal: got credentials for '{ssid}' — trying STA")
+                            try:
+                                portal.stop()
+                            except Exception as exc:
+                                log.warning(f"Portal stop error: {exc}")
+                            portal_active = False
+                            portal.credentials = None
+                            _ds['ap_mode'] = False
+                            time.sleep(2)
+                            add_network(ssid, pwd)
+                            deadline = time.time() + ADD_NET_WAIT
+                            while time.time() < deadline:
+                                time.sleep(1)
+                                if is_connected():
+                                    log.info(f"Connected to '{ssid}'")
+                                    disconnect_time = None
+                                    break
+                            else:
+                                log.warning(f"Could not connect to '{ssid}' — back to AP mode")
+                                disconnect_time = time.time() - AP_GRACE_PERIOD
+
+                        elif now - last_sta_retry >= STA_RETRY_IN_AP:
+                            log.info("AP mode: trying known WiFi networks...")
+                            try:
+                                portal.stop()
+                            except Exception as exc:
+                                log.warning(f"Portal stop error: {exc}")
+                            portal_active = False
+                            _ds['ap_mode'] = False
+                            last_sta_retry = time.time()
+                            if is_connected():
+                                log.info("Reconnected to known network — staying in STA mode")
+                                disconnect_time = None
+                            else:
+                                log.info("No known network available — returning to AP mode")
+                                disconnect_time = time.time() - AP_GRACE_PERIOD
+
+            _ds['net_connected'] = connected
 
             # ── Upload pending files ──────────────────────────────────────────
             if pending:
@@ -392,8 +440,6 @@ def upload_worker():
                 if not connected:
                     log.info("Upload worker: no WiFi, skipping upload this cycle")
                 else:
-                    _ds['net_connected'] = True
-
                     for filepath in pending:
                         if not os.path.exists(filepath):
                             continue
@@ -446,17 +492,15 @@ def upload_worker():
                         else:
                             log.error(f"Upload worker: {fname} FAILED: {msg}")
 
-                    _ds['net_connected'] = False
-
             else:
                 log.debug("Upload worker: outbox empty, sleeping")
 
         except Exception as exc:
             log.error(f"Upload worker error: {exc}")
-            _ds['net_connected'] = False
 
-        # Wait for the next scheduled check OR an immediate trigger from harvest.
-        _upload_trigger.wait(timeout=check_interval)
+        # Faster polling while disconnected; normal interval when connected.
+        poll = WIFI_POLL if (disconnect_time is not None) else check_interval
+        _upload_trigger.wait(timeout=poll)
         _upload_trigger.clear()
 
 
@@ -524,8 +568,8 @@ def main():
     _wifi_tick         = 0   # poll WiFi status every 30 cycles (30 s)
 
     # State for responsive drive-size display.
-    _last_fat_mb      = 0.0
-    _last_fat_sectors = -1
+    _last_fat_mb      = -1.0  # last FAT-confirmed used_mb; -1 = never read
+    _last_fat_sectors = -1    # sectors at time of last FAT baseline
     _fat_at_connect_mb = -1.0
 
     log.info("Monitoring for file writes...")
@@ -543,16 +587,23 @@ def main():
                 _poll_wifi_status()
 
             # ── Live drive size ────────────────────────────────────────────────
+            # Host OS flushes FAT32 FSInfo lazily (~30-60 s dirty writeback).
+            # Anchor the sector baseline ONLY when FAT reports a new value so the
+            # sector-delta accumulates correctly between host flushes.
             fat_used, fat_total = get_fat32_disk_info()
             if fat_used >= 0.0:
-                _last_fat_mb      = fat_used
-                _last_fat_sectors = current_sectors
-                _ds['drive_mb']   = fat_used
-            elif _last_fat_sectors >= 0 and current_sectors >= 0:
-                extra_mb = max(0.0, (current_sectors - _last_fat_sectors) * 512 / 1e6)
-                _last_fat_mb     += extra_mb
-                _last_fat_sectors = current_sectors
-                _ds['drive_mb']   = _last_fat_mb
+                if fat_used != _last_fat_mb:
+                    # Host flushed FSInfo — reset baseline to current position.
+                    _last_fat_mb      = fat_used
+                    _last_fat_sectors = current_sectors
+                # Show FAT value + any writes not yet reflected in FSInfo.
+                if _last_fat_sectors >= 0 and current_sectors > _last_fat_sectors:
+                    _ds['drive_mb'] = _last_fat_mb + (current_sectors - _last_fat_sectors) * 512 / 1e6
+                else:
+                    _ds['drive_mb'] = _last_fat_mb
+            elif _last_fat_sectors >= 0 and current_sectors >= 0 and _last_fat_mb >= 0:
+                # FAT unreadable but we have a previous baseline — keep accumulating.
+                _ds['drive_mb'] = _last_fat_mb + max(0.0, (current_sectors - _last_fat_sectors) * 512 / 1e6)
             elif current_sectors >= 0 and baseline_sectors >= 0:
                 _ds['drive_mb'] = max(0.0, (current_sectors - baseline_sectors) * 512 / 1e6)
             _ds['drive_total_mb'] = fat_total if fat_total >= 0.0 else 0.0
