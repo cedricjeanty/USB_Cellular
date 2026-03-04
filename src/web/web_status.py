@@ -100,7 +100,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <h1>Airbridge Status</h1>
-    <p class="subtitle">USB Cellular Data Bridge</p>
+    <p class="subtitle">USB WiFi Data Bridge</p>
 
     <div class="card">
         <h2>System Status</h2>
@@ -151,7 +151,7 @@ HTML_TEMPLATE = """
     </div>
 
     <div class="card">
-        <h2>Cellular</h2>
+        <h2>WiFi</h2>
         <div class="status-grid">
             <div class="status-item">
                 <div class="label">Signal (CSQ)</div>
@@ -160,14 +160,14 @@ HTML_TEMPLATE = """
                 </div>
             </div>
             <div class="status-item">
-                <div class="label">Network</div>
-                <div class="value {{ 'status-ok' if status.registered else 'status-err' }}">
-                    {{ 'Registered' if status.registered else 'Not registered' }}
-                </div>
+                <div class="label">SSID</div>
+                <div class="value" style="font-size: 14px;">{{ status.ssid or 'Not connected' }}</div>
             </div>
             <div class="status-item">
-                <div class="label">IP Address</div>
-                <div class="value" style="font-size: 14px;">{{ status.ip or 'None' }}</div>
+                <div class="label">Connected</div>
+                <div class="value {{ 'status-ok' if status.net_connected else 'status-err' }}">
+                    {{ 'Yes' if status.net_connected else 'No' }}
+                </div>
             </div>
         </div>
     </div>
@@ -277,56 +277,21 @@ def get_cpu_temp():
     except:
         return 0
 
-def get_cellular_status():
-    """Get cellular modem status via AT commands."""
-    import serial
-    import yaml
-
+def get_wifi_status():
+    """Get WiFi status via wifi_manager."""
+    import sys
+    sys.path.insert(0, '/home/cedric')
     signal = 99
-    registered = False
-    ip = None
-
+    ssid = ''
+    connected = False
     try:
-        with open('/home/cedric/config.yaml', 'r') as f:
-            cfg = yaml.safe_load(f)
-
-        ser = serial.Serial(cfg['serial']['port'], cfg['serial']['baudrate'], timeout=1)
-
-        # Check signal
-        ser.write(b"AT+CSQ\r\n")
-        import time
-        time.sleep(0.5)
-        resp = ser.read(ser.in_waiting).decode(errors='ignore')
-        if "+CSQ:" in resp:
-            try:
-                signal = int(resp.split(":")[1].split(",")[0].strip())
-            except:
-                pass
-
-        # Check registration
-        ser.write(b"AT+CREG?\r\n")
-        time.sleep(0.5)
-        resp = ser.read(ser.in_waiting).decode(errors='ignore')
-        if "+CREG:" in resp:
-            registered = ",1" in resp or ",5" in resp
-
-        # Check IP
-        ser.write(b"AT+SAPBR=2,1\r\n")
-        time.sleep(0.5)
-        resp = ser.read(ser.in_waiting).decode(errors='ignore')
-        if "+SAPBR:" in resp and '"' in resp:
-            try:
-                ip = resp.split('"')[1]
-                if ip == "0.0.0.0":
-                    ip = None
-            except:
-                pass
-
-        ser.close()
-    except Exception as e:
+        from wifi_manager import get_wifi_info, rssi_to_csq, is_connected
+        rssi, ssid = get_wifi_info()
+        signal = rssi_to_csq(rssi)
+        connected = is_connected()
+    except Exception:
         pass
-
-    return signal, registered, ip
+    return signal, ssid, connected
 
 # Track previous disk stats for activity detection
 _last_disk_stats = {'writes': 0, 'timestamp': 0}
@@ -483,7 +448,7 @@ def get_logs(n=50):
 @app.route('/')
 def index():
     """Main status page."""
-    signal, registered, ip = get_cellular_status()
+    signal, ssid, net_connected = get_wifi_status()
 
     status = {
         'service_active': get_service_status(),
@@ -492,8 +457,8 @@ def index():
         'uptime': get_uptime(),
         'cpu_temp': get_cpu_temp(),
         'signal': signal,
-        'registered': registered,
-        'ip': ip,
+        'ssid': ssid,
+        'net_connected': net_connected,
         'pending_count': get_pending_uploads(),
         'upload_progress': get_upload_progress(),
         'timestamp': datetime.now().strftime('%H:%M:%S')
@@ -506,7 +471,7 @@ def index():
 @app.route('/api/status')
 def api_status():
     """JSON API for status."""
-    signal, registered, ip = get_cellular_status()
+    signal, ssid, net_connected = get_wifi_status()
 
     return jsonify({
         'service_active': get_service_status(),
@@ -515,8 +480,8 @@ def api_status():
         'uptime': get_uptime(),
         'cpu_temp': get_cpu_temp(),
         'signal': signal,
-        'registered': registered,
-        'ip': ip,
+        'ssid': ssid,
+        'net_connected': net_connected,
         'pending_count': get_pending_uploads(),
         'upload_progress': get_upload_progress(),
         'timestamp': datetime.now().isoformat()

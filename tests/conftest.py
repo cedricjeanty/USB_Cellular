@@ -4,7 +4,7 @@ conftest.py – shared fixtures and auto-skip logic for the Airbridge test suite
 Mark summary
 ────────────
   hardware    SSH to the Pi to test peripherals.   Enable: --pi-host USER@HOST
-  cellular    Needs an active SIM / data bearer.    Enable: --cellular
+  cellular    Requires WiFi network connection.     Enable: --cellular
   disruptive  Briefly unloads the USB gadget.       Enable: --disruptive
   usb_cable   Pi connected via USB to this host.    Enable: --usb-device /dev/sdX
   slow        Takes > 30 s.
@@ -14,7 +14,7 @@ Example runs
   pytest                                         # unit tests only
   pytest --pi-host cedric@pizerologs.local       # + all hardware tests
   pytest --pi-host ... --disruptive              # + gadget/mount tests
-  pytest --pi-host ... --cellular                # + modem/FTP tests
+  pytest --pi-host ... --cellular                # + WiFi upload tests
   pytest --pi-host ... --usb-device /dev/sdb     # + USB-cable write test
 """
 
@@ -37,7 +37,7 @@ def pytest_addoption(parser):
     )
     parser.addoption(
         "--cellular", action="store_true", default=False,
-        help="Enable cellular/modem tests (requires active SIM)",
+        help="Enable WiFi upload tests (requires network connection)",
     )
     parser.addoption(
         "--disruptive", action="store_true", default=False,
@@ -74,7 +74,7 @@ def pytest_collection_modifyitems(config, items):
 # ── SSH helper ────────────────────────────────────────────────────────────────
 
 class SSHRunner:
-    """Thin SSH wrapper used by hardware/modem/USB tests."""
+    """Thin SSH wrapper used by hardware/WiFi/USB tests."""
 
     def __init__(self, host: str):
         self.host = host
@@ -101,6 +101,13 @@ class SSHRunner:
     def python(self, code: str, timeout: int = 30) -> subprocess.CompletedProcess:
         """Run a Python snippet on the Pi via ``python3 -c``."""
         return self.check(f"python3 -c {code!r}", timeout=timeout)
+
+    def script(self, code: str, timeout: int = 30) -> subprocess.CompletedProcess:
+        """Run a multiline Python script on the Pi by piping it to python3 stdin."""
+        return subprocess.run(
+            self._base + ["python3 -"],
+            input=code, capture_output=True, text=True, timeout=timeout,
+        )
 
 
 # ── Session-scoped fixtures ───────────────────────────────────────────────────

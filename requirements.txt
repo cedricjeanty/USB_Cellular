@@ -1,3 +1,2 @@
-pyserial>=3.4
 PyYAML>=5.4.1
 flask>=2.0.1

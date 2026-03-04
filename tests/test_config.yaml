@@ -45,7 +45,6 @@ expected_device_config:
   service_user: "cedric"
   
   # Hardware interfaces
-  uart_device: "/dev/ttyAMA0"
   udc_path: "/sys/class/udc"
   
   # Python environment
@@ -66,7 +65,7 @@ test_scenarios:
   # Full integration test scenarios
   integration_tests:
     - file_transfer_and_harvest
-    - cellular_upload_verification
+    - wifi_upload_verification
     - end_to_end_pipeline
     - error_recovery
     - log_analysis
@@ -89,16 +88,14 @@ expected_results:
     - "/home/cedric"
     - "/home/cedric/outbox"
     - "/mnt/usb_logs"
-    - "/dev/ttyAMA0"
     - "/sys/class/udc"
-  
+
   # Python modules that should be importable
   required_python_modules:
     - "yaml"
-    - "serial" 
     - "subprocess"
     - "airbridge.main"
-    - "airbridge.modem_handler"
+    - "airbridge.wifi_manager"
   
   # Minimum system resources
   minimum_requirements:

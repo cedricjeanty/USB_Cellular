@@ -1,5 +1,5 @@
 """
-display_handler.py - SSD1306 128×64 OLED status display for USB Cellular Airbridge.
+display_handler.py - SSD1306 128×64 OLED status display for USB Airbridge.
 
 Dependencies: python3-smbus or smbus2 (no Pillow / luma.oled needed).
 I2C bus 1, address 0x3C.
@@ -300,7 +300,7 @@ class SSD1306:
 # ─── Helper functions ──────────────────────────────────────────────────────────
 
 def _csq_to_bars(csq):
-    """Map AT+CSQ value (0-31, 99=unknown) to 0-4 signal bars."""
+    """Map CSQ value (0–31; 99=unknown) to 0–4 signal bars."""
     if csq < 0 or csq == 99: return 0
     if csq < 5:               return 0
     if csq < 10:              return 1
@@ -431,9 +431,9 @@ class AirbridgeDisplay:
         Refresh the full display with current system state.
 
         Args:
-            csq           : SIM7000G AT+CSQ value (0–31; 99 = no signal)
-            carrier       : Operator name string from AT+COPS? (e.g. "T-Mobile")
-            net_connected : True when a cellular data bearer is active
+            csq           : Signal quality (0–31; 99 = unknown)
+            carrier       : Network name or WiFi SSID
+            net_connected : True when WiFi is connected
             usb_active    : True when g_mass_storage gadget is loaded
             mb_uploaded   : Megabytes uploaded this session
             mb_remaining  : Megabytes queued in outbox
@@ -520,20 +520,21 @@ class AirbridgeDisplay:
                 oled._buf[4 * COLS + _c] = (_orig << 3) & 0xFF
                 oled._buf[5 * COLS + _c] |= (_orig >> 5) & 0xFF
 
-        # ── Page 6: upload progress — always rendered ─────────────────────────
+        # ── Page 6: upload progress — only shown when there is something to do ──
         # "UP0.4MB[======]  R0.0MB" — remaining is flush-right; bar fills the gap.
         oled.fill_page(6, 0x00)
-        total_mb = mb_uploaded + mb_remaining
-        pct   = (mb_uploaded / total_mb * 100) if total_mb > 0 else 0.0
-        up_s  = "UP" + _fmt_size(mb_uploaded)
-        rem_s = "R"  + _fmt_size(mb_remaining)
-        bar_x = len(up_s) * CELL_W + 2     # 2 px gap after up text
-        rem_x = COLS - len(rem_s) * CELL_W # flush-right
-        bar_w = rem_x - 2 - bar_x          # 2 px gap before rem text
-        oled.text(0,     6, up_s)
-        if bar_w >= 4:
-            _draw_progress_bar(oled, 6, bar_x, bar_w, pct)
-        oled.text(rem_x, 6, rem_s)
+        if mb_uploaded > 0.0 or mb_remaining > 0.0:
+            total_mb = mb_uploaded + mb_remaining
+            pct   = (mb_uploaded / total_mb * 100) if total_mb > 0 else 0.0
+            up_s  = "UP" + _fmt_size(mb_uploaded)
+            rem_s = "R"  + _fmt_size(mb_remaining)
+            bar_x = len(up_s) * CELL_W + 2     # 2 px gap after up text
+            rem_x = COLS - len(rem_s) * CELL_W # flush-right
+            bar_w = rem_x - 2 - bar_x          # 2 px gap before rem text
+            oled.text(0,     6, up_s)
+            if bar_w >= 4:
+                _draw_progress_bar(oled, 6, bar_x, bar_w, pct)
+            oled.text(rem_x, 6, rem_s)
 
         # ── Page 7: blank ────────────────────────────────────────────────────
         oled.fill_page(7, 0x00)

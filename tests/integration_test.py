@@ -192,28 +192,29 @@ Test Data:
         return False
         
     def verify_file_upload(self):
-        """Verify that files were uploaded via cellular connection."""
+        """Verify that files were uploaded via WiFi connection."""
         print("Verifying file upload...")
-        
+
         try:
-            # Check modem connectivity
-            result = self.run_remote_cmd("python3 -c \"from airbridge.modem_handler import SIM7000GHandler; m=SIM7000GHandler('/dev/ttyAMA0',115200,1); print('Signal:', m.check_signal())\"")
-            print("✓ Cellular modem responsive")
-            
+            # Check WiFi connectivity
+            result = self.run_remote_cmd(
+                "python3 -c \"from wifi_manager import is_connected; print('Connected:', is_connected())\"",
+                check=False,
+            )
+            print(f"✓ WiFi status: {result.stdout.strip()}")
+
             # Check if outbox is empty (files uploaded and deleted)
             result = self.run_remote_cmd("ls /home/cedric/outbox/ 2>/dev/null | wc -l")
             remaining_files = int(result.stdout.strip())
-            
+
             if remaining_files == 0:
                 print("✓ Outbox is empty - files likely uploaded successfully")
                 return True
             else:
                 print(f"⚠ {remaining_files} files remain in outbox - upload may have failed")
-                
-                # Show what's left
                 self.run_remote_cmd("ls -la /home/cedric/outbox/")
                 return False
-                
+
         except Exception as e:
             print(f"Upload verification failed: {e}")
             return False

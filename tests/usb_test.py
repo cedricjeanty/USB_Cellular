@@ -2,7 +2,6 @@ import os
 import time
 import subprocess
 import yaml
-from modem_handler import SIM7000GHandler
 
 # Load configuration from shared config file
 with open("config.yaml", "r") as ymlfile:
@@ -11,10 +10,6 @@ with open("config.yaml", "r") as ymlfile:
 DISK_IMAGE = cfg['virtual_disk_path']
 MOUNT_POINT = cfg['mount_point']
 QUIET_WINDOW = cfg.get('quiet_window_seconds', 30)
-
-# FTP config
-FTP_CONFIG = cfg.get('ftp', {})
-ENABLE_FTP = bool(FTP_CONFIG.get('server'))
 
 def run_cmd(cmd, check=True):
     """Run a shell command and return output."""
@@ -144,58 +139,6 @@ def list_files():
     return file_list
 
 
-def upload_files_via_ftp(file_list):
-    """Upload files via FTP over cellular and delete after success."""
-    if not ENABLE_FTP:
-        print("FTP not configured, skipping upload")
-        return
-
-    if not file_list:
-        print("No files to upload")
-        return
-
-    print("\n=== Starting FTP Upload via Cellular ===")
-
-    # Initialize modem
-    modem = SIM7000GHandler(
-        port=cfg['serial']['port'],
-        baudrate=cfg['serial']['baudrate'],
-        timeout=cfg['serial']['timeout'],
-        chunk_size=cfg.get('chunk_size', 512000)
-    )
-
-    # Setup network
-    ok, msg = modem.setup_network(apn=cfg.get('apn', 'hologram'))
-    if not ok:
-        print(f"Failed to setup network: {msg}")
-        return
-
-    # Upload each file
-    ftp = FTP_CONFIG
-    uploaded = []
-    for filepath in file_list:
-        ok, msg = modem.upload_ftp(
-            server=ftp['server'],
-            port=ftp.get('port', 21),
-            username=ftp['username'],
-            password=ftp['password'],
-            filepath=filepath,
-            remote_path=ftp.get('remote_path', '/')
-        )
-        if ok:
-            uploaded.append(filepath)
-            print(f"Deleting {os.path.basename(filepath)} after successful upload")
-            os.remove(filepath)
-            os.sync()
-        else:
-            print(f"Failed to upload {filepath}: {msg}")
-
-    # Cleanup
-    modem.close_bearer()
-
-    print(f"\n=== Upload Summary: {len(uploaded)}/{len(file_list)} files ===")
-    return uploaded
-
 def monitor_transfers():
     """Monitor for file transfers and detect quiet periods."""
     print(f"\nMonitoring for file transfers (quiet window: {QUIET_WINDOW}s)...")
@@ -261,11 +204,8 @@ def main():
                 print("Failed to mount disk image")
                 return
 
-            # List and upload files
-            file_list = list_files()
-
-            if ENABLE_FTP and file_list:
-                upload_files_via_ftp(file_list)
+            # List files
+            list_files()
 
             unmount_disk_image()
 

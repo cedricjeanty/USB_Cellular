@@ -26,7 +26,7 @@ def test_i2c_bus_exists(ssh):
 @pytest.mark.hardware
 def test_ssd1306_responds_on_i2c(ssh):
     r = ssh.python(
-        "import smbus; b = smbus.SMBus(1); b.read_byte(0x3C); b.close(); print('ok')"
+        "import smbus2; b = smbus2.SMBus(1); b.read_byte(0x3C); b.close(); print('ok')"
     )
     assert "ok" in r.stdout, "SSD1306 did not ACK at 0x3C – check wiring (SDA→GPIO2, SCL→GPIO3)"
 
@@ -40,21 +40,21 @@ def test_display_handler_importable(ssh):
     assert "ok" in r.stdout, f"display_handler import failed:\n{r.stderr}"
 
 
-# ── UART / Modem ──────────────────────────────────────────────────────────────
+# ── WiFi ──────────────────────────────────────────────────────────────────────
 
 @pytest.mark.hardware
-def test_uart_device_exists(ssh):
-    r = ssh.run("test -c /dev/ttyAMA0 && echo yes")
-    assert "yes" in r.stdout, "/dev/ttyAMA0 not found – check enable_uart=1 in config.txt"
+def test_wlan0_exists(ssh):
+    r = ssh.run("test -d /sys/class/net/wlan0 && echo yes")
+    assert "yes" in r.stdout, "/sys/class/net/wlan0 not found – WiFi interface missing"
 
 
 @pytest.mark.hardware
-def test_modem_handler_importable(ssh):
+def test_wifi_manager_importable(ssh):
     r = ssh.run(
         "python3 -c 'import sys; sys.path.insert(0,\"/home/cedric\"); "
-        "from modem_handler import SIM7000GHandler; print(\"ok\")'"
+        "from wifi_manager import is_connected, get_wifi_info, rssi_to_csq; print(\"ok\")'"
     )
-    assert "ok" in r.stdout, f"modem_handler import failed:\n{r.stderr}"
+    assert "ok" in r.stdout, f"wifi_manager import failed:\n{r.stderr}"
 
 
 # ── USB gadget / UDC ──────────────────────────────────────────────────────────
@@ -118,7 +118,7 @@ def test_free_disk_above_10mb(ssh):
 # ── Python environment on Pi ─────────────────────────────────────────────────
 
 @pytest.mark.hardware
-@pytest.mark.parametrize("pkg", ["serial", "yaml", "smbus"])
+@pytest.mark.parametrize("pkg", ["yaml", "smbus2"])
 def test_python_package_on_pi(ssh, pkg):
     r = ssh.python(f"import {pkg}; print('ok')")
     assert "ok" in r.stdout, f"{pkg} not importable on Pi"
@@ -129,7 +129,6 @@ def test_python_package_on_pi(ssh, pkg):
 @pytest.mark.hardware
 def test_airbridge_service_enabled(ssh):
     r = ssh.run("systemctl is-enabled airbridge.service 2>/dev/null")
-    # Not failing if disabled – just report; service may not be installed yet
     status = r.stdout.strip()
     if status not in ("enabled", "disabled", "static"):
         pytest.xfail(f"airbridge.service not found (status: {status!r}) – not installed yet")
@@ -153,21 +152,6 @@ def test_display_renders_all_states(ssh):
     )
     r = ssh.run(f"python3 -c \"{code}\"", timeout=15)
     assert "ok" in r.stdout, f"Display render failed:\n{r.stderr}"
-
-
-@pytest.mark.hardware
-@pytest.mark.disruptive
-def test_modem_responds_to_at(ssh):
-    """Open the serial port and confirm the modem replies OK to AT."""
-    code = (
-        "import sys; sys.path.insert(0,'/home/cedric'); "
-        "from modem_handler import SIM7000GHandler; "
-        "m = SIM7000GHandler('/dev/ttyAMA0', 115200, timeout=1); "
-        "ok, resp = m.send_at('AT', timeout=3); "
-        "print('ok' if ok else 'FAIL', resp.strip())"
-    )
-    r = ssh.run(f"python3 -c \"{code}\"", timeout=10)
-    assert r.stdout.startswith("ok"), f"Modem AT failed:\n{r.stdout}\n{r.stderr}"
 
 
 @pytest.mark.hardware

@@ -1,39 +1,37 @@
-# Developer Brief: USB Cellular Airbridge
+# Developer Brief: USB WiFi Airbridge
 
-**Environment:** Raspberry Pi Zero (W) running Raspberry Pi OS (Lite)
+**Environment:** Raspberry Pi Zero 2 W running Raspberry Pi OS (Lite)
 
-**Access:** `cedric@pizerologs.local` (scripts stored in `~`)
+**Access:** `cedric@pizerologs.local`
 
-**Peripheral:** Waveshare SIM7000G (NB-IoT/Cat-M) HAT via UART (`/dev/ttyAMA0`)
+**Hardware Interface:** USB-OTG port in peripheral mode — emulates a Mass Storage Device (USB Gadget)
 
-**Hardware Interface:** USB-OTG port emulating a Mass Storage Device (USB Gadget)
+**Connectivity:** WiFi via wlan0 (built-in); captive portal AP for credential provisioning
+
+**Display:** SSD1306 128×64 OLED at I2C-1 address 0x3C
 
 ## 0. Pi Zero Setup (Run Once)
 
 ### Deploy code to Pi:
 ```bash
-scp *.py *.yaml *.sh cedric@pizerologs.local:~
+scp src/airbridge/*.py config.yaml cedric@pizerologs.local:~
+# For persistent storage across overlayroot reboots:
+ssh cedric@pizerologs.local "sudo mount -o remount,rw /media/root-ro"
+scp src/airbridge/*.py config.yaml "cedric@pizerologs.local:/media/root-ro/home/cedric/"
 ```
 
-### Run OTG setup script:
-```bash
-ssh cedric@pizerologs.local "sudo bash setup_otg.sh"
+### Enable USB peripheral mode:
+In `/boot/firmware/config.txt`, ensure the `[all]` section contains:
 ```
-
-This configures:
-- `/boot/firmware/config.txt`: Adds `dtoverlay=dwc2,dr_mode=peripheral` in `[all]` section
-- `/etc/modules`: Adds `dwc2` for boot-time loading
-- Uses DATA partition (`/dev/mmcblk0p3`) if available, otherwise creates `/piusb.bin`
-- Creates mount point at `/mnt/usb_logs`
+dtoverlay=dwc2,dr_mode=peripheral
+```
 
 **Important:** The dwc2 overlay MUST be in the `[all]` section, not under `[cm4]` or `[cm5]`.
 
 ### Manual USB gadget commands:
 ```bash
-# Load gadget (Pi appears as USB drive) - use partition or file
+# Load gadget (Pi appears as USB drive)
 sudo modprobe g_mass_storage file=/dev/mmcblk0p3 stall=0 removable=1
-# Or with file-backed image:
-# sudo modprobe g_mass_storage file=/piusb.bin stall=0 removable=1
 
 # Check UDC state
 cat /sys/class/udc/*/state
@@ -42,62 +40,113 @@ cat /sys/class/udc/*/state
 sudo modprobe -r g_mass_storage
 
 # Mount locally to read files
-sudo mount -o loop /piusb.bin /mnt/usb_logs
+sudo mount /dev/mmcblk0p3 /mnt/usb_logs
 ```
 
 ## 1. Context & Objective
 
-Develop a Python service that bridges a **Legacy Host (2004-era Linux)** to a cloud server. The Legacy Host treats the Pi as a standard USB thumb drive. The Pi must intermittently "harvest" files from this drive and upload them via cellular 4G (SIM7000G) to a remote server.
+Python service that bridges a **Legacy Host (2004-era Linux)** to a cloud server. The Legacy Host treats the Pi as a standard USB thumb drive. The Pi intermittently harvests files and uploads them via WiFi (wlan0) to a remote FTP or HTTP server.
 
-## 2. Technical Stack Requirements
+## 2. Technical Stack
 
-* **Serial Comm:** `pyserial` for AT Commands to the SIM7000G.
-* **System Operations:** `subprocess` for `modprobe`, `mount`, and `umount` commands.
-* **File Management:** `os`, `shutil`, and `zipfile` for log handling.
-* **Logging:** Robust local logging for debugging (since the device is headless).
+* **WiFi:** `nmcli` (NetworkManager) for connection management; `/proc/net/wireless` for RSSI
+* **Captive Portal:** NM hotspot AP (`nmcli con add type wifi mode ap`) + Python HTTPServer
+* **System Operations:** `subprocess` for `modprobe`, `mount`, `umount`, `nmcli`
+* **File Management:** `os`, `shutil`, `zipfile` for log handling
+* **Uploads:** `ftplib` / `requests` directly over wlan0 (no AT command overhead)
+* **Logging:** Robust local logging via Python `logging` → systemd journal
 
-## 3. Mandatory Logic Flow (The Duty Cycle)
-
-The agent must implement a state machine with the following loop:
+## 3. Duty Cycle
 
 ### Phase 1: Data Collection (Host Ownership)
 
-1. Load `g_mass_storage` gadget pointing to `/piusb.bin`.
-2. Monitor for "Quiet Window": Check `/sys/class/udc/$(ls /sys/class/udc)/state`.
-3. If `state == 'configured'`, check file modification timestamp (`mtime`) on `/piusb.bin`.
-4. Proceed to Phase 2 only if no writes have occurred for  minutes.
+1. Load `g_mass_storage` gadget pointing to `/dev/mmcblk0p3`.
+2. Monitor UDC state: `cat /sys/class/udc/*/state`.
+3. If `state == 'configured'`, watch disk write activity.
+4. Proceed to Phase 2 only if no writes have occurred for N seconds (quiet window).
 
 ### Phase 2: Log Harvesting (Pi Ownership)
 
 1. Unload USB Gadget: `sudo modprobe -r g_mass_storage`.
-2. Mount virtual disk locally: `sudo mount -o loop /piusb.bin /mnt/usb_logs`.
-3. Compress new files into a `.zip` or `.gz` archive.
-4. Move archives to a `/home/cedric/outbox/` queue.
-5. Unmount `/mnt/usb_logs`.
+2. Mount partition locally: `sudo mount /dev/mmcblk0p3 /mnt/usb_logs`.
+3. Compress new files into `.zip` archives.
+4. Move archives to `/home/cedric/outbox/` queue.
+5. Unmount and reload gadget.
 
-### Phase 3: Cellular Transmission (SIM7000G)
+### Phase 3: WiFi Upload
 
-1. Initialize SIM7000G via UART.
-2. **Challenge:** Files can be up to 100MB.
-3. **Requirement:** Use **FTP(S)** or **Chunked HTTP POST** via AT Commands.
-* *Agent must implement a chunking loop:* Read 512KB from file  `AT+HTTPDATA`  `AT+HTTPACTION`.
+1. Check WiFi connectivity (`wifi_manager.is_connected()`).
+2. If no WiFi: start captive portal AP so user can provide credentials via phone browser.
+3. If WiFi available: upload queued files via FTP or HTTP.
+4. Delete successfully uploaded files from outbox.
 
+## 4. Captive Portal
 
-4. Implement **Automatic Resume/Retry**: If `AT+CSQ` (signal) is lost, pause and retry from the last successful chunk.
-5. Upon 200 OK (Server Receipt), delete file from the outbox.
+When WiFi is unavailable, the Pi creates an open AP named "AirBridge":
 
-## 4. Specific Constraint Instructions
+- NM hotspot at `192.168.4.1/24` (`nmcli con add type wifi mode ap ipv4.method shared`)
+- NM's internal dnsmasq redirects all DNS to AP IP via `/etc/NetworkManager/dnsmasq-shared.d/`
+- Python HTTPServer on port 80 serves a credential entry form
+- iOS/Android detect the DNS redirect and show "Sign in to network" prompt
+- On form submit: portal stops, `add_network()` provisions the new WiFi network
 
-* **Single-Host Violation:** The code must **never** mount the loop device while `g_mass_storage` is active. This causes immediate filesystem corruption.
-* **Power Resilience:** Use `os.sync()` after moving files. Assume power could be pulled at any moment.
-* **AT Command Handling:** Do not use `time.sleep()` for modem responses. Use a proper serial read-until loop to wait for `OK`, `ERROR`, or `+HTTPACTION:`.
+**Critical ordering:** call `portal.stop()` BEFORE `add_network()` so wlan0 is back in
+client mode when attempting to join the new network.
 
-## 5. Deliverables
+## 5. Files
 
-1. **`main.py`**: The primary state machine.
-2. **`modem_handler.py`**: A class-based wrapper for SIM7000G AT commands (HTTP/FTP logic).
-3. **`config.yaml`**: Configuration for APN, Server URL, Poll Interval, and Chunk Size.
+* `main.py` — Primary state machine (harvest loop + upload worker thread)
+* `wifi_manager.py` — WiFi status (`get_wifi_info`, `rssi_to_csq`, `is_connected`), FTP/HTTP upload
+* `captive_portal.py` — NM hotspot AP + captive portal HTTP server
+* `display_handler.py` — SSD1306 OLED display (no Pillow/luma.oled needed)
+* `config.yaml` — FTP server settings, poll interval, `wifi_ap` ssid/channel
+
+## 6. Configuration (`config.yaml`)
+
+```yaml
+virtual_disk_path: /dev/mmcblk0p3
+mount_point: /mnt/usb_logs
+outbox_dir: /home/cedric/outbox
+quiet_window_seconds: 30
+poll_interval: 5
+
+wifi_ap:
+  ssid: AirBridge
+  channel: 6
+
+upload_method: ftp   # or http
+
+ftp:
+  server: your-ftp-server.example.com
+  port: 21
+  username: user
+  password: pass
+  remote_path: /uploads
+```
+
+## 7. Constraints
+
+* **Single-Host Violation:** NEVER mount the partition while `g_mass_storage` is active — immediate filesystem corruption.
+* **Power Resilience:** Use `os.sync()` after moving files; assume power could be cut at any moment.
+* **Overlayroot filesystem:** `/home/cedric/` is on a tmpfs overlay that resets on reboot. For persistent changes deploy to `/media/root-ro/home/cedric/` (after `sudo mount -o remount,rw /media/root-ro`).
+* **nmcli con up as Popen:** `nmcli con up airbridge-ap` must be fire-and-forget (Popen) because the SSH session drops when the Pi switches from client to AP mode.
+
+## 8. Testing
+
+```bash
+# Unit tests — no hardware required
+pytest tests/test_unit.py
+
+# All tests against the Pi
+pytest --pi-host cedric@pizerologs.local
+
+# + disruptive USB gadget tests
+pytest --pi-host cedric@pizerologs.local --disruptive
+
+# + WiFi upload / e2e tests
+pytest --pi-host cedric@pizerologs.local --disruptive --cellular
+```
 
 configure the raspberry pi OTG port as a USB drive. wait for the file system to stop growing for 30s, and then unmount, and display the files that were added.
 
-take a directory of files, and upload them through the cellular to an FTP server.
+take a directory of files, and upload them through WiFi to an FTP server.

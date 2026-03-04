@@ -1,6 +1,7 @@
 """
 Unit tests – no hardware required.
-Covers: config validation, dependency imports, display helper functions.
+Covers: config validation, dependency imports, display helper functions,
+        wifi_manager pure helpers.
 
 Run anywhere:
     pytest tests/test_unit.py
@@ -61,10 +62,10 @@ def test_config_ftp_key_present(cfg, key):
     assert key in cfg["ftp"], f"Missing ftp.{key}"
 
 
-@pytest.mark.parametrize("key", ["port", "baudrate", "timeout"])
-def test_config_modem_key_present(cfg, key):
-    assert "modem" in cfg, "Missing 'modem' section"
-    assert key in cfg["modem"], f"Missing modem.{key}"
+@pytest.mark.parametrize("key", ["ssid", "channel"])
+def test_config_wifi_ap_key_present(cfg, key):
+    assert "wifi_ap" in cfg, "Missing 'wifi_ap' section"
+    assert key in cfg["wifi_ap"], f"Missing wifi_ap.{key}"
 
 
 def test_config_quiet_window_positive(cfg):
@@ -85,33 +86,57 @@ def test_config_ftp_port_valid(cfg):
     assert 1 <= port <= 65535, f"FTP port out of range: {port}"
 
 
-def test_config_modem_baudrate_valid(cfg):
-    rate = cfg["modem"]["baudrate"]
-    assert rate in (9600, 19200, 38400, 57600, 115200, 230400), \
-        f"Unusual baud rate: {rate}"
+def test_config_wifi_ap_channel_valid(cfg):
+    channel = cfg["wifi_ap"]["channel"]
+    assert isinstance(channel, int)
+    assert 1 <= channel <= 14, f"WiFi channel out of range: {channel}"
 
 
 # ── Dependency imports ────────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("module", ["serial", "yaml", "zipfile", "subprocess"])
+@pytest.mark.parametrize("module", ["yaml", "zipfile", "subprocess", "socket"])
 def test_python_dependency_importable(module):
     __import__(module)
 
 
-def test_import_modem_handler():
-    from modem_handler import SIM7000GHandler  # noqa: F401
+def test_import_wifi_manager():
+    from wifi_manager import is_connected, get_wifi_info, rssi_to_csq  # noqa: F401
 
 
 def test_import_display_handler():
     from display_handler import AirbridgeDisplay  # noqa: F401
 
 
-def test_modem_handler_instantiates_without_hardware():
-    """SIM7000GHandler.__init__ opens a serial port; /dev/null avoids real hardware."""
-    from modem_handler import SIM7000GHandler
-    # Opening /dev/null as a serial port raises on some systems –
-    # we only verify the class can be imported and is callable.
-    assert callable(SIM7000GHandler)
+# ── wifi_manager pure helpers ─────────────────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def wm():
+    import wifi_manager as m
+    return m
+
+
+@pytest.mark.parametrize("dbm, expected_csq", [
+    (None, 99),   # unknown
+    (-30,  31),   # excellent (clamp to max)
+    (-60,  15),   # mid-range
+    (-90,   0),   # minimum
+    (-100,  0),   # below minimum (clamp to 0)
+    (-51,  20),   # mid-high
+])
+def test_rssi_to_csq(wm, dbm, expected_csq):
+    assert wm.rssi_to_csq(dbm) == expected_csq
+
+
+def test_rssi_to_csq_none_is_99(wm):
+    assert wm.rssi_to_csq(None) == 99
+
+
+def test_rssi_to_csq_max_clamped(wm):
+    assert wm.rssi_to_csq(0) == 31   # above -30 clamps to 31
+
+
+def test_rssi_to_csq_min_clamped(wm):
+    assert wm.rssi_to_csq(-200) == 0  # far below -90 clamps to 0
 
 
 # ── display_handler pure-Python helpers ───────────────────────────────────────
