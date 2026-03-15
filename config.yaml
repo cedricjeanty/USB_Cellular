@@ -1,10 +1,10 @@
 boot_upload_timeout: 180
 ftp:
-  password: WeY0JmzjCYsjvppK7iW9JVcmRAop7hww
+  password: 3rb6jwWctBNoHqpF2wKSEr4i9pjcarVw
   port: 21
   remote_path: /
   server: eu-central-1.sftpcloud.io
-  username: 38ee2e9547134464a5482acb56a97a76
+  username: cb1701384f8f40939be04af84822f9f1
 http_upload:
   chunk_size: 65536
   url_base: http://b03d97337e8cfa.lhr.life/upload
