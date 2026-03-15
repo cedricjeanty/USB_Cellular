@@ -9,6 +9,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include <WiFi.h>
+#include <DNSServer.h>
+#include <WebServer.h>
+#include <Preferences.h>
 
 // ── Pin assignments ────────────────────────────────────────────────────────────
 #define PIN_I2C_SCL  7
@@ -76,6 +80,31 @@ static uint32_t     g_card_sectors = 0;
 // Deferred harvest log — written during harvest, printed by loop() after serial reconnects
 static char g_harvest_log[512] = "";
 
+// ── WiFi / captive portal ─────────────────────────────────────────────────────
+#define WIFI_AP_SSID            "AirBridge"
+#define WIFI_CONNECT_TIMEOUT_MS  10000UL   // per-network connection attempt
+#define WIFI_GRACE_MS            60000UL   // time disconnected before starting AP
+#define AP_RETRY_MS             300000UL   // STA retry interval while in AP mode
+#define MAX_KNOWN_NETS                  5
+
+static volatile bool g_netConnected = false;   // true = STA associated + IP
+static volatile bool g_apMode       = false;   // true = softAP running
+static char          g_wifiLabel[22] = "No WiFi";
+static int8_t        g_wifiBars      = 0;      // 0-4 filled signal bars
+
+static volatile bool g_portal_connected = false;  // set by POST handler on success
+static TaskHandle_t  g_wifi_task        = nullptr;
+
+static DNSServer g_dns;
+static WebServer g_http(80);
+
+// Cached WiFi scan results (refreshed at AP start and on /scan request)
+#define MAX_SCAN_RESULTS 15
+static char   g_scan_ssids[MAX_SCAN_RESULTS][33];
+static int8_t g_scan_rssi[MAX_SCAN_RESULTS];
+static bool   g_scan_enc[MAX_SCAN_RESULTS];
+static int    g_scan_count = 0;
+
 // ── MSC callbacks ──────────────────────────────────────────────────────────────
 static int32_t msc_read(uint32_t lba, uint32_t offset, void* buf, uint32_t bufsize) {
     if (!g_sd_ready || g_harvesting) return -1;
@@ -109,6 +138,345 @@ static bool msc_start_stop(uint8_t, bool start, bool load_eject) {
     return true;
 }
 
+// ── Portal HTML (dynamically built with scan results) ─────────────────────────
+
+// Scan for nearby networks while AP stays up (WIFI_AP_STA mode).
+static void doScan() {
+    DBG.println("WiFi: scanning...");
+    WiFi.mode(WIFI_AP_STA);   // AP stays up; STA radio scans
+    int n = WiFi.scanNetworks(false, false);
+    g_scan_count = (n > 0) ? min(n, MAX_SCAN_RESULTS) : 0;
+    for (int i = 0; i < g_scan_count; i++) {
+        strlcpy(g_scan_ssids[i], WiFi.SSID(i).c_str(), sizeof(g_scan_ssids[i]));
+        g_scan_rssi[i] = (int8_t)constrain(WiFi.RSSI(i), -128, 0);
+        g_scan_enc[i]  = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+    }
+    WiFi.scanDelete();
+    DBG.printf("WiFi: scan found %d networks\n", g_scan_count);
+}
+
+static String buildPortalHTML() {
+    String h;
+    h.reserve(2048);
+    h = "<!DOCTYPE html><html><head>"
+        "<meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>AirBridge WiFi Setup</title><style>"
+        "body{font-family:sans-serif;max-width:400px;margin:40px auto;padding:0 20px}"
+        "h2{color:#333}label{color:#555;font-size:13px;display:block;margin-top:10px}"
+        "select,input{display:block;width:100%;padding:10px;margin:4px 0;"
+        "box-sizing:border-box;font-size:15px;border:1px solid #ccc;border-radius:4px}"
+        "button{width:100%;padding:12px;background:#0078d4;color:#fff;border:none;"
+        "font-size:16px;border-radius:4px;cursor:pointer;margin-top:12px}"
+        ".rescan{display:block;text-align:center;margin-top:14px;color:#0078d4;font-size:14px}"
+        "</style></head><body>"
+        "<h2>AirBridge WiFi Setup</h2>"
+        "<form method='POST' action='/configure'>";
+
+    if (g_scan_count > 0) {
+        h += "<label>Select network:</label>"
+             "<select name='ssid'><option value=''>-- Choose network --</option>";
+        for (int i = 0; i < g_scan_count; i++) {
+            // Signal bars: █ (U+2588) filled, ░ (U+2591) empty
+            int bars = (g_scan_rssi[i] >= -55) ? 4 :
+                       (g_scan_rssi[i] >= -67) ? 3 :
+                       (g_scan_rssi[i] >= -80) ? 2 : 1;
+            String ssid = g_scan_ssids[i];
+            ssid.replace("'", "&#39;");   // escape for HTML attribute
+            h += "<option value='"; h += ssid; h += "'>";
+            h += ssid; h += "  ";
+            for (int b = 0; b < 4; b++)
+                h += (b < bars) ? "\xe2\x96\x88" : "\xe2\x96\x91";  // █ or ░
+            if (g_scan_enc[i]) h += " \xf0\x9f\x94\x92";  // 🔒
+            h += "</option>";
+        }
+        h += "</select>"
+             "<label>Or enter name manually (hidden network):</label>"
+             "<input name='ssid_manual' placeholder='Network name' "
+             "autocorrect='off' autocapitalize='off'>";
+    } else {
+        h += "<label>Network name:</label>"
+             "<input name='ssid_manual' placeholder='WiFi Network Name' required "
+             "autocorrect='off' autocapitalize='off'>"
+             "<p style='color:#c00;font-size:13px'>No networks found — "
+             "<a href='/scan'>scan again</a></p>";
+    }
+
+    h += "<label>Password:</label>"
+         "<input name='password' type='password' placeholder='Password (leave blank if open)'>"
+         "<button type='submit'>Connect</button>"
+         "</form>"
+         "<a class='rescan' href='/scan'>&#x1F504; Scan again</a>"
+         "</body></html>";
+    return h;
+}
+
+static const char SUCCESS_HTML[] = R"rawliteral(<!DOCTYPE html><html>
+<head><meta charset="utf-8"><title>AirBridge</title></head>
+<body><h2>Connected!</h2>
+<p>AirBridge has joined your WiFi network. You can close this page.</p>
+</body></html>)rawliteral";
+
+static String buildErrorHTML(const String& ssid) {
+    String h;
+    h.reserve(512);
+    h = "<!DOCTYPE html><html><head>"
+        "<meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>AirBridge</title><style>"
+        "body{font-family:sans-serif;max-width:400px;margin:40px auto;padding:0 20px}"
+        "h2{color:#c00}.back{display:block;text-align:center;margin-top:20px;"
+        "color:#0078d4;font-size:15px;text-decoration:none}"
+        "</style></head><body>"
+        "<h2>Connection failed</h2>"
+        "<p>Could not connect to <strong>";
+    h += ssid;
+    h += "</strong>. Please check the password and try again.</p>"
+         "<a class='back' href='/'>&#8592; Try again</a>"
+         "</body></html>";
+    return h;
+}
+
+// ── WiFi credential storage (NVS namespace "wifi") ────────────────────────────
+struct NetCred { char ssid[33]; char pass[65]; };
+
+static int loadKnownNets(NetCred* out) {
+    Preferences p; p.begin("wifi", true);
+    int n = min((int)p.getInt("count", 0), (int)MAX_KNOWN_NETS);
+    for (int i = 0; i < n; i++) {
+        char ks[8], kp[8];
+        snprintf(ks, sizeof(ks), "ssid%d", i);
+        snprintf(kp, sizeof(kp), "pass%d", i);
+        strlcpy(out[i].ssid, p.getString(ks, "").c_str(), sizeof(out[i].ssid));
+        strlcpy(out[i].pass, p.getString(kp, "").c_str(), sizeof(out[i].pass));
+    }
+    p.end(); return n;
+}
+
+// Saves network MRU-first; de-dupes by SSID.
+static void saveNetwork(const char* ssid, const char* pass) {
+    NetCred nets[MAX_KNOWN_NETS];
+    int n = loadKnownNets(nets);
+    // Remove existing entry for this SSID
+    int j = 0;
+    for (int i = 0; i < n; i++) if (strcmp(nets[i].ssid, ssid) != 0) nets[j++] = nets[i];
+    n = j;
+    // Prepend
+    if (n >= MAX_KNOWN_NETS) n = MAX_KNOWN_NETS - 1;
+    memmove(&nets[1], &nets[0], sizeof(NetCred) * n);
+    strlcpy(nets[0].ssid, ssid, sizeof(nets[0].ssid));
+    strlcpy(nets[0].pass, pass, sizeof(nets[0].pass));
+    n++;
+    Preferences p; p.begin("wifi", false);
+    p.putInt("count", n);
+    for (int i = 0; i < n; i++) {
+        char ks[8], kp[8];
+        snprintf(ks, sizeof(ks), "ssid%d", i);
+        snprintf(kp, sizeof(kp), "pass%d", i);
+        p.putString(ks, nets[i].ssid);
+        p.putString(kp, nets[i].pass);
+    }
+    p.end();
+    DBG.printf("WiFi: saved '%s' (%d stored)\n", ssid, n);
+}
+
+// ── WiFi helpers ──────────────────────────────────────────────────────────────
+static int8_t rssiToBars(int32_t rssi) {
+    if (rssi >= -55) return 4;
+    if (rssi >= -67) return 3;
+    if (rssi >= -80) return 2;
+    if (rssi >= -90) return 1;
+    return 0;
+}
+
+// Try connecting to one SSID; returns true if WL_CONNECTED within timeout.
+static bool tryConnect(const char* ssid, const char* pass) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, pass[0] ? pass : nullptr);
+    uint32_t t0 = millis();
+    while (millis() - t0 < WIFI_CONNECT_TIMEOUT_MS) {
+        if (WiFi.status() == WL_CONNECTED) return true;
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    WiFi.disconnect(true);
+    return false;
+}
+
+// Try all stored networks in MRU order.
+static bool tryKnownNets() {
+    NetCred nets[MAX_KNOWN_NETS];
+    int n = loadKnownNets(nets);
+    for (int i = 0; i < n; i++) {
+        DBG.printf("WiFi: trying '%s'\n", nets[i].ssid);
+        strlcpy(g_wifiLabel, nets[i].ssid, sizeof(g_wifiLabel));
+        if (tryConnect(nets[i].ssid, nets[i].pass)) return true;
+    }
+    return false;
+}
+
+// ── Captive portal AP ─────────────────────────────────────────────────────────
+static bool g_web_registered = false;
+
+static void startAP() {
+    WiFi.disconnect(true);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    // WIFI_AP_STA: AP stays up while STA radio scans
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(WIFI_AP_SSID);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    g_dns.start(53, "*", WiFi.softAPIP());
+
+    // Scan for nearby networks now that the AP is up
+    doScan();
+
+    if (!g_web_registered) {
+        // Serve dynamic portal page (includes scan results)
+        auto servePage = []() { g_http.send(200, "text/html", buildPortalHTML()); };
+        g_http.on("/", HTTP_GET, servePage);
+        // /scan: rescan and redirect back to portal
+        g_http.on("/scan", HTTP_GET, []() {
+            doScan();
+            g_http.sendHeader("Location", "/");
+            g_http.send(302, "text/plain", "");
+        });
+        g_http.on("/configure", HTTP_POST, []() {
+            // Prefer manually typed name (hidden networks); fall back to select value
+            String ssid = g_http.arg("ssid_manual");
+            if (ssid.isEmpty()) ssid = g_http.arg("ssid");
+            String pass = g_http.arg("password");
+            if (ssid.isEmpty()) {
+                g_http.send(400, "text/plain", "Missing SSID");
+                return;
+            }
+            // Test credentials inline while AP stays up (WIFI_AP_STA keeps softAP running)
+            DBG.printf("Portal: testing '%s'...\n", ssid.c_str());
+            WiFi.begin(ssid.c_str(), pass.isEmpty() ? nullptr : pass.c_str());
+            bool connected = false;
+            for (int i = 0; i < 50; i++) {  // up to 10 s (50 × 200 ms)
+                if (WiFi.status() == WL_CONNECTED) { connected = true; break; }
+                vTaskDelay(pdMS_TO_TICKS(200));
+            }
+            if (connected) {
+                saveNetwork(ssid.c_str(), pass.c_str());
+                g_http.send(200, "text/html", SUCCESS_HTML);
+                g_portal_connected = true;
+            } else {
+                WiFi.disconnect(false);  // drop STA attempt; keep AP running
+                g_http.send(200, "text/html", buildErrorHTML(ssid));
+            }
+        });
+        // Captive portal probe URLs — iOS and Android trigger the sign-in popup
+        // when they don't get the expected response from these well-known paths.
+        g_http.on("/hotspot-detect.html",       HTTP_GET, servePage);  // iOS
+        g_http.on("/library/test/success.html", HTTP_GET, servePage);  // iOS newer
+        g_http.on("/generate_204",              HTTP_GET, servePage);  // Android
+        g_http.on("/connectivitycheck.html",    HTTP_GET, servePage);  // Android
+        g_http.onNotFound([]() {
+            g_http.sendHeader("Location", "http://192.168.4.1/");
+            g_http.send(302, "text/plain", "");
+        });
+        g_web_registered = true;
+    }
+    g_http.begin();
+    g_apMode = true;
+    strlcpy(g_wifiLabel, WIFI_AP_SSID, sizeof(g_wifiLabel));
+    g_wifiBars = 0;
+    DBG.println("WiFi: AP started — SSID=AirBridge IP=192.168.4.1");
+}
+
+static void stopAP() {
+    g_http.stop();
+    g_dns.stop();
+    WiFi.softAPdisconnect(true);
+    g_apMode = false;
+    DBG.println("WiFi: AP stopped");
+}
+
+// ── WiFi task — mirrors Pi upload_worker WiFi/portal state machine ─────────────
+static void wifiTask(void* /*param*/) {
+    vTaskDelay(pdMS_TO_TICKS(2000));  // let USB/SD settle first
+    WiFi.persistent(false);           // we manage NVS ourselves via Preferences
+    WiFi.setAutoReconnect(false);
+
+    enum WState { WS_TRY_KNOWN, WS_CONNECTED, WS_AP };
+    WState   state     = WS_TRY_KNOWN;
+    uint32_t discMs    = 0;   // millis() when WiFi first lost
+    uint32_t apRetryMs = 0;   // millis() of last STA scan from AP mode
+
+    for (;;) {
+        switch (state) {
+
+        // ── Try every stored network (MRU order) ──────────────────────────────
+        case WS_TRY_KNOWN: {
+            strlcpy(g_wifiLabel, "Connecting...", sizeof(g_wifiLabel));
+            g_netConnected = false;
+            if (tryKnownNets()) {
+                state = WS_CONNECTED; discMs = 0;
+            } else {
+                if (discMs == 0) discMs = millis();
+                strlcpy(g_wifiLabel, "No WiFi", sizeof(g_wifiLabel));
+                g_wifiBars = 0;
+                if (millis() - discMs >= WIFI_GRACE_MS) {
+                    state = WS_AP;
+                } else {
+                    vTaskDelay(pdMS_TO_TICKS(5000));
+                }
+            }
+            break;
+        }
+
+        // ── Maintain STA connection ────────────────────────────────────────────
+        case WS_CONNECTED: {
+            if (WiFi.status() == WL_CONNECTED) {
+                g_netConnected = true; discMs = 0;
+                strlcpy(g_wifiLabel, WiFi.SSID().c_str(), sizeof(g_wifiLabel));
+                g_wifiBars = rssiToBars(WiFi.RSSI());
+                vTaskDelay(pdMS_TO_TICKS(5000));
+            } else {
+                g_netConnected = false;
+                if (discMs == 0) { discMs = millis(); DBG.println("WiFi: connection lost"); }
+                strlcpy(g_wifiLabel, "No WiFi", sizeof(g_wifiLabel));
+                g_wifiBars = 0;
+                state = WS_TRY_KNOWN;
+            }
+            break;
+        }
+
+        // ── AP + captive portal ────────────────────────────────────────────────
+        case WS_AP: {
+            if (!g_apMode) { startAP(); apRetryMs = millis(); }
+            g_dns.processNextRequest();
+            g_http.handleClient();
+
+            // Portal POST handler connected successfully?
+            if (g_portal_connected) {
+                g_portal_connected = false;
+                DBG.printf("WiFi: connected via portal to '%s'\n", WiFi.SSID().c_str());
+                stopAP();
+                state = WS_CONNECTED; discMs = 0;
+                break;
+            }
+
+            // Periodic STA retry while in AP mode (every 5 min, like Pi STA_RETRY_IN_AP)
+            if (millis() - apRetryMs >= AP_RETRY_MS) {
+                DBG.println("WiFi: AP-mode STA retry");
+                stopAP();
+                vTaskDelay(pdMS_TO_TICKS(300));
+                if (tryKnownNets()) {
+                    state = WS_CONNECTED; discMs = 0;
+                } else {
+                    state = WS_TRY_KNOWN;  // will re-enter AP immediately (discMs already set)
+                }
+                break;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(10));  // tight loop needed for DNS/HTTP responsiveness
+            break;
+        }
+        }
+    }
+}
+
 // ── Display ────────────────────────────────────────────────────────────────────
 static void disp(const char* line1, const char* line2 = nullptr) {
     display.clearDisplay();
@@ -136,11 +504,15 @@ static void updateDisplay() {
 
     display.setTextSize(1);
     display.setCursor(0, 0);
-    display.print("NO CELL");
-    // Signal bars (4 outline bars = no signal)
+    // WiFi SSID / "AirBridge" (AP) / "No WiFi" — max 17 chars before the bars
+    char label[18]; strlcpy(label, g_wifiLabel, sizeof(label));
+    display.print(label);
+    // Signal bars: filled up to g_wifiBars (0-4), rest outlined
     const int8_t xs[4] = {108,113,118,123}, hs[4] = {2,4,6,8};
-    for (int i = 0; i < 4; i++)
-        display.drawRect(xs[i], 8-hs[i], 3, hs[i], SSD1306_WHITE);
+    for (int i = 0; i < 4; i++) {
+        if (i < g_wifiBars) display.fillRect(xs[i], 8-hs[i], 3, hs[i], SSD1306_WHITE);
+        else                 display.drawRect(xs[i], 8-hs[i], 3, hs[i], SSD1306_WHITE);
+    }
     display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
 
     display.setTextSize(2);
@@ -391,6 +763,7 @@ void setup() {
     g_lastDisplayMs = millis();
 
     xTaskCreatePinnedToCore(uploadTask, "upload", 8192, nullptr, 1, &g_upload_task, 1);
+    xTaskCreatePinnedToCore(wifiTask,   "wifi",   8192, nullptr, 1, &g_wifi_task,   1);
     DBG.println("setup done");
 }
 
