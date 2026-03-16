@@ -10,9 +10,11 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <DNSServer.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include "mbedtls/base64.h"
 
 // ── Pin assignments ────────────────────────────────────────────────────────────
 #define PIN_I2C_SCL  7
@@ -577,152 +579,210 @@ static void updateDisplay() {
     display.display();
 }
 
-// ── FTP upload ─────────────────────────────────────────────────────────────────
-// Minimal passive-mode FTP STOR using raw WiFiClient.
-// Loads config from NVS namespace "ftp": host, port, user, pass, path.
-static bool ftpStorFile(const char* name) {
-    Preferences p; p.begin("ftp", true);
-    char host[64];  strlcpy(host,  p.getString("host","").c_str(), sizeof(host));
-    int  port =     p.getInt("port", 21);
-    char user[33];  strlcpy(user,  p.getString("user","").c_str(), sizeof(user));
-    char pass[65];  strlcpy(pass,  p.getString("pass","").c_str(), sizeof(pass));
-    char rpath[64]; strlcpy(rpath, p.getString("path","/").c_str(), sizeof(rpath));
+// ── Dropbox upload ─────────────────────────────────────────────────────────────
+// Uses OAuth2 refresh-token flow: the refresh token (stored in NVS) never
+// expires and mints short-lived access tokens on demand.
+//
+// NVS namespace "dbx": app_key, app_secret, refresh_token
+// Cached access token lives in RAM — refreshed when expired or on 401.
+
+static char   g_dbxToken[2048] = "";   // current access token (short-lived)
+static uint32_t g_dbxTokenExpMs = 0;   // millis() when token expires
+
+// Mint a fresh access token using the refresh token.
+static bool dbxRefreshToken() {
+    Preferences p; p.begin("dbx", true);
+    String appKey    = p.getString("app_key", "");
+    String appSecret = p.getString("app_secret", "");
+    String refresh   = p.getString("refresh", "");
     p.end();
 
-    if (!host[0] || !user[0]) { DBG.println("FTP: no config"); return false; }
-    if (!g_netConnected)       { DBG.println("FTP: no WiFi");   return false; }
-
-    WiFiClient ctrl;
-    if (!ctrl.connect(host, (uint16_t)port)) {
-        DBG.printf("FTP: connect failed %s:%d\n", host, port); return false;
-    }
-
-    char line[512] = "";
-
-    // Read one CRLF-terminated line, 10 s timeout.
-    auto rdLine = [&]() -> bool {
-        int i = 0; uint32_t t0 = millis();
-        while (millis()-t0 < 10000) {
-            if (!ctrl.connected()) return false;
-            if (ctrl.available()) {
-                char c = ctrl.read();
-                if (c == '\n') { line[i] = 0; return true; }
-                if (c != '\r' && i < (int)sizeof(line)-1) line[i++] = c;
-            } else { vTaskDelay(pdMS_TO_TICKS(5)); }
-        }
+    if (!appKey.length() || !refresh.length()) {
+        DBG.println("DBX: no credentials in NVS");
         return false;
-    };
-
-    // Consume multi-line responses (e.g. "220-..." lines until "220 ").
-    auto rdResp = [&]() -> bool {
-        do { if (!rdLine()) return false; } while (strlen(line) > 3 && line[3] == '-');
-        return true;
-    };
-
-    // ── FTP dialogue ──────────────────────────────────────────────────────────
-    if (!rdResp() || line[0] != '2') {
-        DBG.printf("FTP: bad welcome: %s\n", line); ctrl.stop(); return false;
-    }
-    ctrl.printf("USER %s\r\n", user); rdResp();
-    ctrl.printf("PASS %s\r\n", pass);
-    if (!rdResp() || line[0] != '2') {
-        DBG.printf("FTP: login failed: %s\n", line); ctrl.stop(); return false;
-    }
-    ctrl.print("TYPE I\r\n"); rdResp();
-    ctrl.printf("CWD %s\r\n", rpath); rdResp();  // ignore CWD failure (root is fine)
-    ctrl.print("PASV\r\n");
-    if (!rdResp() || line[0] != '2') {
-        DBG.printf("FTP: PASV failed: %s\n", line); ctrl.stop(); return false;
     }
 
-    // Parse "227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)"
-    int h1,h2,h3,h4,dp1,dp2;
-    char* lp = strchr(line, '(');
-    if (!lp || sscanf(lp+1, "%d,%d,%d,%d,%d,%d", &h1,&h2,&h3,&h4,&dp1,&dp2) != 6) {
-        DBG.println("FTP: PASV parse failed"); ctrl.stop(); return false;
-    }
-    char dh[16]; snprintf(dh, sizeof(dh), "%d.%d.%d.%d", h1,h2,h3,h4);
-    int  dp = dp1*256 + dp2;
-
-    // Open data connection, issue STOR, then stream.
-    WiFiClient data;
-    if (!data.connect(dh, (uint16_t)dp)) {
-        DBG.printf("FTP: data connect failed %s:%d\n", dh, dp);
-        ctrl.stop(); return false;
-    }
-    ctrl.printf("STOR %s\r\n", name);
-    if (!rdResp() || line[0] != '1') {
-        DBG.printf("FTP: STOR failed: %s\n", line);
-        data.stop(); ctrl.stop(); return false;
+    WiFiClientSecure tls;
+    tls.setInsecure();  // skip cert verification (saves ~40 KB RAM)
+    if (!tls.connect("api.dropboxapi.com", 443)) {
+        DBG.println("DBX: TLS connect failed (token)");
+        return false;
     }
 
-    // Stream file from /harvested/<name> in 4 KB chunks.
+    // POST body
+    String body = "grant_type=refresh_token&refresh_token=" + refresh;
+
+    // Basic auth header: base64(app_key:app_secret)
+    String cred = appKey + ":" + appSecret;
+    // Simple base64 encode (ESP32 Arduino has no built-in b64 for strings)
+    size_t outLen = 0;
+    mbedtls_base64_encode(nullptr, 0, &outLen,
+        (const uint8_t*)cred.c_str(), cred.length());
+    char* b64 = (char*)malloc(outLen + 1);
+    mbedtls_base64_encode((uint8_t*)b64, outLen, &outLen,
+        (const uint8_t*)cred.c_str(), cred.length());
+    b64[outLen] = 0;
+
+    tls.printf("POST /oauth2/token HTTP/1.1\r\n"
+               "Host: api.dropboxapi.com\r\n"
+               "Authorization: Basic %s\r\n"
+               "Content-Type: application/x-www-form-urlencoded\r\n"
+               "Content-Length: %d\r\n"
+               "Connection: close\r\n\r\n",
+               b64, body.length());
+    tls.print(body);
+    free(b64);
+
+    // Read response — find access_token in JSON body
+    // Skip HTTP headers
+    String statusLine = tls.readStringUntil('\n');
+    DBG.printf("DBX: HTTP %s\n", statusLine.c_str());
+    while (tls.connected()) {
+        String line = tls.readStringUntil('\n');
+        if (line == "\r") break;
+    }
+    // Read body (may arrive in chunks; wait up to 5s for data)
+    String resp = "";
+    uint32_t t1 = millis();
+    while (millis() - t1 < 5000) {
+        if (tls.available()) {
+            resp += tls.readString();
+            t1 = millis();  // reset timer on data
+        } else if (!tls.connected()) {
+            break;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+    tls.stop();
+    DBG.printf("DBX: resp (%d bytes): %s\n", resp.length(),
+               resp.substring(0, 300).c_str());
+
+    // Extract access_token from JSON (avoid pulling in ArduinoJson)
+    int pos = resp.indexOf("\"access_token\"");
+    if (pos < 0) {
+        DBG.println("DBX: token refresh failed — no access_token in response");
+        return false;
+    }
+    // Find the value: skip to the colon, then the opening quote
+    int q1 = resp.indexOf('"', resp.indexOf(':', pos) + 1);
+    int q2 = resp.indexOf('"', q1 + 1);
+    int tokenLen = (q1 >= 0 && q2 >= 0) ? q2 - q1 - 1 : -1;
+    if (q1 < 0 || q2 < 0 || tokenLen > (int)sizeof(g_dbxToken) - 1) {
+        DBG.printf("DBX: token parse failed q1=%d q2=%d len=%d max=%d\n",
+                   q1, q2, tokenLen, (int)sizeof(g_dbxToken) - 1);
+        return false;
+    }
+    resp.substring(q1 + 1, q2).toCharArray(g_dbxToken, sizeof(g_dbxToken));
+
+    // Extract expires_in
+    int epos = resp.indexOf("\"expires_in\"");
+    uint32_t expiresIn = 14400;
+    if (epos >= 0) {
+        int colon = resp.indexOf(':', epos);
+        expiresIn = (uint32_t)resp.substring(colon + 1).toInt();
+    }
+    g_dbxTokenExpMs = millis() + (expiresIn - 300) * 1000UL;  // refresh 5 min early
+
+    DBG.printf("DBX: token refreshed, expires in %us\n", expiresIn);
+    return true;
+}
+
+// Upload a file from /harvested/<name> to Dropbox.
+static bool dbxUploadFile(const char* name) {
+    if (!g_netConnected) { DBG.println("DBX: no WiFi"); return false; }
+
+    // Refresh token if expired or missing
+    if (!g_dbxToken[0] || millis() >= g_dbxTokenExpMs) {
+        if (!dbxRefreshToken()) return false;
+    }
+
+    // Open file and get size
     char fpath[80]; snprintf(fpath, sizeof(fpath), "/harvested/%s", name);
     xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
     FsFile f; bool fok = f.open(&sd, fpath, O_RDONLY);
+    uint32_t fileSize = fok ? f.fileSize() : 0;
     xSemaphoreGive(g_sd_mutex);
+    if (!fok) { DBG.printf("DBX: can't open %s\n", fpath); return false; }
 
-    if (!fok) { data.stop(); ctrl.stop(); return false; }
+    // Build Dropbox-API-Arg header
+    char apiArg[128];
+    snprintf(apiArg, sizeof(apiArg),
+        "{\"path\":\"/%s\",\"mode\":\"add\",\"autorename\":true}", name);
 
-    // WiFiClient.write() uses MSG_DONTWAIT on ESP32 — returns immediately
-    // (bytes sent if buffer has space, 0 if full).  We yield briefly on
-    // 0-returns to let the lwIP task drain the send buffer via ACKs.
-    // Timeout: stall detection (no progress for 60 s) rather than wall-clock
-    // cap so large files complete regardless of how slow the link is.
-    auto writeAll = [&](const uint8_t* buf, size_t len) -> bool {
-        size_t sent = 0;
-        uint32_t lastProgressMs = millis();
-        while (sent < len) {
-            if (!data.connected()) { DBG.println("FTP: data conn lost"); return false; }
-            if (millis() - lastProgressMs > 60000) {
-                DBG.println("FTP: write stalled 60s"); return false;
-            }
-            size_t wr = data.write(buf + sent, len - sent);
-            if (wr > 0) {
-                sent += wr;
-                lastProgressMs = millis();
-            } else {
-                vTaskDelay(pdMS_TO_TICKS(5));
-            }
-        }
-        return true;
-    };
+    WiFiClientSecure tls;
+    tls.setInsecure();
+    if (!tls.connect("content.dropboxapi.com", 443)) {
+        DBG.println("DBX: TLS connect failed (upload)");
+        xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
+        return false;
+    }
 
-    uint8_t cbuf[4096]; int n;
+    tls.printf("POST /2/files/upload HTTP/1.1\r\n"
+               "Host: content.dropboxapi.com\r\n"
+               "Authorization: Bearer %s\r\n"
+               "Dropbox-API-Arg: %s\r\n"
+               "Content-Type: application/octet-stream\r\n"
+               "Content-Length: %u\r\n"
+               "Connection: close\r\n\r\n",
+               g_dbxToken, apiArg, fileSize);
+
+    // Stream file in 8 KB chunks
+    uint8_t cbuf[8192];
     uint32_t xfrStart = millis();
-    uint32_t bytesWritten = 0;
+    uint32_t bytesSent = 0;
     uint32_t nextLogMb = 1;
     bool xfrOk = true;
     for (;;) {
         xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-        n = f.read(cbuf, sizeof(cbuf));
+        int n = f.read(cbuf, sizeof(cbuf));
         xSemaphoreGive(g_sd_mutex);
         if (n <= 0) break;
-        if (!writeAll(cbuf, (size_t)n)) { xfrOk = false; break; }
-        bytesWritten += (uint32_t)n;
-        if (bytesWritten / 1000000 >= nextLogMb) {
+
+        // writeAll with stall detection
+        size_t sent = 0;
+        uint32_t lastProgress = millis();
+        while (sent < (size_t)n) {
+            if (!tls.connected()) { DBG.println("DBX: conn lost"); xfrOk = false; break; }
+            if (millis() - lastProgress > 60000) { DBG.println("DBX: stalled 60s"); xfrOk = false; break; }
+            size_t wr = tls.write(cbuf + sent, n - sent);
+            if (wr > 0) { sent += wr; lastProgress = millis(); }
+            else { vTaskDelay(pdMS_TO_TICKS(5)); }
+        }
+        if (!xfrOk) break;
+        bytesSent += (uint32_t)n;
+
+        if (bytesSent / 1000000 >= nextLogMb) {
             float elapsed = (millis() - xfrStart) / 1000.0f;
-            if (elapsed > 0)
-                DBG.printf("FTP: %.0f MB sent (%.0f KB/s)\n",
-                    bytesWritten / 1e6f, bytesWritten / 1024.0f / elapsed);
-            nextLogMb = bytesWritten / 1000000 + 1;
+            DBG.printf("DBX: %.0f MB sent (%.0f KB/s)\n",
+                bytesSent / 1e6f, bytesSent / 1024.0f / elapsed);
+            nextLogMb = bytesSent / 1000000 + 1;
         }
     }
-    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-    f.close();
-    xSemaphoreGive(g_sd_mutex);
+    xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
 
-    if (!xfrOk) { data.stop(); ctrl.stop(); return false; }
-    data.stop();  // flush + EOF to server
+    if (!xfrOk) { tls.stop(); return false; }
 
-    if (!rdResp() || line[0] != '2') {
-        DBG.printf("FTP: transfer failed: %s\n", line); ctrl.stop(); return false;
+    // Read HTTP response
+    // Skip headers
+    while (tls.connected()) {
+        String line = tls.readStringUntil('\n');
+        if (line == "\r") break;
     }
+    String resp = tls.readString();
+    tls.stop();
+
+    // Check for success (response contains "path_display")
+    if (resp.indexOf("\"path_display\"") < 0) {
+        DBG.printf("DBX: upload failed: %s\n", resp.substring(0, 200).c_str());
+        // If 401, clear token so next attempt refreshes
+        if (resp.indexOf("invalid_access_token") >= 0) g_dbxToken[0] = 0;
+        return false;
+    }
+
     float elapsed = (millis() - xfrStart) / 1000.0f;
-    DBG.printf("FTP: uploaded '%s' OK (%.0f KB/s)\n", name,
-        elapsed > 0 ? bytesWritten / 1024.0f / elapsed : 0);
-    ctrl.print("QUIT\r\n"); rdResp();
-    ctrl.stop();
+    DBG.printf("DBX: uploaded '%s' OK (%.0f KB/s)\n", name,
+        elapsed > 0 ? bytesSent / 1024.0f / elapsed : 0);
     return true;
 }
 
@@ -784,12 +844,12 @@ static void uploadTask(void* /*param*/) {
                 vTaskDelay(pdMS_TO_TICKS(60000)); continue;
             }
 
-            // Upload via FTP; on failure retry after a delay
+            // Upload to Dropbox; on failure retry after a delay
             DBG.printf("Uploading: %s (%.1f MB) heap=%u min=%u\n",
                        name, fileMb, ESP.getFreeHeap(), ESP.getMinFreeHeap());
-            bool uploaded = ftpStorFile(name);
+            bool uploaded = dbxUploadFile(name);
             if (!uploaded) {
-                DBG.printf("FTP failed for %s — retrying in 30s\n", name);
+                DBG.printf("Upload failed for %s — retrying in 30s\n", name);
                 vTaskDelay(pdMS_TO_TICKS(30000)); continue;  // retry same file
             }
 
@@ -950,6 +1010,18 @@ void setup() {
     if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
         for (;;) { DBG.println("SSD1306 failed"); delay(1000); }
     }
+    // Provision Dropbox credentials on first boot (if NVS is empty)
+    {
+        Preferences p; p.begin("dbx", false);
+        if (p.getString("app_key", "").isEmpty()) {
+            p.putString("app_key",    "82un1zz0uurgszt");
+            p.putString("app_secret", "hc3wapn8hsgzuva");
+            p.putString("refresh",    "J0Iqey6GFFsAAAAAAAAAAa7xToJsNmRAqr1Ok5WOGyqGlIhJI0wcSdL2_LKv6quE");
+            DBG.println("Dropbox credentials provisioned");
+        }
+        p.end();
+    }
+
     disp("Init SD...");
 
     spi.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
@@ -1042,21 +1114,18 @@ static void processCLI(const char* cmd) {
         saveNetwork(ssid, pass);
         DBG.printf("CLI: WiFi saved: '%s'\n", ssid);
 
-    } else if (strncmp(cmd, "SETFTP ", 7) == 0) {
-        char host[64], user[33], pass[65], path[64]; int port = 21;
-        // sscanf stops at whitespace per field — passwords must not contain spaces
-        if (sscanf(cmd + 7, "%63s %d %32s %64s %63s",
-                   host, &port, user, pass, path) < 4) {
-            DBG.println("CLI: SETFTP <host> <port> <user> <pass> [<path>]"); return;
+    } else if (strncmp(cmd, "SETDBX ", 7) == 0) {
+        char appKey[32], appSecret[32], refresh[128];
+        if (sscanf(cmd + 7, "%31s %31s %127s", appKey, appSecret, refresh) < 3) {
+            DBG.println("CLI: SETDBX <app_key> <app_secret> <refresh_token>"); return;
         }
-        Preferences p; p.begin("ftp", false);
-        p.putString("host", host);
-        p.putInt("port", port);
-        p.putString("user", user);
-        p.putString("pass", pass);
-        p.putString("path", path[0] ? path : "/");
+        Preferences p; p.begin("dbx", false);
+        p.putString("app_key", appKey);
+        p.putString("app_secret", appSecret);
+        p.putString("refresh", refresh);
         p.end();
-        DBG.printf("CLI: FTP saved: %s:%d user=%s path=%s\n", host, port, user, path);
+        g_dbxToken[0] = 0;  // force re-auth on next upload
+        DBG.printf("CLI: Dropbox saved: app_key=%s\n", appKey);
 
     } else if (strcmp(cmd, "STATUS") == 0) {
         char ipStr[20] = "disconnected";
@@ -1065,11 +1134,10 @@ static void processCLI(const char* cmd) {
             ipStr, g_apMode ? "yes" : "no",
             g_filesQueued, g_filesUploaded,
             g_mbQueued, g_mbUploaded);
-        Preferences p; p.begin("ftp", true);
-        DBG.printf("CLI: ftp_host=%s port=%d user=%s path=%s\n",
-            p.getString("host","(none)").c_str(), p.getInt("port",21),
-            p.getString("user","(none)").c_str(),
-            p.getString("path","/").c_str());
+        Preferences p; p.begin("dbx", true);
+        DBG.printf("CLI: dropbox app_key=%s refresh=%s\n",
+            p.getString("app_key","(none)").c_str(),
+            p.getString("refresh","").length() > 0 ? "yes" : "no");
         p.end();
 
     } else if (strcmp(cmd, "RESETBOOT") == 0) {
