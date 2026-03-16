@@ -74,7 +74,8 @@ static float    g_mbUploaded     = 0.0f;  // MB uploaded this session
 static float    g_sdTotalMb      = 0.0f;
 static uint32_t g_lastDisplayMs = 0;
 
-static TaskHandle_t g_upload_task = nullptr;
+static TaskHandle_t g_upload_task  = nullptr;
+static TaskHandle_t g_harvest_task = nullptr;
 static uint32_t     g_card_sectors = 0;
 
 // Deferred harvest log — written during harvest, printed by loop() after serial reconnects
@@ -109,7 +110,10 @@ static int    g_scan_count = 0;
 static int32_t msc_read(uint32_t lba, uint32_t offset, void* buf, uint32_t bufsize) {
     if (!g_sd_ready || g_harvesting) return -1;
     (void)offset;
-    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+    // TinyUSB task stack is only 4 KB — xSemaphoreTake adds ~200 bytes.
+    // Use a short timeout: if another task holds the mutex, return error
+    // rather than blocking the USB task indefinitely.
+    if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return -1;
     bool ok = sd.card()->readSectors(lba, (uint8_t*)buf, bufsize / 512);
     xSemaphoreGive(g_sd_mutex);
     return ok ? (int32_t)bufsize : -1;
@@ -118,7 +122,7 @@ static int32_t msc_read(uint32_t lba, uint32_t offset, void* buf, uint32_t bufsi
 static int32_t msc_write(uint32_t lba, uint32_t offset, uint8_t* buf, uint32_t bufsize) {
     if (!g_sd_ready || g_harvesting) return -1;
     (void)offset;
-    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+    if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return -1;
     bool ok = sd.card()->writeSectors(lba, buf, bufsize / 512);
     xSemaphoreGive(g_sd_mutex);
     if (ok) {
@@ -428,6 +432,10 @@ static void wifiTask(void* /*param*/) {
         // ── Maintain STA connection ────────────────────────────────────────────
         case WS_CONNECTED: {
             if (WiFi.status() == WL_CONNECTED) {
+                if (!g_netConnected) {
+                    DBG.printf("WiFi: connected to '%s' IP=%s\n",
+                        WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+                }
                 g_netConnected = true; discMs = 0;
                 strlcpy(g_wifiLabel, WiFi.SSID().c_str(), sizeof(g_wifiLabel));
                 g_wifiBars = rssiToBars(WiFi.RSSI());
@@ -569,6 +577,155 @@ static void updateDisplay() {
     display.display();
 }
 
+// ── FTP upload ─────────────────────────────────────────────────────────────────
+// Minimal passive-mode FTP STOR using raw WiFiClient.
+// Loads config from NVS namespace "ftp": host, port, user, pass, path.
+static bool ftpStorFile(const char* name) {
+    Preferences p; p.begin("ftp", true);
+    char host[64];  strlcpy(host,  p.getString("host","").c_str(), sizeof(host));
+    int  port =     p.getInt("port", 21);
+    char user[33];  strlcpy(user,  p.getString("user","").c_str(), sizeof(user));
+    char pass[65];  strlcpy(pass,  p.getString("pass","").c_str(), sizeof(pass));
+    char rpath[64]; strlcpy(rpath, p.getString("path","/").c_str(), sizeof(rpath));
+    p.end();
+
+    if (!host[0] || !user[0]) { DBG.println("FTP: no config"); return false; }
+    if (!g_netConnected)       { DBG.println("FTP: no WiFi");   return false; }
+
+    WiFiClient ctrl;
+    if (!ctrl.connect(host, (uint16_t)port)) {
+        DBG.printf("FTP: connect failed %s:%d\n", host, port); return false;
+    }
+
+    char line[512] = "";
+
+    // Read one CRLF-terminated line, 10 s timeout.
+    auto rdLine = [&]() -> bool {
+        int i = 0; uint32_t t0 = millis();
+        while (millis()-t0 < 10000) {
+            if (!ctrl.connected()) return false;
+            if (ctrl.available()) {
+                char c = ctrl.read();
+                if (c == '\n') { line[i] = 0; return true; }
+                if (c != '\r' && i < (int)sizeof(line)-1) line[i++] = c;
+            } else { vTaskDelay(pdMS_TO_TICKS(5)); }
+        }
+        return false;
+    };
+
+    // Consume multi-line responses (e.g. "220-..." lines until "220 ").
+    auto rdResp = [&]() -> bool {
+        do { if (!rdLine()) return false; } while (strlen(line) > 3 && line[3] == '-');
+        return true;
+    };
+
+    // ── FTP dialogue ──────────────────────────────────────────────────────────
+    if (!rdResp() || line[0] != '2') {
+        DBG.printf("FTP: bad welcome: %s\n", line); ctrl.stop(); return false;
+    }
+    ctrl.printf("USER %s\r\n", user); rdResp();
+    ctrl.printf("PASS %s\r\n", pass);
+    if (!rdResp() || line[0] != '2') {
+        DBG.printf("FTP: login failed: %s\n", line); ctrl.stop(); return false;
+    }
+    ctrl.print("TYPE I\r\n"); rdResp();
+    ctrl.printf("CWD %s\r\n", rpath); rdResp();  // ignore CWD failure (root is fine)
+    ctrl.print("PASV\r\n");
+    if (!rdResp() || line[0] != '2') {
+        DBG.printf("FTP: PASV failed: %s\n", line); ctrl.stop(); return false;
+    }
+
+    // Parse "227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)"
+    int h1,h2,h3,h4,dp1,dp2;
+    char* lp = strchr(line, '(');
+    if (!lp || sscanf(lp+1, "%d,%d,%d,%d,%d,%d", &h1,&h2,&h3,&h4,&dp1,&dp2) != 6) {
+        DBG.println("FTP: PASV parse failed"); ctrl.stop(); return false;
+    }
+    char dh[16]; snprintf(dh, sizeof(dh), "%d.%d.%d.%d", h1,h2,h3,h4);
+    int  dp = dp1*256 + dp2;
+
+    // Open data connection, issue STOR, then stream.
+    WiFiClient data;
+    if (!data.connect(dh, (uint16_t)dp)) {
+        DBG.printf("FTP: data connect failed %s:%d\n", dh, dp);
+        ctrl.stop(); return false;
+    }
+    ctrl.printf("STOR %s\r\n", name);
+    if (!rdResp() || line[0] != '1') {
+        DBG.printf("FTP: STOR failed: %s\n", line);
+        data.stop(); ctrl.stop(); return false;
+    }
+
+    // Stream file from /harvested/<name> in 4 KB chunks.
+    char fpath[80]; snprintf(fpath, sizeof(fpath), "/harvested/%s", name);
+    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+    FsFile f; bool fok = f.open(&sd, fpath, O_RDONLY);
+    xSemaphoreGive(g_sd_mutex);
+
+    if (!fok) { data.stop(); ctrl.stop(); return false; }
+
+    // WiFiClient.write() uses MSG_DONTWAIT on ESP32 — returns immediately
+    // (bytes sent if buffer has space, 0 if full).  We yield briefly on
+    // 0-returns to let the lwIP task drain the send buffer via ACKs.
+    // Timeout: stall detection (no progress for 60 s) rather than wall-clock
+    // cap so large files complete regardless of how slow the link is.
+    auto writeAll = [&](const uint8_t* buf, size_t len) -> bool {
+        size_t sent = 0;
+        uint32_t lastProgressMs = millis();
+        while (sent < len) {
+            if (!data.connected()) { DBG.println("FTP: data conn lost"); return false; }
+            if (millis() - lastProgressMs > 60000) {
+                DBG.println("FTP: write stalled 60s"); return false;
+            }
+            size_t wr = data.write(buf + sent, len - sent);
+            if (wr > 0) {
+                sent += wr;
+                lastProgressMs = millis();
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(5));
+            }
+        }
+        return true;
+    };
+
+    uint8_t cbuf[4096]; int n;
+    uint32_t xfrStart = millis();
+    uint32_t bytesWritten = 0;
+    uint32_t nextLogMb = 1;
+    bool xfrOk = true;
+    for (;;) {
+        xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+        n = f.read(cbuf, sizeof(cbuf));
+        xSemaphoreGive(g_sd_mutex);
+        if (n <= 0) break;
+        if (!writeAll(cbuf, (size_t)n)) { xfrOk = false; break; }
+        bytesWritten += (uint32_t)n;
+        if (bytesWritten / 1000000 >= nextLogMb) {
+            float elapsed = (millis() - xfrStart) / 1000.0f;
+            if (elapsed > 0)
+                DBG.printf("FTP: %.0f MB sent (%.0f KB/s)\n",
+                    bytesWritten / 1e6f, bytesWritten / 1024.0f / elapsed);
+            nextLogMb = bytesWritten / 1000000 + 1;
+        }
+    }
+    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+    f.close();
+    xSemaphoreGive(g_sd_mutex);
+
+    if (!xfrOk) { data.stop(); ctrl.stop(); return false; }
+    data.stop();  // flush + EOF to server
+
+    if (!rdResp() || line[0] != '2') {
+        DBG.printf("FTP: transfer failed: %s\n", line); ctrl.stop(); return false;
+    }
+    float elapsed = (millis() - xfrStart) / 1000.0f;
+    DBG.printf("FTP: uploaded '%s' OK (%.0f KB/s)\n", name,
+        elapsed > 0 ? bytesWritten / 1024.0f / elapsed : 0);
+    ctrl.print("QUIT\r\n"); rdResp();
+    ctrl.stop();
+    return true;
+}
+
 // ── Skip list ──────────────────────────────────────────────────────────────────
 static const char* const SKIP_NAMES[] = {
     "System Volume Information", "desktop.ini", "Thumbs.db",
@@ -602,23 +759,59 @@ static void uploadTask(void* /*param*/) {
             }
             xSemaphoreGive(g_sd_mutex);
 
-            if (!name[0]) break;
-
-            DBG.printf("Upload stub: %s\n", name);
-            // TODO: read chunks with mutex, transmit via cellular
+            if (!name[0]) { DBG.println("Upload: no files in /harvested/"); break; }
 
             char path[80];
             snprintf(path, sizeof(path), "/harvested/%s", name);
+            DBG.printf("Upload: found %s\n", path);
+
+            // Get file size before upload attempt
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
             float fileMb = 0.0f;
             { FsFile f; if (f.open(&sd, path, O_RDONLY)) { fileMb = (float)f.fileSize() / 1e6f; f.close(); } }
+            xSemaphoreGive(g_sd_mutex);
+
+            // Wait for WiFi before attempting FTP (may not be connected yet at boot)
+            {
+                uint32_t waited = 0;
+                while (!g_netConnected && waited < 90000) {
+                    if (waited == 0) DBG.println("Upload: waiting for WiFi...");
+                    vTaskDelay(pdMS_TO_TICKS(2000)); waited += 2000;
+                }
+            }
+            if (!g_netConnected) {
+                DBG.printf("Upload: no WiFi after 90s — will retry in 60s\n");
+                vTaskDelay(pdMS_TO_TICKS(60000)); continue;
+            }
+
+            // Upload via FTP; on failure retry after a delay
+            DBG.printf("Uploading: %s (%.1f MB) heap=%u min=%u\n",
+                       name, fileMb, ESP.getFreeHeap(), ESP.getMinFreeHeap());
+            bool uploaded = ftpStorFile(name);
+            if (!uploaded) {
+                DBG.printf("FTP failed for %s — retrying in 30s\n", name);
+                vTaskDelay(pdMS_TO_TICKS(30000)); continue;  // retry same file
+            }
+
+            // Delete uploaded file.  SdFat's cache may be stale (MSC raw I/O
+            // bypasses it), so removal can fail.  If it does, the file stays
+            // and will be re-uploaded next cycle — wasteful but not fatal.
+            // The next doHarvest() calls sd.begin() which refreshes the cache,
+            // so stale entries get cleaned up naturally.
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
             bool removed = sd.remove(path);
             xSemaphoreGive(g_sd_mutex);
             if (removed) {
+                DBG.printf("Removed %s\n", path);
                 if (g_filesQueued > 0) g_filesQueued--;
                 g_filesUploaded++;
                 g_mbUploaded += fileMb;
                 if (g_mbQueued >= fileMb) g_mbQueued -= fileMb; else g_mbQueued = 0.0f;
+            } else {
+                DBG.printf("sd.remove(%s) failed — will retry next cycle\n", path);
+                // Break out so we don't re-upload the same file immediately.
+                // Next harvest's sd.begin() will refresh the cache.
+                break;
             }
         }
         DBG.printf("Upload idle — %u uploaded\n", g_filesUploaded);
@@ -627,24 +820,25 @@ static void uploadTask(void* /*param*/) {
 
 // ── Harvest ────────────────────────────────────────────────────────────────────
 static void doHarvest() {
+    DBG.println("doHarvest: start");
     g_harvesting = true;
-    delay(150);   // let any in-flight MSC sector transfer finish
+    MSC.mediaPresent(false);  // tell host the drive was ejected — clean unmount
+    DBG.println("doHarvest: media ejected");
+    delay(500);   // give host time to process the media-not-present status
     updateDisplay();
 
     // Take mutex to exclude uploadTask from the SD bus for the entire harvest.
     // MSC callbacks are already blocked by g_harvesting=true.
     xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+    DBG.println("doHarvest: got mutex, calling sd.begin");
 
     // sd.begin() re-initializes the card (CMD0/8/41) and re-mounts the FS.
     // After the host's raw MSC writes the card may be in power-save mode;
     // retry up to 3 times with a short delay to give it time to wake up.
-    g_harvest_log[0] = '\0';
     bool ok = false;
     for (int i = 0; i < 3 && !ok; i++) {
         ok = sd.begin(g_cfg);
-        char tmp[64];
-        snprintf(tmp, sizeof(tmp), "Harvest attempt %d: sd.begin=%s\n", i+1, ok ? "OK" : "FAIL");
-        strncat(g_harvest_log, tmp, sizeof(g_harvest_log) - strlen(g_harvest_log) - 1);
+        DBG.printf("doHarvest: sd.begin attempt %d = %s\n", i+1, ok ? "OK" : "FAIL");
         if (!ok) delay(500);
     }
 
@@ -654,6 +848,8 @@ static void doHarvest() {
         g_writeDetected = false; g_lastWriteMs = 0;
         g_hostWasConnected = false; g_hostConnected = false;
         g_harvesting = false;
+        MSC.mediaPresent(true);   // re-insert media even on failure
+        DBG.println("doHarvest: sd.begin failed, media re-inserted");
         return;
     }
 
@@ -686,18 +882,31 @@ static void doHarvest() {
     }
     root.close();
 
+    // Note: SdFat writes dirty cache sectors to SD on eviction.
+    // MSC reads raw sectors (bypassing cache), so the host sees
+    // actual disk state.  No explicit flush needed here.
+
     xSemaphoreGive(g_sd_mutex);
 
     g_filesQueued += count;
     if (count > 0) g_mbQueued += usedMb;
-    DBG.printf("Harvest done: %u file(s) (%.1f MB)\n", count, usedMb);
+    DBG.printf("doHarvest: done %u file(s) (%.1f MB)\n", count, usedMb);
 
     g_writeDetected = false; g_lastWriteMs = 0;
     g_hostWasConnected = false; g_hostConnected = false;
     g_hostWrittenMb = 0.0f;
     g_harvesting = false;
+    MSC.mediaPresent(true);   // re-insert drive — host remounts with fresh data
+    DBG.println("doHarvest: media re-inserted");
 
     if (count > 0 && g_upload_task) xTaskNotifyGive(g_upload_task);
+}
+
+static void harvestTask(void* /*param*/) {
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // wait for signal from loop()
+        doHarvest();
+    }
 }
 
 // ── setup ─────────────────────────────────────────────────────────────────────
@@ -715,7 +924,27 @@ void setup() {
     DBG.begin(115200);
     uint32_t t0 = millis();
     while (!DBG && (millis() - t0) < 3000) { delay(10); }
-    DBG.println("USB up");
+
+    // Crash-loop detection: count rapid reboots via NVS.
+    // If >5 reboots within seconds of each other, pause to allow debugging.
+    {
+        Preferences bc; bc.begin("dbg", false);
+        uint32_t boots = bc.getUInt("boots", 0) + 1;
+        bc.putUInt("boots", boots);
+        bc.end();
+        esp_reset_reason_t reason = esp_reset_reason();
+        DBG.printf("Boot #%u  reset_reason=%d  heap=%u\n",
+                   boots, (int)reason, ESP.getFreeHeap());
+        if (boots > 5 && reason != ESP_RST_POWERON) {
+            DBG.println("CRASH LOOP DETECTED — pausing 30s for debug");
+            disp("CRASH LOOP", "Paused 30s");
+            delay(30000);
+            // Reset counter so next boot proceeds normally
+            Preferences bc2; bc2.begin("dbg", false);
+            bc2.putUInt("boots", 0);
+            bc2.end();
+        }
+    }
 
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
     if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
@@ -762,16 +991,129 @@ void setup() {
     disp("USB drive ready", "");
     g_lastDisplayMs = millis();
 
-    xTaskCreatePinnedToCore(uploadTask, "upload", 8192, nullptr, 1, &g_upload_task, 1);
-    xTaskCreatePinnedToCore(wifiTask,   "wifi",   8192, nullptr, 1, &g_wifi_task,   1);
-    DBG.println("setup done");
+    xTaskCreatePinnedToCore(uploadTask,  "upload",  16384, nullptr, 1, &g_upload_task,  1);
+    xTaskCreatePinnedToCore(harvestTask, "harvest", 16384, nullptr, 1, &g_harvest_task, 1);
+    xTaskCreatePinnedToCore(wifiTask,    "wifi",    8192, nullptr, 1, &g_wifi_task,    1);
+
+    // Scan /harvested/ for files left over from before the last reboot.
+    // The upload task starts blocked; notify it if there is work to do.
+    {
+        FsFile h, f;
+        if (h.open(&sd, "/harvested", O_RDONLY)) {
+            while (f.openNext(&h, O_RDONLY)) {
+                char name[64]; f.getName(name, sizeof(name));
+                if (!f.isDir() && !f.isHidden() && !f.isSystem()) {
+                    g_filesQueued++;
+                    g_mbQueued += (float)f.fileSize() / 1e6f;
+                }
+                f.close();
+            }
+            h.close();
+            if (g_filesQueued > 0) {
+                DBG.printf("Boot: found %u file(s) in /harvested/ — notifying upload\n", g_filesQueued);
+                xTaskNotifyGive(g_upload_task);
+            }
+        }
+    }
+
+    DBG.printf("setup done — free heap: %u, min: %u\n",
+               ESP.getFreeHeap(), ESP.getMinFreeHeap());
 }
+
+// ── Serial CLI — credential provisioning for automated testing ─────────────────
+// Commands (newline-terminated):
+//   SETWIFI <ssid> <pass>
+//   SETFTP  <host> <port> <user> <pass> <remote_path>
+//   STATUS
+//   REBOOT
+static void processCLI(const char* cmd) {
+    if (strncmp(cmd, "SETWIFI ", 8) == 0) {
+        const char* rest = cmd + 8;
+        const char* sp   = strchr(rest, ' ');
+        char ssid[33] = "", pass[65] = "";
+        if (sp) {
+            int slen = sp - rest;
+            strlcpy(ssid, rest, min(slen + 1, (int)sizeof(ssid)));
+            strlcpy(pass, sp + 1, sizeof(pass));
+        } else {
+            strlcpy(ssid, rest, sizeof(ssid));
+        }
+        if (!ssid[0]) { DBG.println("CLI: SETWIFI <ssid> <pass>"); return; }
+        saveNetwork(ssid, pass);
+        DBG.printf("CLI: WiFi saved: '%s'\n", ssid);
+
+    } else if (strncmp(cmd, "SETFTP ", 7) == 0) {
+        char host[64], user[33], pass[65], path[64]; int port = 21;
+        // sscanf stops at whitespace per field — passwords must not contain spaces
+        if (sscanf(cmd + 7, "%63s %d %32s %64s %63s",
+                   host, &port, user, pass, path) < 4) {
+            DBG.println("CLI: SETFTP <host> <port> <user> <pass> [<path>]"); return;
+        }
+        Preferences p; p.begin("ftp", false);
+        p.putString("host", host);
+        p.putInt("port", port);
+        p.putString("user", user);
+        p.putString("pass", pass);
+        p.putString("path", path[0] ? path : "/");
+        p.end();
+        DBG.printf("CLI: FTP saved: %s:%d user=%s path=%s\n", host, port, user, path);
+
+    } else if (strcmp(cmd, "STATUS") == 0) {
+        char ipStr[20] = "disconnected";
+        if (g_netConnected) strlcpy(ipStr, WiFi.localIP().toString().c_str(), sizeof(ipStr));
+        DBG.printf("CLI: wifi=%s ap=%s files_q=%u files_up=%u mbq=%.2f mbup=%.2f\n",
+            ipStr, g_apMode ? "yes" : "no",
+            g_filesQueued, g_filesUploaded,
+            g_mbQueued, g_mbUploaded);
+        Preferences p; p.begin("ftp", true);
+        DBG.printf("CLI: ftp_host=%s port=%d user=%s path=%s\n",
+            p.getString("host","(none)").c_str(), p.getInt("port",21),
+            p.getString("user","(none)").c_str(),
+            p.getString("path","/").c_str());
+        p.end();
+
+    } else if (strcmp(cmd, "RESETBOOT") == 0) {
+        Preferences bc; bc.begin("dbg", false);
+        bc.putUInt("boots", 0);
+        bc.end();
+        DBG.println("CLI: boot counter reset");
+
+    } else if (strcmp(cmd, "UPLOAD") == 0) {
+        if (g_upload_task) {
+            DBG.println("CLI: triggering upload task");
+            xTaskNotifyGive(g_upload_task);
+        }
+
+    } else if (strcmp(cmd, "REBOOT") == 0) {
+        DBG.println("CLI: rebooting...");
+        delay(200);
+        ESP.restart();
+
+    } else {
+        DBG.printf("CLI: unknown: '%s'\n", cmd);
+        DBG.println("CLI: commands: SETWIFI SETFTP STATUS REBOOT");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 void loop() {
     // Print buffered harvest log after serial reconnects (USB may have reset during harvest)
     if (g_harvest_log[0]) {
         DBG.print(g_harvest_log);
         g_harvest_log[0] = '\0';
+    }
+
+    // Serial CLI: accumulate characters into a line, process on newline
+    while (DBG.available()) {
+        static char cliBuf[128];
+        static int  cliLen = 0;
+        char c = DBG.read();
+        if (c == '\n' || c == '\r') {
+            if (cliLen > 0) { cliBuf[cliLen] = 0; processCLI(cliBuf); cliLen = 0; }
+        } else if (cliLen < (int)sizeof(cliBuf) - 1) {
+            cliBuf[cliLen++] = c;
+        }
     }
 
     uint32_t now = millis();
@@ -782,7 +1124,7 @@ void loop() {
     if (!g_harvesting && g_writeDetected && g_hostWasConnected &&
         g_lastWriteMs != 0 && (now - g_lastWriteMs) >= QUIET_WINDOW_MS) {
         DBG.println("Quiet window elapsed — triggering harvest");
-        doHarvest();
+        if (g_harvest_task) xTaskNotifyGive(g_harvest_task);
     }
     delay(100);
 }
