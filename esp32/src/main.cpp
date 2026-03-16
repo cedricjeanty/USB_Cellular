@@ -1216,40 +1216,45 @@ void setup() {
     spi.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
 
     // sd.begin(): full init — card init (CMD0/8/41) + FAT volume mount.
-    // If no valid filesystem, format FAT32 and retry.
+    // NEVER auto-format: a corrupt FAT after power loss is recoverable,
+    // but formatting destroys all data.  Only format on explicit CLI command.
     {
         bool has_fs = false;
-        for (int i = 1; i <= 5 && !has_fs; i++) {
+        for (int i = 1; i <= 10 && !has_fs; i++) {
             has_fs = sd.begin(g_cfg);
-            if (!has_fs) { disp("SD init...", "retrying"); delay(500); }
-        }
-        if (!has_fs) {
-            DBG.println("No filesystem — formatting FAT32...");
-            disp("Formatting...", "please wait");
-            if (sd.format(&DBG)) {
-                DBG.println("Format OK — remounting...");
-                has_fs = sd.begin(g_cfg);
+            if (!has_fs) {
+                DBG.printf("SD init attempt %d failed\n", i);
+                disp("SD init...", i <= 5 ? "retrying" : "check card");
+                delay(1000);
             }
         }
         if (!has_fs) {
-            disp("SD init failed!", "Check wiring");
-            for (;;) delay(1000);
+            DBG.println("SD init failed — NOT formatting (data preservation)");
+            DBG.println("Use CLI command FORMAT to format if card is truly blank");
+            disp("SD FAILED", "serial: FORMAT");
+            // Continue without SD — USB MSC won't work but WiFi/CLI still function
+            // so the user can issue FORMAT via serial if the card is genuinely empty.
         }
-        g_card_sectors = sd.card()->sectorCount();
-        DBG.printf("SD OK: %lu sectors (%.0f MB)\n",
-                   g_card_sectors, g_card_sectors * 512.0f / 1e6f);
+        if (has_fs) {
+            g_card_sectors = sd.card()->sectorCount();
+            DBG.printf("SD OK: %lu sectors (%.0f MB)\n",
+                       g_card_sectors, g_card_sectors * 512.0f / 1e6f);
+        }
     }
 
     g_sdTotalMb = g_card_sectors * 512.0f / 1e6f;
 
-    // MSC: raw sector access through sd.card() bypasses sd's FS cache.
-    // sd.begin() in doHarvest() refreshes the cache each harvest cycle.
-    MSC.begin(g_card_sectors, 512);
-    MSC.mediaPresent(true);
-    g_sd_ready = true;
-    DBG.printf("MSC ready: %lu sectors (%.0f MB)\n", g_card_sectors, g_sdTotalMb);
-
-    disp("USB drive ready", "");
+    if (g_card_sectors > 0) {
+        // MSC: raw sector access through sd.card() bypasses sd's FS cache.
+        // sd.begin() in doHarvest() refreshes the cache each harvest cycle.
+        MSC.begin(g_card_sectors, 512);
+        MSC.mediaPresent(true);
+        g_sd_ready = true;
+        DBG.printf("MSC ready: %lu sectors (%.0f MB)\n", g_card_sectors, g_sdTotalMb);
+        disp("USB drive ready", "");
+    } else {
+        disp("No SD card", "CLI: FORMAT");
+    }
     g_lastDisplayMs = millis();
 
     xTaskCreatePinnedToCore(uploadTask,  "upload",  16384, nullptr, 1, &g_upload_task,  1);
@@ -1341,6 +1346,22 @@ static void processCLI(const char* cmd) {
             xTaskNotifyGive(g_upload_task);
         }
 
+    } else if (strcmp(cmd, "FORMAT") == 0) {
+        DBG.println("CLI: formatting SD card — ALL DATA WILL BE LOST");
+        g_harvesting = true;  // block MSC
+        MSC.mediaPresent(false);
+        delay(500);
+        if (sd.format(&DBG)) {
+            DBG.println("CLI: format OK");
+            sd.begin(g_cfg);
+            g_card_sectors = sd.card()->sectorCount();
+            g_sd_ready = true;
+        } else {
+            DBG.println("CLI: format FAILED");
+        }
+        g_harvesting = false;
+        MSC.mediaPresent(true);
+
     } else if (strcmp(cmd, "REBOOT") == 0) {
         DBG.println("CLI: rebooting...");
         delay(200);
@@ -1374,7 +1395,7 @@ void loop() {
     }
 
     uint32_t now = millis();
-    if (now - g_lastDisplayMs >= DISPLAY_INTERVAL_MS) {
+    if (g_sd_ready && now - g_lastDisplayMs >= DISPLAY_INTERVAL_MS) {
         g_lastDisplayMs = now;
         updateDisplay();
     }
