@@ -1215,9 +1215,15 @@ static void doHarvest() {
         }
     }
 
-    // Note: SdFat writes dirty cache sectors to SD on eviction.
-    // MSC reads raw sectors (bypassing cache), so the host sees
-    // actual disk state.  No explicit flush needed here.
+    // Flush SdFat's dirty cache to the physical SD card.  MSC reads raw
+    // sectors (bypassing cache), so without this the host sees stale data
+    // and files appear to vanish after harvest.
+    // Re-init the volume so the uploadTask and next harvest see fresh state.
+    if (count > 0) {
+        sd.end();     // flushes cache to card
+        sd.begin(g_cfg);  // remount for upload task
+        DBG.println("doHarvest: cache flushed");
+    }
 
     xSemaphoreGive(g_sd_mutex);
 
@@ -1488,7 +1494,7 @@ void loop() {
     if (!g_harvesting && g_writeDetected && g_hostWasConnected &&
         g_lastWriteMs != 0 && (now - g_lastWriteMs) >= QUIET_WINDOW_MS &&
         (now - g_lastHarvestMs) >= QUIET_WINDOW_MS &&  // cooldown after last harvest
-        g_hostWrittenMb > 0.001f) {  // >1 KB — ignore metadata-only writes
+        g_hostWrittenMb > 0.01f) {  // >10 KB — ignore metadata-only writes (deletes, mounts)
         DBG.printf("Harvest trigger: %.1f KB written, %us idle\n",
                    g_hostWrittenMb * 1024.0f, (now - g_lastWriteMs) / 1000);
         if (g_harvest_task) xTaskNotifyGive(g_harvest_task);
