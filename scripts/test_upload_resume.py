@@ -200,7 +200,7 @@ def main():
     interrupted = False
     t0 = time.time()
     output = ""
-    while time.time() - t0 < 300:
+    while time.time() - t0 < 600:  # 10 min — host delayed writes can take 4+ min
         try:
             data = s.read(max(s.in_waiting, 1))
             if data:

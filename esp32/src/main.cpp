@@ -76,7 +76,8 @@ static float    g_mbQueued       = 0.0f;  // MB in /harvested awaiting upload
 static float    g_mbUploaded     = 0.0f;  // MB uploaded this session
 static float    g_sdTotalMb      = 0.0f;
 static uint32_t g_lastDisplayMs = 0;
-static uint32_t g_lastHarvestMs = 0;   // cooldown: prevent rapid re-harvest
+static uint32_t g_lastHarvestMs  = 0;     // cooldown: prevent rapid re-harvest
+static uint32_t g_harvestCoolMs = 30000;  // adaptive: 30s after files found, 5min after empty
 
 static TaskHandle_t g_upload_task  = nullptr;
 static TaskHandle_t g_harvest_task = nullptr;
@@ -120,13 +121,7 @@ static int32_t msc_read(uint32_t lba, uint32_t offset, void* buf, uint32_t bufsi
     if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return -1;
     bool ok = sd.card()->readSectors(lba, (uint8_t*)buf, bufsize / 512);
     xSemaphoreGive(g_sd_mutex);
-    if (ok) {
-        g_lastIoMs = millis();
-        // Reset quiet-window timer on reads too — during multi-file copies the
-        // host reads directories between writes.  Without this, harvest triggers
-        // mid-copy whenever a gap between writes exceeds QUIET_WINDOW_MS.
-        if (g_writeDetected) g_lastWriteMs = millis();
-    }
+    if (ok) g_lastIoMs = millis();
     return ok ? (int32_t)bufsize : -1;
 }
 
@@ -1216,12 +1211,12 @@ static void doHarvest() {
     }
 
     // Flush SdFat's dirty cache to the physical SD card.  MSC reads raw
-    // sectors (bypassing cache), so without this the host sees stale data
-    // and files appear to vanish after harvest.
-    // Re-init the volume so the uploadTask and next harvest see fresh state.
+    // sectors (bypassing cache), so without this the host sees stale data.
+    // sd.end()/sd.begin() is too heavy (breaks MSC).  Instead, force the
+    // last dirty cache sector out by reading a sector that isn't cached.
     if (count > 0) {
-        sd.end();     // flushes cache to card
-        sd.begin(g_cfg);  // remount for upload task
+        uint8_t dummy[512];
+        sd.card()->readSector(0, dummy);  // evicts dirty cache sector
         DBG.println("doHarvest: cache flushed");
     }
 
@@ -1237,8 +1232,12 @@ static void doHarvest() {
 
     g_harvesting = false;
     MSC.mediaPresent(true);
-    g_lastHarvestMs = millis();  // cooldown: ignore host metadata writes after remount
-    DBG.printf("doHarvest: media re-inserted (%u files)\n", count);
+    g_lastHarvestMs = millis();
+    // Adaptive cooldown: short after productive harvest, long after empty
+    // (empty harvest → host metadata re-triggers → need longer cooldown)
+    g_harvestCoolMs = (count > 0) ? QUIET_WINDOW_MS : 300000UL;
+    DBG.printf("doHarvest: media re-inserted (%u files, cooldown %us)\n",
+               count, g_harvestCoolMs / 1000);
 
     if (count > 0 && g_upload_task) xTaskNotifyGive(g_upload_task);
 }
@@ -1493,7 +1492,7 @@ void loop() {
     }
     if (!g_harvesting && g_writeDetected && g_hostWasConnected &&
         g_lastWriteMs != 0 && (now - g_lastWriteMs) >= QUIET_WINDOW_MS &&
-        (now - g_lastHarvestMs) >= QUIET_WINDOW_MS &&  // cooldown after last harvest
+        (now - g_lastHarvestMs) >= g_harvestCoolMs &&  // adaptive cooldown
         g_hostWrittenMb > 0.01f) {  // >10 KB — ignore metadata-only writes (deletes, mounts)
         DBG.printf("Harvest trigger: %.1f KB written, %us idle\n",
                    g_hostWrittenMb * 1024.0f, (now - g_lastWriteMs) / 1000);
