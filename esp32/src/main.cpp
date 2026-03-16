@@ -1047,26 +1047,20 @@ static void uploadTask(void* /*param*/) {
                 vTaskDelay(pdMS_TO_TICKS(30000)); continue;  // retry same file
             }
 
-            // Delete uploaded file.  SdFat's cache may be stale (MSC raw I/O
-            // bypasses it), so removal can fail.  If it does, the file stays
-            // and will be re-uploaded next cycle — wasteful but not fatal.
-            // The next doHarvest() calls sd.begin() which refreshes the cache,
-            // so stale entries get cleaned up naturally.
+            // Delete the /harvested/ copy and create a .done marker so the
+            // next harvest doesn't re-copy the original file.
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-            bool removed = sd.remove(path);
+            sd.remove(path);
+            // Create .done marker: /harvested/.done__<name>
+            char donePath[160];
+            snprintf(donePath, sizeof(donePath), "/harvested/.done__%s", name);
+            { FsFile m; m.open(&sd, donePath, O_WRONLY | O_CREAT); m.close(); }
             xSemaphoreGive(g_sd_mutex);
-            if (removed) {
-                DBG.printf("Removed %s\n", path);
-                if (g_filesQueued > 0) g_filesQueued--;
-                g_filesUploaded++;
-                g_mbUploaded += fileMb;
-                if (g_mbQueued >= fileMb) g_mbQueued -= fileMb; else g_mbQueued = 0.0f;
-            } else {
-                DBG.printf("sd.remove(%s) failed — will retry next cycle\n", path);
-                // Break out so we don't re-upload the same file immediately.
-                // Next harvest's sd.begin() will refresh the cache.
-                break;
-            }
+            DBG.printf("Uploaded & marked done: %s\n", name);
+            if (g_filesQueued > 0) g_filesQueued--;
+            g_filesUploaded++;
+            g_mbUploaded += fileMb;
+            if (g_mbQueued >= fileMb) g_mbQueued -= fileMb; else g_mbQueued = 0.0f;
         }
         DBG.printf("Upload idle — %u uploaded\n", g_filesUploaded);
     }
@@ -1110,9 +1104,13 @@ static void doHarvest() {
     // Ensure /harvested directory exists
     if (!sd.exists("/harvested")) sd.mkdir("/harvested");
 
-    // Recursively move all files (not in /harvested/) to /harvested/.
-    // Preserves flat structure in /harvested/ using path-encoded names:
-    //   /logs/2024/data.bin → /harvested/logs__2024__data.bin
+    // Recursively COPY new files to /harvested/ for upload.
+    // Originals stay on the USB drive — the host always sees its files.
+    // Flattens paths: /logs/data.bin → /harvested/logs__data.bin
+    //
+    // Skip logic (avoid re-uploading):
+    //   - /harvested/<name> exists with same size → pending upload, skip
+    //   - /harvested/.done__<name> exists → already uploaded, skip
     uint16_t count = 0; float usedMb = 0.0f;
 
     // Stack-based directory walk (avoids recursive function calls on 16 KB stack)
@@ -1138,7 +1136,6 @@ static void doHarvest() {
 
         if (entry.isDir()) {
             entry.close();
-            // Recurse into subdirectory (skip /harvested itself)
             if (depth < 3) {
                 depth++;
                 char subpath[80];
@@ -1147,7 +1144,6 @@ static void doHarvest() {
                 else
                     snprintf(subpath, sizeof(subpath), "/%s", name);
                 stack[depth].dir.open(&sd, subpath, O_RDONLY);
-                // Build flat prefix: replace / with __
                 if (stack[depth-1].prefix[0])
                     snprintf(stack[depth].prefix, sizeof(stack[depth].prefix),
                              "%s__%s", stack[depth-1].prefix, name);
@@ -1160,59 +1156,62 @@ static void doHarvest() {
         uint32_t fileBytes = entry.fileSize();
         float fileMb = (float)fileBytes / 1e6f;
         entry.close();
+        if (fileBytes == 0) continue;  // skip empty files
 
-        // Build source path and flat destination name.
-        // Files in subdirs get flattened: /logs/data.bin → /harvested/logs__data.bin
-        char srcDir[80] = "/";
-        if (stack[depth].prefix[0]) {
-            // Reconstruct real directory path from __ prefix
-            strlcpy(srcDir + 1, stack[depth].prefix, sizeof(srcDir) - 1);
-            for (char* p = srcDir + 1; *p; p++) {
-                if (p[0] == '_' && p[1] == '_') { p[0] = '/'; memmove(p+1, p+2, strlen(p+1)); }
-            }
-        }
-        char src[128], dstName[128], dst[140];
-        snprintf(src, sizeof(src), "%s/%s", srcDir, name);
+        // Build destination name (flatten subdirs with __)
+        char dstName[128];
         if (stack[depth].prefix[0])
             snprintf(dstName, sizeof(dstName), "%s__%s", stack[depth].prefix, name);
         else
             strlcpy(dstName, name, sizeof(dstName));
-        snprintf(dst, sizeof(dst), "/harvested/%s", dstName);
 
-        // Remove stale 0-byte duplicates from previous failed harvests
+        // Skip if already uploaded (.done marker exists)
+        char donePath[160];
+        snprintf(donePath, sizeof(donePath), "/harvested/.done__%s", dstName);
+        if (sd.exists(donePath)) continue;
+
+        // Skip if already pending upload (same-size copy in /harvested/)
+        char dst[160];
+        snprintf(dst, sizeof(dst), "/harvested/%s", dstName);
         if (sd.exists(dst)) {
             FsFile dup; dup.open(&sd, dst, O_RDONLY);
-            if (dup && dup.fileSize() == 0) { dup.close(); sd.remove(dst); }
-            else if (dup) { dup.close(); }
+            if (dup && dup.fileSize() == fileBytes) { dup.close(); continue; }
+            if (dup) { dup.close(); sd.remove(dst); }  // stale/wrong size — replace
         }
-        if (sd.exists(dst)) { continue; }  // real duplicate, skip
 
-        // Try rename first (works for top-level files).
-        // For files in subdirectories, FAT rename() can't move across
-        // directories — fall back to copy + delete.
-        bool moved = sd.rename(src, dst);
-        if (!moved) {
-            // Copy file to /harvested/, then delete original
-            FsFile sf, df;
-            if (sf.open(&sd, src, O_RDONLY) && df.open(&sd, dst, O_WRONLY | O_CREAT)) {
-                uint8_t cpbuf[512];
-                uint32_t rem = fileBytes;
-                moved = true;
-                while (rem > 0) {
-                    int n = sf.read(cpbuf, min((uint32_t)sizeof(cpbuf), rem));
-                    if (n <= 0 || df.write(cpbuf, n) != n) { moved = false; break; }
-                    rem -= n;
-                }
-                sf.close(); df.close();
-                if (moved) sd.remove(src);
-                else sd.remove(dst);  // clean up partial copy
+        // Build source path from prefix
+        char src[128];
+        if (stack[depth].prefix[0]) {
+            char srcDir[80] = "/";
+            strlcpy(srcDir + 1, stack[depth].prefix, sizeof(srcDir) - 1);
+            for (char* p = srcDir + 1; *p; p++) {
+                if (p[0] == '_' && p[1] == '_') { p[0] = '/'; memmove(p+1, p+2, strlen(p+1)); }
             }
+            snprintf(src, sizeof(src), "%s/%s", srcDir, name);
+        } else {
+            snprintf(src, sizeof(src), "/%s", name);
         }
-        if (moved) {
-            DBG.printf("Harvested: %s (%.1f MB)\n", src, fileMb);
+
+        // Copy file (original stays in place on USB drive)
+        FsFile sf, df;
+        bool copied = false;
+        if (sf.open(&sd, src, O_RDONLY) && df.open(&sd, dst, O_WRONLY | O_CREAT)) {
+            uint8_t cpbuf[512];
+            uint32_t rem = fileBytes;
+            copied = true;
+            while (rem > 0) {
+                int n = sf.read(cpbuf, min((uint32_t)sizeof(cpbuf), rem));
+                if (n <= 0 || df.write(cpbuf, n) != n) { copied = false; break; }
+                rem -= n;
+            }
+            sf.close(); df.close();
+            if (!copied) sd.remove(dst);  // clean up partial copy
+        }
+        if (copied) {
+            DBG.printf("Harvested: %s → %s (%.1f MB)\n", src, dstName, fileMb);
             usedMb += fileMb; count++;
         } else {
-            DBG.printf("Harvest failed: %s\n", src);
+            DBG.printf("Harvest copy failed: %s\n", src);
         }
     }
 
