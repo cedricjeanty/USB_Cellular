@@ -688,101 +688,276 @@ static bool dbxRefreshToken() {
     return true;
 }
 
-// Upload a file from /harvested/<name> to Dropbox.
+// ── Dropbox chunked upload with resume ────────────────────────────────────────
+// Uses upload_session/start → append_v2 → finish so uploads survive power loss.
+// Session state (session_id + offset) is persisted to NVS after each chunk.
+// On boot, if a session is in progress, we resume from the stored offset.
+// Dropbox sessions last 7 days.
+//
+// Chunk size per HTTPS request.  Larger = fewer TLS handshakes = faster,
+// but more data lost on power-cut.  4 MB is a good balance.
+#define DBX_CHUNK_SIZE (4UL * 1024 * 1024)
+
+// Read HTTP response body, skipping headers.  Returns body as String.
+// Handles chunked transfer encoding by stripping chunk-size lines.
+static String dbxReadResponse(WiFiClientSecure& tls) {
+    bool chunked = false;
+    while (tls.connected()) {
+        String line = tls.readStringUntil('\n');
+        if (line.indexOf("chunked") >= 0) chunked = true;
+        if (line == "\r") break;
+    }
+    String raw = "";
+    uint32_t t1 = millis();
+    while (millis() - t1 < 10000) {
+        if (tls.available()) { raw += tls.readString(); t1 = millis(); }
+        else if (!tls.connected()) break;
+        else vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    tls.stop();
+    if (!chunked) return raw;
+    // De-chunk: extract data between chunk-size lines
+    String body = "";
+    int pos = 0;
+    while (pos < (int)raw.length()) {
+        int nl = raw.indexOf('\n', pos);
+        if (nl < 0) break;
+        // Parse chunk size (hex)
+        String szLine = raw.substring(pos, nl);
+        szLine.trim();
+        unsigned long chunkSz = strtoul(szLine.c_str(), nullptr, 16);
+        if (chunkSz == 0) break;  // final chunk
+        int dataStart = nl + 1;
+        body += raw.substring(dataStart, dataStart + (int)chunkSz);
+        pos = dataStart + (int)chunkSz + 2;  // skip data + \r\n
+    }
+    return body;
+}
+
+// Stream `len` bytes from an open FsFile at current position to a TLS connection.
+// Returns true if all bytes sent.
+static bool dbxStreamChunk(WiFiClientSecure& tls, FsFile& f, uint32_t len) {
+    uint8_t cbuf[8192];
+    uint32_t remaining = len;
+    while (remaining > 0) {
+        uint32_t toRead = (remaining < sizeof(cbuf)) ? remaining : sizeof(cbuf);
+        xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+        int n = f.read(cbuf, toRead);
+        xSemaphoreGive(g_sd_mutex);
+        if (n <= 0) return false;
+
+        size_t sent = 0;
+        uint32_t lastProgress = millis();
+        while (sent < (size_t)n) {
+            if (!tls.connected()) return false;
+            if (millis() - lastProgress > 60000) return false;
+            size_t wr = tls.write(cbuf + sent, n - sent);
+            if (wr > 0) { sent += wr; lastProgress = millis(); }
+            else vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        remaining -= n;
+    }
+    return true;
+}
+
+// Clear stored upload session from NVS.
+static void dbxClearSession() {
+    Preferences p; p.begin("dbxup", false);
+    p.clear();
+    p.end();
+}
+
+// Upload a file from /harvested/<name> to Dropbox using resumable sessions.
 static bool dbxUploadFile(const char* name) {
     if (!g_netConnected) { DBG.println("DBX: no WiFi"); return false; }
-
-    // Refresh token if expired or missing
     if (!g_dbxToken[0] || millis() >= g_dbxTokenExpMs) {
         if (!dbxRefreshToken()) return false;
     }
 
-    // Open file and get size
+    // Open file
     char fpath[80]; snprintf(fpath, sizeof(fpath), "/harvested/%s", name);
     xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
     FsFile f; bool fok = f.open(&sd, fpath, O_RDONLY);
     uint32_t fileSize = fok ? f.fileSize() : 0;
     xSemaphoreGive(g_sd_mutex);
-    if (!fok) { DBG.printf("DBX: can't open %s\n", fpath); return false; }
+    if (!fok || fileSize == 0) { DBG.printf("DBX: can't open %s\n", fpath); return false; }
 
-    // Build Dropbox-API-Arg header
-    char apiArg[128];
-    snprintf(apiArg, sizeof(apiArg),
-        "{\"path\":\"/%s\",\"mode\":\"add\",\"autorename\":true}", name);
-
-    WiFiClientSecure tls;
-    tls.setInsecure();
-    if (!tls.connect("content.dropboxapi.com", 443)) {
-        DBG.println("DBX: TLS connect failed (upload)");
-        xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
-        return false;
+    // Check for a stored session to resume
+    char sessionId[128] = "";
+    uint32_t offset = 0;
+    {
+        Preferences p; p.begin("dbxup", true);
+        String storedName = p.getString("name", "");
+        if (storedName == name) {
+            strlcpy(sessionId, p.getString("sid", "").c_str(), sizeof(sessionId));
+            offset = p.getUInt("offset", 0);
+        }
+        p.end();
     }
 
-    tls.printf("POST /2/files/upload HTTP/1.1\r\n"
-               "Host: content.dropboxapi.com\r\n"
-               "Authorization: Bearer %s\r\n"
-               "Dropbox-API-Arg: %s\r\n"
-               "Content-Type: application/octet-stream\r\n"
-               "Content-Length: %u\r\n"
-               "Connection: close\r\n\r\n",
-               g_dbxToken, apiArg, fileSize);
+    // ── Start new session if none stored ──────────────────────────────────────
+    if (!sessionId[0]) {
+        offset = 0;
+        WiFiClientSecure tls; tls.setInsecure();
+        if (!tls.connect("content.dropboxapi.com", 443)) {
+            DBG.println("DBX: TLS connect failed (start)");
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
+            return false;
+        }
 
-    // Stream file in 8 KB chunks
-    uint8_t cbuf[8192];
-    uint32_t xfrStart = millis();
-    uint32_t bytesSent = 0;
-    uint32_t nextLogMb = 1;
-    bool xfrOk = true;
-    for (;;) {
+        // Start with 0 bytes — just get a session ID
+        tls.printf("POST /2/files/upload_session/start HTTP/1.1\r\n"
+                   "Host: content.dropboxapi.com\r\n"
+                   "Authorization: Bearer %s\r\n"
+                   "Dropbox-API-Arg: {}\r\n"
+                   "Content-Type: application/octet-stream\r\n"
+                   "Content-Length: 0\r\n"
+                   "Connection: close\r\n\r\n", g_dbxToken);
+
+        String resp = dbxReadResponse(tls);
+        // Parse session_id
+        int q1 = resp.indexOf("\"session_id\"");
+        if (q1 < 0) {
+            DBG.printf("DBX: start failed: %s\n", resp.substring(0, 200).c_str());
+            if (resp.indexOf("invalid_access_token") >= 0) g_dbxToken[0] = 0;
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
+            return false;
+        }
+        int v1 = resp.indexOf('"', resp.indexOf(':', q1) + 1);
+        int v2 = resp.indexOf('"', v1 + 1);
+        resp.substring(v1 + 1, v2).toCharArray(sessionId, sizeof(sessionId));
+        DBG.printf("DBX: session started (%d chars): %s\n",
+                   (int)strlen(sessionId), sessionId);
+
+        // Persist session immediately
+        Preferences p; p.begin("dbxup", false);
+        p.putString("sid", sessionId);
+        p.putString("name", name);
+        p.putUInt("offset", 0);
+        p.putUInt("size", fileSize);
+        p.end();
+    } else {
+        DBG.printf("DBX: resuming session %s at offset %u/%u\n",
+                   sessionId, offset, fileSize);
+    }
+
+    // Seek file to resume offset
+    if (offset > 0) {
         xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-        int n = f.read(cbuf, sizeof(cbuf));
+        f.seekSet(offset);
         xSemaphoreGive(g_sd_mutex);
-        if (n <= 0) break;
+    }
 
-        // writeAll with stall detection
-        size_t sent = 0;
-        uint32_t lastProgress = millis();
-        while (sent < (size_t)n) {
-            if (!tls.connected()) { DBG.println("DBX: conn lost"); xfrOk = false; break; }
-            if (millis() - lastProgress > 60000) { DBG.println("DBX: stalled 60s"); xfrOk = false; break; }
-            size_t wr = tls.write(cbuf + sent, n - sent);
-            if (wr > 0) { sent += wr; lastProgress = millis(); }
-            else { vTaskDelay(pdMS_TO_TICKS(5)); }
+    // ── Send chunks via append_v2 ────────────────────────────────────────────
+    uint32_t xfrStart = millis();
+    while (offset < fileSize) {
+        if (!g_dbxToken[0] || millis() >= g_dbxTokenExpMs) {
+            if (!dbxRefreshToken()) {
+                xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
+                return false;
+            }
         }
-        if (!xfrOk) break;
-        bytesSent += (uint32_t)n;
 
-        if (bytesSent / 1000000 >= nextLogMb) {
-            float elapsed = (millis() - xfrStart) / 1000.0f;
-            DBG.printf("DBX: %.0f MB sent (%.0f KB/s)\n",
-                bytesSent / 1e6f, bytesSent / 1024.0f / elapsed);
-            nextLogMb = bytesSent / 1000000 + 1;
+        uint32_t chunkSize = fileSize - offset;
+        if (chunkSize > DBX_CHUNK_SIZE) chunkSize = DBX_CHUNK_SIZE;
+
+        WiFiClientSecure tls; tls.setInsecure();
+        if (!tls.connect("content.dropboxapi.com", 443)) {
+            DBG.println("DBX: TLS connect failed (append)");
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
+            return false;
         }
+
+        char apiArg[256];
+        snprintf(apiArg, sizeof(apiArg),
+            "{\"cursor\":{\"session_id\":\"%s\",\"offset\":%u},\"close\":false}",
+            sessionId, offset);
+
+        tls.printf("POST /2/files/upload_session/append_v2 HTTP/1.1\r\n"
+                   "Host: content.dropboxapi.com\r\n"
+                   "Authorization: Bearer %s\r\n"
+                   "Dropbox-API-Arg: %s\r\n"
+                   "Content-Type: application/octet-stream\r\n"
+                   "Content-Length: %u\r\n"
+                   "Connection: close\r\n\r\n",
+                   g_dbxToken, apiArg, chunkSize);
+
+        if (!dbxStreamChunk(tls, f, chunkSize)) {
+            DBG.printf("DBX: stream failed at offset %u\n", offset);
+            tls.stop();
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
+            return false;
+        }
+
+        // Check response (append returns empty body on success, or error JSON)
+        String statusLine = tls.readStringUntil('\n');
+        String resp = dbxReadResponse(tls);
+
+        if (statusLine.indexOf("200") < 0) {
+            DBG.printf("DBX: append failed at %u: %s %s\n", offset,
+                       statusLine.c_str(), resp.substring(0, 200).c_str());
+            if (resp.indexOf("invalid_access_token") >= 0) g_dbxToken[0] = 0;
+            if (resp.indexOf("not_found") >= 0) dbxClearSession();  // stale session
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
+            return false;
+        }
+
+        offset += chunkSize;
+
+        // Persist progress to NVS after each successful chunk
+        {
+            Preferences p; p.begin("dbxup", false);
+            p.putUInt("offset", offset);
+            p.end();
+        }
+
+        float elapsed = (millis() - xfrStart) / 1000.0f;
+        DBG.printf("DBX: %u/%u bytes (%.0f%%, %.0f KB/s)\n",
+                   offset, fileSize, offset * 100.0f / fileSize,
+                   elapsed > 0 ? offset / 1024.0f / elapsed : 0);
     }
     xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
 
-    if (!xfrOk) { tls.stop(); return false; }
+    // ── Finish: commit the file ──────────────────────────────────────────────
+    {
+        if (!g_dbxToken[0] || millis() >= g_dbxTokenExpMs) {
+            if (!dbxRefreshToken()) return false;
+        }
 
-    // Read HTTP response
-    // Skip headers
-    while (tls.connected()) {
-        String line = tls.readStringUntil('\n');
-        if (line == "\r") break;
-    }
-    String resp = tls.readString();
-    tls.stop();
+        WiFiClientSecure tls; tls.setInsecure();
+        if (!tls.connect("content.dropboxapi.com", 443)) {
+            DBG.println("DBX: TLS connect failed (finish)");
+            return false;
+        }
 
-    // Check for success (response contains "path_display")
-    if (resp.indexOf("\"path_display\"") < 0) {
-        DBG.printf("DBX: upload failed: %s\n", resp.substring(0, 200).c_str());
-        // If 401, clear token so next attempt refreshes
-        if (resp.indexOf("invalid_access_token") >= 0) g_dbxToken[0] = 0;
-        return false;
+        char apiArg[256];
+        snprintf(apiArg, sizeof(apiArg),
+            "{\"cursor\":{\"session_id\":\"%s\",\"offset\":%u},"
+            "\"commit\":{\"path\":\"/%s\",\"mode\":\"add\",\"autorename\":true}}",
+            sessionId, fileSize, name);
+
+        tls.printf("POST /2/files/upload_session/finish HTTP/1.1\r\n"
+                   "Host: content.dropboxapi.com\r\n"
+                   "Authorization: Bearer %s\r\n"
+                   "Dropbox-API-Arg: %s\r\n"
+                   "Content-Type: application/octet-stream\r\n"
+                   "Content-Length: 0\r\n"
+                   "Connection: close\r\n\r\n",
+                   g_dbxToken, apiArg);
+
+        String resp = dbxReadResponse(tls);
+        if (resp.indexOf("\"path_display\"") < 0) {
+            DBG.printf("DBX: finish failed: %s\n", resp.substring(0, 200).c_str());
+            return false;
+        }
     }
+
+    // Success — clear stored session
+    dbxClearSession();
 
     float elapsed = (millis() - xfrStart) / 1000.0f;
-    DBG.printf("DBX: uploaded '%s' OK (%.0f KB/s)\n", name,
-        elapsed > 0 ? bytesSent / 1024.0f / elapsed : 0);
+    DBG.printf("DBX: uploaded '%s' OK (%u bytes, %.0f KB/s)\n", name, fileSize,
+               elapsed > 0 ? fileSize / 1024.0f / elapsed : 0);
     return true;
 }
 
