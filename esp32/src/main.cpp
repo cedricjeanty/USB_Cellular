@@ -1000,11 +1000,19 @@ static void uploadTask(void* /*param*/) {
             snprintf(path, sizeof(path), "/harvested/%s", name);
             DBG.printf("Upload: found %s\n", path);
 
-            // Get file size before upload attempt
+            // Get file size before upload attempt.
+            // If file can't be opened or is empty, it's a stale cache entry —
+            // skip it (harvest's sd.begin() will clean the cache next cycle).
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
             float fileMb = 0.0f;
-            { FsFile f; if (f.open(&sd, path, O_RDONLY)) { fileMb = (float)f.fileSize() / 1e6f; f.close(); } }
+            { FsFile f;
+              if (f.open(&sd, path, O_RDONLY)) { fileMb = (float)f.fileSize() / 1e6f; f.close(); }
+            }
             xSemaphoreGive(g_sd_mutex);
+            if (fileMb < 0.001f) {
+                DBG.printf("Upload: skipping %s (empty or stale)\n", path);
+                break;
+            }
 
             // Wait for WiFi before attempting FTP (may not be connected yet at boot)
             {
@@ -1108,6 +1116,12 @@ static void doHarvest() {
         char src[80], dst[80];
         snprintf(src, sizeof(src), "/%s", name);
         snprintf(dst, sizeof(dst), "/harvested/%s", name);
+        // Remove stale 0-byte duplicates from previous failed harvests
+        if (sd.exists(dst)) {
+            FsFile dup; dup.open(&sd, dst, O_RDONLY);
+            if (dup && dup.fileSize() == 0) { dup.close(); sd.remove(dst); }
+            else if (dup) { dup.close(); }
+        }
         if (!sd.exists(dst) && sd.rename(src, dst)) {
             DBG.printf("Harvested: %s (%.1f MB)\n", name, fileMb);
             usedMb += fileMb; count++;
