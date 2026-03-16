@@ -76,6 +76,7 @@ static float    g_mbQueued       = 0.0f;  // MB in /harvested awaiting upload
 static float    g_mbUploaded     = 0.0f;  // MB uploaded this session
 static float    g_sdTotalMb      = 0.0f;
 static uint32_t g_lastDisplayMs = 0;
+static uint32_t g_lastHarvestMs = 0;   // cooldown: prevent rapid re-harvest
 
 static TaskHandle_t g_upload_task  = nullptr;
 static TaskHandle_t g_harvest_task = nullptr;
@@ -1109,37 +1110,111 @@ static void doHarvest() {
     // Ensure /harvested directory exists
     if (!sd.exists("/harvested")) sd.mkdir("/harvested");
 
-    FsFile root, entry;
-    root.open(&sd, "/", O_RDONLY);
+    // Recursively move all files (not in /harvested/) to /harvested/.
+    // Preserves flat structure in /harvested/ using path-encoded names:
+    //   /logs/2024/data.bin → /harvested/logs__2024__data.bin
     uint16_t count = 0; float usedMb = 0.0f;
 
-    while (entry.openNext(&root, O_RDONLY)) {
+    // Stack-based directory walk (avoids recursive function calls on 16 KB stack)
+    struct DirFrame { FsFile dir; char prefix[80]; };
+    DirFrame stack[4];  // max 4 levels deep
+    int depth = 0;
+    stack[0].dir.open(&sd, "/", O_RDONLY);
+    stack[0].prefix[0] = '\0';
+
+    while (depth >= 0) {
+        FsFile entry;
+        if (!entry.openNext(&stack[depth].dir, O_RDONLY)) {
+            stack[depth].dir.close();
+            depth--;
+            continue;
+        }
         char name[64];
         entry.getName(name, sizeof(name));
-        if (entry.isDir() || entry.isHidden() || entry.isSystem() || isSkipped(name)) {
+
+        if (entry.isHidden() || entry.isSystem() || isSkipped(name)) {
             entry.close(); continue;
         }
-        float fileMb = (float)entry.fileSize() / 1e6f;
+
+        if (entry.isDir()) {
+            entry.close();
+            // Recurse into subdirectory (skip /harvested itself)
+            if (depth < 3) {
+                depth++;
+                char subpath[80];
+                if (stack[depth-1].prefix[0])
+                    snprintf(subpath, sizeof(subpath), "%s/%s", stack[depth-1].prefix, name);
+                else
+                    snprintf(subpath, sizeof(subpath), "/%s", name);
+                stack[depth].dir.open(&sd, subpath, O_RDONLY);
+                // Build flat prefix: replace / with __
+                if (stack[depth-1].prefix[0])
+                    snprintf(stack[depth].prefix, sizeof(stack[depth].prefix),
+                             "%s__%s", stack[depth-1].prefix, name);
+                else
+                    strlcpy(stack[depth].prefix, name, sizeof(stack[depth].prefix));
+            }
+            continue;
+        }
+
+        uint32_t fileBytes = entry.fileSize();
+        float fileMb = (float)fileBytes / 1e6f;
         entry.close();
 
-        // Atomic rename: /name → /harvested/name
-        char src[80], dst[80];
-        snprintf(src, sizeof(src), "/%s", name);
-        snprintf(dst, sizeof(dst), "/harvested/%s", name);
+        // Build source path and flat destination name.
+        // Files in subdirs get flattened: /logs/data.bin → /harvested/logs__data.bin
+        char srcDir[80] = "/";
+        if (stack[depth].prefix[0]) {
+            // Reconstruct real directory path from __ prefix
+            strlcpy(srcDir + 1, stack[depth].prefix, sizeof(srcDir) - 1);
+            for (char* p = srcDir + 1; *p; p++) {
+                if (p[0] == '_' && p[1] == '_') { p[0] = '/'; memmove(p+1, p+2, strlen(p+1)); }
+            }
+        }
+        char src[128], dstName[128], dst[140];
+        snprintf(src, sizeof(src), "%s/%s", srcDir, name);
+        if (stack[depth].prefix[0])
+            snprintf(dstName, sizeof(dstName), "%s__%s", stack[depth].prefix, name);
+        else
+            strlcpy(dstName, name, sizeof(dstName));
+        snprintf(dst, sizeof(dst), "/harvested/%s", dstName);
+
         // Remove stale 0-byte duplicates from previous failed harvests
         if (sd.exists(dst)) {
             FsFile dup; dup.open(&sd, dst, O_RDONLY);
             if (dup && dup.fileSize() == 0) { dup.close(); sd.remove(dst); }
             else if (dup) { dup.close(); }
         }
-        if (!sd.exists(dst) && sd.rename(src, dst)) {
-            DBG.printf("Harvested: %s (%.1f MB)\n", name, fileMb);
+        if (sd.exists(dst)) { continue; }  // real duplicate, skip
+
+        // Try rename first (works for top-level files).
+        // For files in subdirectories, FAT rename() can't move across
+        // directories — fall back to copy + delete.
+        bool moved = sd.rename(src, dst);
+        if (!moved) {
+            // Copy file to /harvested/, then delete original
+            FsFile sf, df;
+            if (sf.open(&sd, src, O_RDONLY) && df.open(&sd, dst, O_WRONLY | O_CREAT)) {
+                uint8_t cpbuf[512];
+                uint32_t rem = fileBytes;
+                moved = true;
+                while (rem > 0) {
+                    int n = sf.read(cpbuf, min((uint32_t)sizeof(cpbuf), rem));
+                    if (n <= 0 || df.write(cpbuf, n) != n) { moved = false; break; }
+                    rem -= n;
+                }
+                sf.close(); df.close();
+                if (moved) sd.remove(src);
+                else sd.remove(dst);  // clean up partial copy
+            }
+        }
+        if (moved) {
+            DBG.printf("Harvested: %s (%.1f MB)\n", src, fileMb);
             usedMb += fileMb; count++;
         } else {
-            DBG.printf("Rename failed or duplicate: %s\n", name);
+            DBG.printf("Harvest failed: %s\n", src);
         }
     }
-    root.close();
 
     // Note: SdFat writes dirty cache sectors to SD on eviction.
     // MSC reads raw sectors (bypassing cache), so the host sees
@@ -1154,9 +1229,11 @@ static void doHarvest() {
     g_writeDetected = false; g_lastWriteMs = 0;
     g_hostWasConnected = false; g_hostConnected = false;
     g_hostWrittenMb = 0.0f;
+
     g_harvesting = false;
-    MSC.mediaPresent(true);   // re-insert drive — host remounts with fresh data
-    DBG.println("doHarvest: media re-inserted");
+    MSC.mediaPresent(true);
+    g_lastHarvestMs = millis();  // cooldown: ignore host metadata writes after remount
+    DBG.printf("doHarvest: media re-inserted (%u files)\n", count);
 
     if (count > 0 && g_upload_task) xTaskNotifyGive(g_upload_task);
 }
@@ -1273,7 +1350,7 @@ void setup() {
 
     // Scan /harvested/ for files left over from before the last reboot.
     // The upload task starts blocked; notify it if there is work to do.
-    {
+    if (g_sd_ready) {
         FsFile h, f;
         if (h.open(&sd, "/harvested", O_RDONLY)) {
             while (f.openNext(&h, O_RDONLY)) {
@@ -1410,8 +1487,11 @@ void loop() {
         updateDisplay();
     }
     if (!g_harvesting && g_writeDetected && g_hostWasConnected &&
-        g_lastWriteMs != 0 && (now - g_lastWriteMs) >= QUIET_WINDOW_MS) {
-        DBG.println("Quiet window elapsed — triggering harvest");
+        g_lastWriteMs != 0 && (now - g_lastWriteMs) >= QUIET_WINDOW_MS &&
+        (now - g_lastHarvestMs) >= QUIET_WINDOW_MS &&  // cooldown after last harvest
+        g_hostWrittenMb > 0.001f) {  // >1 KB — ignore metadata-only writes
+        DBG.printf("Harvest trigger: %.1f KB written, %us idle\n",
+                   g_hostWrittenMb * 1024.0f, (now - g_lastWriteMs) / 1000);
         if (g_harvest_task) xTaskNotifyGive(g_harvest_task);
     }
     delay(100);
