@@ -64,6 +64,7 @@ USBMSC MSC;
 
 static volatile bool     g_hostConnected    = false;
 static volatile bool     g_hostWasConnected = false;
+static volatile uint32_t g_lastIoMs         = 0;      // last MSC read or write
 static volatile uint32_t g_lastWriteMs      = 0;
 static volatile bool     g_writeDetected    = false;
 static volatile bool     g_harvesting       = false;
@@ -118,6 +119,13 @@ static int32_t msc_read(uint32_t lba, uint32_t offset, void* buf, uint32_t bufsi
     if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return -1;
     bool ok = sd.card()->readSectors(lba, (uint8_t*)buf, bufsize / 512);
     xSemaphoreGive(g_sd_mutex);
+    if (ok) {
+        g_lastIoMs = millis();
+        // Reset quiet-window timer on reads too — during multi-file copies the
+        // host reads directories between writes.  Without this, harvest triggers
+        // mid-copy whenever a gap between writes exceeds QUIET_WINDOW_MS.
+        if (g_writeDetected) g_lastWriteMs = millis();
+    }
     return ok ? (int32_t)bufsize : -1;
 }
 
@@ -129,6 +137,7 @@ static int32_t msc_write(uint32_t lba, uint32_t offset, uint8_t* buf, uint32_t b
     xSemaphoreGive(g_sd_mutex);
     if (ok) {
         g_lastWriteMs      = millis();
+        g_lastIoMs         = g_lastWriteMs;
         g_writeDetected    = true;
         g_hostWasConnected = true;
         g_hostWrittenMb   += bufsize / 1e6f;
@@ -527,9 +536,10 @@ static void updateDisplay() {
 
     display.setTextSize(2);
     const char* lbl; int lx;
-    if (g_harvesting)         { lbl = "HARVEST";    lx = 22; }
-    else if (g_hostConnected) { lbl = "USB ACTIVE"; lx =  4; }
-    else                      { lbl = "USB  IDLE";  lx = 10; }
+    if (g_harvesting)                                      { lbl = "HARVEST";    lx = 22; }
+    else if (g_lastIoMs && millis() - g_lastIoMs < 2000)   { lbl = "USB ACTIVE"; lx =  4; }
+    else if (g_writeDetected)                              { lbl = "USB  IDLE";  lx = 10; }
+    else                                                   { lbl = "USB READY";  lx = 10; }
     display.setCursor(lx, 12);
     display.print(lbl);
 
