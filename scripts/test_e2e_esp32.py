@@ -3,60 +3,102 @@
 ESP32-S3 end-to-end integration test.
 
 Steps:
-  1. Get a temporary FTP server from sftpcloud.io (60-min free session)
-  2. Provision WiFi + FTP credentials into the device via the serial CLI
-  3. Reboot the device
-  4. Wait for USB drive to re-enumerate and WiFi to connect
-  5. Write a 10 MB binary test file to the USB drive
-  6. Wait for the quiet window (30 s) + harvest + FTP upload
-  7. Verify the file appears on the FTP server
+  1. Clean old test files from Dropbox
+  2. Verify device is connected and ready
+  3. Find USB drive mount
+  4. Write a test file to the USB drive
+  5. Wait for quiet window + harvest + Dropbox upload
+  6. Verify the file appears on Dropbox with correct size
 
 Usage:
+    python3 scripts/test_e2e_esp32.py
+    python3 scripts/test_e2e_esp32.py --file-size-mb 1    # smaller/faster
     python3 scripts/test_e2e_esp32.py --wifi-ssid MyNet --wifi-pass hunter2
-
-Options:
-    --wifi-ssid SSID         (required) Home/lab WiFi SSID
-    --wifi-pass PASS         WiFi password (default: empty for open networks)
-    --serial-port PORT       Serial port (default: /dev/ttyACM0)
-    --ftp-remote-path PATH   Remote dir on FTP server (default: /)
-    --no-ftp-creds           Reuse FTP server from config.yaml instead of allocating new one
-    --file-size-mb N         Size of test file in MB (default: 10)
-    --quiet-window N         Seconds to wait for quiet window (default: 30 + 10 buffer = 40)
 """
 
 import argparse
-import ftplib
 import glob
+import json
 import os
 import subprocess
 import sys
 import time
+
+import requests
 import serial
-from pathlib import Path
 
-# Locate get_ftp_creds in the same scripts/ dir
-sys.path.insert(0, str(Path(__file__).parent))
-from get_ftp_creds import get_credentials
-
-CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
 BAUD = 115200
-UPLOAD_TIMEOUT = 300   # seconds to poll FTP server for the file
+UPLOAD_TIMEOUT = 300  # seconds to poll Dropbox for the file
+
+# Dropbox credentials (same as provisioned on ESP32)
+DBX_APP_KEY = "82un1zz0uurgszt"
+DBX_APP_SECRET = "hc3wapn8hsgzuva"
+DBX_REFRESH_TOKEN = "J0Iqey6GFFsAAAAAAAAAAa7xToJsNmRAqr1Ok5WOGyqGlIhJI0wcSdL2_LKv6quE"
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── Dropbox helpers ──────────────────────────────────────────────────────────
 
-def wait_for(path, timeout=30, label=None):
-    label = label or path
-    print(f"  Waiting for {label} ...", end="", flush=True)
+def dbx_get_token():
+    resp = requests.post(
+        "https://api.dropboxapi.com/oauth2/token",
+        auth=(DBX_APP_KEY, DBX_APP_SECRET),
+        data={"grant_type": "refresh_token", "refresh_token": DBX_REFRESH_TOKEN},
+    )
+    resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
+def dbx_list_files(token):
+    resp = requests.post(
+        "https://api.dropboxapi.com/2/files/list_folder",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"path": "", "limit": 100},
+    )
+    if resp.status_code == 200:
+        return {e["name"]: e for e in resp.json().get("entries", [])}
+    return {}
+
+
+def dbx_delete(token, path):
+    requests.post(
+        "https://api.dropboxapi.com/2/files/delete_v2",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"path": path},
+    )
+
+
+def dbx_wait_for_file(token, filename, expected_size, timeout=300):
+    """Poll Dropbox until filename appears with correct size."""
+    print(f"  Polling Dropbox for '{filename}' ...", end="", flush=True)
     t0 = time.time()
     while time.time() - t0 < timeout:
-        if os.path.exists(path):
-            print(f" OK ({time.time()-t0:.1f}s)")
-            return True
-        time.sleep(1)
+        try:
+            files = dbx_list_files(token)
+            if filename in files:
+                size = files[filename].get("size", 0)
+                elapsed = time.time() - t0
+                print(f" FOUND ({elapsed:.1f}s, {size:,} bytes)")
+                return size == expected_size
+        except Exception:
+            token = dbx_get_token()  # refresh if expired
+        time.sleep(5)
         print(".", end="", flush=True)
-    print(f" TIMEOUT after {timeout}s")
+    print(f" NOT FOUND after {timeout}s")
     return False
+
+
+# ── Serial/USB helpers ───────────────────────────────────────────────────────
+
+def find_serial_port():
+    """Find an available ttyACM port."""
+    for port in sorted(glob.glob("/dev/ttyACM*")):
+        try:
+            s = serial.Serial(port, BAUD, timeout=1)
+            s.close()
+            return port
+        except Exception:
+            pass
+    return None
 
 
 def open_serial(port):
@@ -66,8 +108,7 @@ def open_serial(port):
     return s
 
 
-def cli(s, cmd, wait=0.6):
-    """Send a CLI command and return the device's response."""
+def cli(s, cmd, wait=1.0):
     s.reset_input_buffer()
     s.write((cmd + "\n").encode())
     s.flush()
@@ -81,218 +122,146 @@ def cli(s, cmd, wait=0.6):
 
 
 def find_usb_mount(timeout=30):
-    """Return the first auto-mounted FAT partition that looks like the ESP32 SD card."""
     print(f"  Scanning for USB drive mount ...", end="", flush=True)
     t0 = time.time()
     while time.time() - t0 < timeout:
-        # lsblk gives us SIZE=14.8G fstype=vfat mounts — look for small-ish vfat
         result = subprocess.run(
             ["lsblk", "-J", "-o", "NAME,FSTYPE,MOUNTPOINT,SIZE"],
-            capture_output=True, text=True
+            capture_output=True, text=True,
         )
-        import json
         try:
             data = json.loads(result.stdout)
             for dev in data.get("blockdevices", []):
-                mp = dev.get("mountpoint") or ""
-                if dev.get("fstype") in ("vfat", "exfat") and mp and mp.startswith("/media"):
-                    print(f" found: {mp}")
-                    return mp
-                for child in dev.get("children", []):
-                    mp = child.get("mountpoint") or ""
-                    if child.get("fstype") in ("vfat", "exfat") and mp and mp.startswith("/media"):
+                for target in [dev] + dev.get("children", []):
+                    mp = target.get("mountpoint") or ""
+                    if target.get("fstype") in ("vfat", "exfat") and mp.startswith("/media"):
                         print(f" found: {mp}")
                         return mp
         except Exception:
             pass
-        # fallback: glob
-        for mp in glob.glob("/media/*/*") + glob.glob("/media/*"):
-            if os.path.ismount(mp):
-                print(f" found: {mp}")
-                return mp
         time.sleep(2)
         print(".", end="", flush=True)
     print(" NOT FOUND")
     return None
 
 
-def wait_for_wifi(s, timeout=60):
-    """Poll STATUS command until WiFi shows a real IP."""
-    print(f"  Waiting up to {timeout}s for WiFi connection ...", end="", flush=True)
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        s.reset_input_buffer()
-        s.write(b"STATUS\n")
-        s.flush()
-        time.sleep(1.0)
-        resp = s.read(s.in_waiting).decode(errors="replace")
-        # STATUS line: "CLI: wifi=192.168.x.x ap=no ..."
-        for line in resp.splitlines():
-            if "wifi=" in line and "disconnected" not in line and "Connecting" not in line:
-                ip = line.split("wifi=")[1].split()[0]
-                if ip and ip[0].isdigit():
-                    print(f" connected ({ip}, {time.time()-t0:.0f}s)")
-                    return True
-        print(".", end="", flush=True)
-        time.sleep(4)
-    print(f" TIMEOUT")
-    return False
-
-
-def wait_for_file_on_ftp(host, port, user, password, remote_path, filename, timeout=120):
-    """Poll the FTP server until filename appears in remote_path."""
-    print(f"  Polling FTP for '{filename}' ...", end="", flush=True)
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        try:
-            ftp = ftplib.FTP()
-            ftp.connect(host, port, timeout=10)
-            ftp.login(user, password)
-            try:
-                ftp.cwd(remote_path)
-            except ftplib.error_perm:
-                pass  # path may not exist yet or may be root
-            files = ftp.nlst()
-            ftp.quit()
-            if filename in files:
-                elapsed = time.time() - t0
-                print(f" FOUND ({elapsed:.1f}s)")
-                return True
-        except Exception as e:
-            pass  # server not ready yet
-        time.sleep(5)
-        print(".", end="", flush=True)
-    print(f" NOT FOUND after {timeout}s")
-    return False
-
-
-# ── main ──────────────────────────────────────────────────────────────────────
+# ── main ─────────────────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser(description="ESP32-S3 E2E integration test")
-    ap.add_argument("--wifi-ssid",       default=None,
-                    help="WiFi SSID to provision; omit if device already has credentials")
-    ap.add_argument("--wifi-pass",       default="")
-    ap.add_argument("--serial-port",     default="/dev/ttyACM0")
-    ap.add_argument("--ftp-remote-path", default="/")
-    ap.add_argument("--no-ftp-creds",    action="store_true",
-                    help="Reuse FTP config from config.yaml")
-    ap.add_argument("--file-size-mb",    type=int, default=10)
-    ap.add_argument("--quiet-window",    type=int, default=40,
-                    help="Seconds to wait after last write (default: 40 = 30s window + 10s buffer)")
+    ap.add_argument("--wifi-ssid", default=None,
+                    help="WiFi SSID to provision; omit if already configured")
+    ap.add_argument("--wifi-pass", default="")
+    ap.add_argument("--serial-port", default=None,
+                    help="Serial port (default: auto-detect)")
+    ap.add_argument("--file-size-mb", type=int, default=1)
+    ap.add_argument("--quiet-window", type=int, default=50,
+                    help="Seconds to wait after write (default: 50)")
     args = ap.parse_args()
 
     print("\n╔══════════════════════════════════════════╗")
     print("║   ESP32-S3 E2E Integration Test          ║")
     print("╚══════════════════════════════════════════╝\n")
 
-    # ── Step 1: FTP credentials ────────────────────────────────────────────────
-    print("[1/7] Allocating FTP server ...")
-    if args.no_ftp_creds:
-        import yaml
-        cfg = yaml.safe_load(open(CONFIG_PATH))
-        ftp_cfg = cfg["ftp"]
-        ftp_host = ftp_cfg["server"]
-        ftp_port = int(ftp_cfg.get("port", 21))
-        ftp_user = ftp_cfg["username"]
-        ftp_pass = ftp_cfg["password"]
-        print(f"  Reusing config.yaml: {ftp_user}@{ftp_host}:{ftp_port}")
-    else:
-        creds = get_credentials(headless=True)
-        if not creds.get("username") or not creds.get("password"):
-            print(f"  ERROR: could not get FTP credentials: {creds}")
-            sys.exit(1)
-        ftp_host = creds["host"]
-        ftp_port = int(creds.get("port", 21))
-        ftp_user = creds["username"]
-        ftp_pass = creds["password"]
-        print(f"  Got: {ftp_user}@{ftp_host}:{ftp_port}")
+    # ── Step 1: Dropbox setup ─────────────────────────────────────────────────
+    print("[1/6] Setting up Dropbox ...")
+    token = dbx_get_token()
+    print(f"  Token OK")
+    files = dbx_list_files(token)
+    for name in list(files.keys()):
+        if name.startswith("e2e_"):
+            dbx_delete(token, f"/{name}")
+            print(f"  Deleted old: {name}")
 
-    ftp_path = args.ftp_remote_path
-
-    # ── Step 2: Provision FTP (and optionally WiFi) via serial CLI ───────────
-    print(f"\n[2/7] Provisioning credentials via {args.serial_port} ...")
-    s = open_serial(args.serial_port)
+    # ── Step 2: Verify device ─────────────────────────────────────────────────
+    port = args.serial_port or find_serial_port()
+    if not port:
+        print("ERROR: no serial port found"); sys.exit(1)
+    print(f"\n[2/6] Checking device on {port} ...")
+    s = open_serial(port)
     if args.wifi_ssid:
         cli(s, f"SETWIFI {args.wifi_ssid} {args.wifi_pass}")
-    cli(s, f"SETFTP {ftp_host} {ftp_port} {ftp_user} {ftp_pass} {ftp_path}")
-    cli(s, "STATUS")
-
-    # ── Step 3: Reboot (only needed when provisioning new WiFi creds) ─────────
-    if args.wifi_ssid:
-        print(f"\n[3/7] Rebooting device ...")
         cli(s, "REBOOT", wait=0.3)
         s.close()
-        time.sleep(4)  # let USB re-enumerate
-
-        print(f"\n[4/7] Waiting for USB drive and WiFi ...")
-        if not wait_for(args.serial_port, timeout=20, label="serial port"):
-            print("ERROR: device did not come back after reboot"); sys.exit(1)
-        time.sleep(3)
-        mount = find_usb_mount(timeout=20)
-        if not mount:
-            print("ERROR: USB drive not mounted"); sys.exit(1)
-
-        s = open_serial(args.serial_port)
-        if not wait_for_wifi(s, timeout=75):
-            print("ERROR: device did not connect to WiFi within 75s"); sys.exit(1)
-        s.close()
+        time.sleep(8)
+        port = find_serial_port()
+        s = open_serial(port)
+        # Wait for WiFi
+        for _ in range(15):
+            resp = cli(s, "STATUS", wait=2)
+            if "wifi=" in resp and "disconnected" not in resp:
+                break
+            time.sleep(5)
     else:
-        print(f"\n[3/7] WiFi already provisioned — skipping reboot")
-        s.close()
-        print(f"\n[4/7] Locating USB drive ...")
-        mount = find_usb_mount(timeout=10)
-        if not mount:
-            print("ERROR: USB drive not mounted"); sys.exit(1)
+        status = cli(s, "STATUS")
+        if "disconnected" in status:
+            print("ERROR: WiFi not connected"); sys.exit(1)
+    s.close()
 
-    # ── Step 5: Write test file ────────────────────────────────────────────────
+    # ── Step 3: Find USB drive ────────────────────────────────────────────────
+    print(f"\n[3/6] Locating USB drive ...")
+    mount = find_usb_mount(timeout=15)
+    if not mount:
+        print("ERROR: USB drive not mounted"); sys.exit(1)
+
+    # Clean old test files from SD card
+    for old in glob.glob(os.path.join(mount, "e2e_*.bin")):
+        try: os.unlink(old)
+        except Exception: pass
+    harvested = os.path.join(mount, "harvested")
+    if os.path.isdir(harvested):
+        for old in glob.glob(os.path.join(harvested, "e2e_*.bin")):
+            try: os.unlink(old)
+            except Exception: pass
+
+    # ── Step 4: Write test file ───────────────────────────────────────────────
     test_filename = f"e2e_{int(time.time())}.bin"
     test_path = os.path.join(mount, test_filename)
     size_mb = args.file_size_mb
-    print(f"\n[5/7] Writing {size_mb} MB test file → {test_path} ...")
+    print(f"\n[4/6] Writing {size_mb} MB test file → {test_path} ...")
     chunk = b'\xAB\xCD\xEF\x01' * 256  # 1 KB
     with open(test_path, "wb") as f:
-        for _ in range(size_mb * 1024):  # size_mb × 1024 × 1 KB = size_mb MB
+        for _ in range(size_mb * 1024):
             f.write(chunk)
         f.flush()
-        os.fsync(f.fileno())  # wait for data to reach USB device
+        os.fsync(f.fileno())
     os.sync()
     actual = os.path.getsize(test_path)
     print(f"  Written: {actual:,} bytes ({actual/1e6:.1f} MB)")
 
-    # ── Step 6: Wait for quiet window ─────────────────────────────────────────
+    # ── Step 5: Wait for harvest + upload ─────────────────────────────────────
     wait_secs = args.quiet_window
-    print(f"\n[6/7] Waiting {wait_secs}s for quiet window + harvest + upload ...")
+    print(f"\n[5/6] Waiting {wait_secs}s for quiet window + harvest + upload ...")
     for remaining in range(wait_secs, 0, -10):
         print(f"  {remaining}s remaining ...", flush=True)
         time.sleep(min(10, remaining))
 
-    # ── Step 7: Verify on FTP ─────────────────────────────────────────────────
-    print(f"\n[7/7] Verifying '{test_filename}' on FTP ({ftp_host}) ...")
-    found = wait_for_file_on_ftp(
-        ftp_host, ftp_port, ftp_user, ftp_pass, ftp_path,
-        test_filename, timeout=UPLOAD_TIMEOUT
-    )
+    # ── Step 6: Verify on Dropbox ─────────────────────────────────────────────
+    print(f"\n[6/6] Verifying '{test_filename}' on Dropbox ...")
+    token = dbx_get_token()
+    found = dbx_wait_for_file(token, test_filename, actual, timeout=UPLOAD_TIMEOUT)
 
     # Print serial log for diagnostics
     try:
-        s2 = open_serial(args.serial_port)
-        time.sleep(0.5)
-        log = s2.read(s2.in_waiting).decode(errors="replace").strip()
-        s2.close()
-        if log:
-            print("\n  --- Serial log ---")
-            for line in log.splitlines():
-                print(f"  {line}")
+        port = find_serial_port()
+        if port:
+            s2 = open_serial(port)
+            time.sleep(0.5)
+            log = s2.read(s2.in_waiting).decode(errors="replace").strip()
+            s2.close()
+            if log:
+                print("\n  --- Serial log ---")
+                for line in log.splitlines():
+                    print(f"  {line}")
     except Exception:
         pass
 
     print()
     if found:
-        print("✓  PASS — file harvested and uploaded to FTP successfully")
+        print("✓  PASS — file harvested and uploaded to Dropbox successfully")
         sys.exit(0)
     else:
-        print("✗  FAIL — file not found on FTP within timeout")
+        print("✗  FAIL — file not found on Dropbox within timeout")
         sys.exit(1)
 
 
