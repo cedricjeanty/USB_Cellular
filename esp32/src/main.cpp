@@ -993,8 +993,15 @@ static void uploadTask(void* /*param*/) {
                 FsFile root, entry;
                 root.open(&sd, "/harvested", O_RDONLY);
                 while (entry.openNext(&root, O_RDONLY)) {
-                    if (!entry.isDir()) { entry.getName(name, sizeof(name)); entry.close(); break; }
+                    if (entry.isDir()) { entry.close(); continue; }
+                    char tmp[64]; entry.getName(tmp, sizeof(tmp));
+                    // Skip .done__ markers and other hidden files
+                    if (tmp[0] == '.') { entry.close(); continue; }
+                    // Skip 0-byte files (stale cache entries)
+                    if (entry.fileSize() == 0) { entry.close(); continue; }
+                    strlcpy(name, tmp, sizeof(name));
                     entry.close();
+                    break;
                 }
                 root.close();
             }
@@ -1006,19 +1013,13 @@ static void uploadTask(void* /*param*/) {
             snprintf(path, sizeof(path), "/harvested/%s", name);
             DBG.printf("Upload: found %s\n", path);
 
-            // Get file size before upload attempt.
-            // If file can't be opened or is empty, it's a stale cache entry —
-            // skip it (harvest's sd.begin() will clean the cache next cycle).
+            // Get file size before upload attempt
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
             float fileMb = 0.0f;
             { FsFile f;
               if (f.open(&sd, path, O_RDONLY)) { fileMb = (float)f.fileSize() / 1e6f; f.close(); }
             }
             xSemaphoreGive(g_sd_mutex);
-            if (fileMb < 0.001f) {
-                DBG.printf("Upload: skipping %s (empty or stale)\n", path);
-                break;
-            }
 
             // Wait for WiFi before attempting FTP (may not be connected yet at boot)
             {
