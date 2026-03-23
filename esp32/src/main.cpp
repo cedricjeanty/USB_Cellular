@@ -14,7 +14,7 @@
 #include <DNSServer.h>
 #include <WebServer.h>
 #include <Preferences.h>
-#include "mbedtls/base64.h"
+#include "esp_mac.h"
 
 // ── Pin assignments ────────────────────────────────────────────────────────────
 #define PIN_I2C_SCL  7
@@ -585,132 +585,50 @@ static void updateDisplay() {
     display.display();
 }
 
-// ── Dropbox upload ─────────────────────────────────────────────────────────────
-// Uses OAuth2 refresh-token flow: the refresh token (stored in NVS) never
-// expires and mints short-lived access tokens on demand.
+// ── S3 upload via pre-signed URLs ─────────────────────────────────────────────
+// A Lambda backend generates time-limited S3 PUT URLs.  The ESP32 just does
+// HTTPS PUT — no AWS credentials on device, no SigV4 signing needed.
 //
-// NVS namespace "dbx": app_key, app_secret, refresh_token
-// Cached access token lives in RAM — refreshed when expired or on 401.
+// NVS namespace "s3": api_host, api_key  (device_id auto-generated from MAC)
+// NVS namespace "s3up": upload session state for power-loss resume
+//
+// Small files (<5 MB): single pre-signed PUT
+// Large files: S3 multipart — one pre-signed URL per 5 MB part
 
-static char   g_dbxToken[2048] = "";   // current access token (short-lived)
-static uint32_t g_dbxTokenExpMs = 0;   // millis() when token expires
+#define S3_CHUNK_SIZE (5UL * 1024 * 1024)  // 5 MB per part (S3 multipart minimum)
 
-// Mint a fresh access token using the refresh token.
-static bool dbxRefreshToken() {
-    Preferences p; p.begin("dbx", true);
-    String appKey    = p.getString("app_key", "");
-    String appSecret = p.getString("app_secret", "");
-    String refresh   = p.getString("refresh", "");
+static char g_apiHost[128] = "";   // API Gateway hostname
+static char g_apiKey[64]   = "";   // API Gateway API key
+static char g_deviceId[16] = "";   // MAC-derived device identifier
+// Load S3 API credentials from NVS into globals.
+static bool s3LoadCreds() {
+    if (g_apiHost[0] && g_apiKey[0] && g_deviceId[0]) return true;
+    Preferences p; p.begin("s3", true);
+    strlcpy(g_apiHost, p.getString("api_host", "").c_str(), sizeof(g_apiHost));
+    strlcpy(g_apiKey,  p.getString("api_key", "").c_str(),  sizeof(g_apiKey));
+    strlcpy(g_deviceId, p.getString("device_id", "").c_str(), sizeof(g_deviceId));
     p.end();
-
-    if (!appKey.length() || !refresh.length()) {
-        DBG.println("DBX: no credentials in NVS");
+    if (!g_apiHost[0] || !g_apiKey[0]) {
+        DBG.println("S3: no credentials in NVS");
         return false;
     }
-
-    WiFiClientSecure tls;
-    tls.setInsecure();  // skip cert verification (saves ~40 KB RAM)
-    if (!tls.connect("api.dropboxapi.com", 443)) {
-        DBG.println("DBX: TLS connect failed (token)");
-        return false;
-    }
-
-    // POST body
-    String body = "grant_type=refresh_token&refresh_token=" + refresh;
-
-    // Basic auth header: base64(app_key:app_secret)
-    String cred = appKey + ":" + appSecret;
-    // Simple base64 encode (ESP32 Arduino has no built-in b64 for strings)
-    size_t outLen = 0;
-    mbedtls_base64_encode(nullptr, 0, &outLen,
-        (const uint8_t*)cred.c_str(), cred.length());
-    char* b64 = (char*)malloc(outLen + 1);
-    mbedtls_base64_encode((uint8_t*)b64, outLen, &outLen,
-        (const uint8_t*)cred.c_str(), cred.length());
-    b64[outLen] = 0;
-
-    tls.printf("POST /oauth2/token HTTP/1.1\r\n"
-               "Host: api.dropboxapi.com\r\n"
-               "Authorization: Basic %s\r\n"
-               "Content-Type: application/x-www-form-urlencoded\r\n"
-               "Content-Length: %d\r\n"
-               "Connection: close\r\n\r\n",
-               b64, body.length());
-    tls.print(body);
-    free(b64);
-
-    // Read response — find access_token in JSON body
-    // Skip HTTP headers
-    String statusLine = tls.readStringUntil('\n');
-    DBG.printf("DBX: HTTP %s\n", statusLine.c_str());
-    while (tls.connected()) {
-        String line = tls.readStringUntil('\n');
-        if (line == "\r") break;
-    }
-    // Read body (may arrive in chunks; wait up to 5s for data)
-    String resp = "";
-    uint32_t t1 = millis();
-    while (millis() - t1 < 5000) {
-        if (tls.available()) {
-            resp += tls.readString();
-            t1 = millis();  // reset timer on data
-        } else if (!tls.connected()) {
-            break;
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(50));
-        }
-    }
-    tls.stop();
-    DBG.printf("DBX: resp (%d bytes): %s\n", resp.length(),
-               resp.substring(0, 300).c_str());
-
-    // Extract access_token from JSON (avoid pulling in ArduinoJson)
-    int pos = resp.indexOf("\"access_token\"");
-    if (pos < 0) {
-        DBG.println("DBX: token refresh failed — no access_token in response");
-        return false;
-    }
-    // Find the value: skip to the colon, then the opening quote
-    int q1 = resp.indexOf('"', resp.indexOf(':', pos) + 1);
-    int q2 = resp.indexOf('"', q1 + 1);
-    int tokenLen = (q1 >= 0 && q2 >= 0) ? q2 - q1 - 1 : -1;
-    if (q1 < 0 || q2 < 0 || tokenLen > (int)sizeof(g_dbxToken) - 1) {
-        DBG.printf("DBX: token parse failed q1=%d q2=%d len=%d max=%d\n",
-                   q1, q2, tokenLen, (int)sizeof(g_dbxToken) - 1);
-        return false;
-    }
-    resp.substring(q1 + 1, q2).toCharArray(g_dbxToken, sizeof(g_dbxToken));
-
-    // Extract expires_in
-    int epos = resp.indexOf("\"expires_in\"");
-    uint32_t expiresIn = 14400;
-    if (epos >= 0) {
-        int colon = resp.indexOf(':', epos);
-        expiresIn = (uint32_t)resp.substring(colon + 1).toInt();
-    }
-    g_dbxTokenExpMs = millis() + (expiresIn - 300) * 1000UL;  // refresh 5 min early
-
-    DBG.printf("DBX: token refreshed, expires in %us\n", expiresIn);
     return true;
 }
 
-// ── Dropbox chunked upload with resume ────────────────────────────────────────
-// Uses upload_session/start → append_v2 → finish so uploads survive power loss.
-// Session state (session_id + offset) is persisted to NVS after each chunk.
-// On boot, if a session is in progress, we resume from the stored offset.
-// Dropbox sessions last 7 days.
-//
-// Chunk size per HTTPS request.  Larger = fewer TLS handshakes = faster,
-// but more data lost on power-cut.  4 MB is a good balance.
-#define DBX_CHUNK_SIZE (4UL * 1024 * 1024)
-
 // Read HTTP response body, skipping headers.  Returns body as String.
+// Also extracts the ETag header if etag buffer is provided.
 // Handles chunked transfer encoding by stripping chunk-size lines.
-static String dbxReadResponse(WiFiClientSecure& tls) {
+static String httpReadResponse(WiFiClientSecure& tls, char* etag = nullptr, size_t etagSz = 0) {
     bool chunked = false;
     while (tls.connected()) {
         String line = tls.readStringUntil('\n');
         if (line.indexOf("chunked") >= 0) chunked = true;
+        // Capture ETag header if requested
+        if (etag && etagSz > 0 && line.startsWith("ETag:")) {
+            String val = line.substring(5);
+            val.trim();
+            strlcpy(etag, val.c_str(), etagSz);
+        }
         if (line == "\r") break;
     }
     String raw = "";
@@ -728,21 +646,20 @@ static String dbxReadResponse(WiFiClientSecure& tls) {
     while (pos < (int)raw.length()) {
         int nl = raw.indexOf('\n', pos);
         if (nl < 0) break;
-        // Parse chunk size (hex)
         String szLine = raw.substring(pos, nl);
         szLine.trim();
         unsigned long chunkSz = strtoul(szLine.c_str(), nullptr, 16);
-        if (chunkSz == 0) break;  // final chunk
+        if (chunkSz == 0) break;
         int dataStart = nl + 1;
         body += raw.substring(dataStart, dataStart + (int)chunkSz);
-        pos = dataStart + (int)chunkSz + 2;  // skip data + \r\n
+        pos = dataStart + (int)chunkSz + 2;
     }
     return body;
 }
 
 // Stream `len` bytes from an open FsFile at current position to a TLS connection.
 // Returns true if all bytes sent.
-static bool dbxStreamChunk(WiFiClientSecure& tls, FsFile& f, uint32_t len) {
+static bool httpStreamChunk(WiFiClientSecure& tls, FsFile& f, uint32_t len) {
     uint8_t cbuf[8192];
     uint32_t remaining = len;
     while (remaining > 0) {
@@ -767,18 +684,111 @@ static bool dbxStreamChunk(WiFiClientSecure& tls, FsFile& f, uint32_t len) {
 }
 
 // Clear stored upload session from NVS.
-static void dbxClearSession() {
-    Preferences p; p.begin("dbxup", false);
+static void s3ClearSession() {
+    Preferences p; p.begin("s3up", false);
     p.clear();
     p.end();
 }
 
-// Upload a file from /harvested/<name> to Dropbox using resumable sessions.
-static bool dbxUploadFile(const char* name) {
-    if (!g_netConnected) { DBG.println("DBX: no WiFi"); return false; }
-    if (!g_dbxToken[0] || millis() >= g_dbxTokenExpMs) {
-        if (!dbxRefreshToken()) return false;
+// Extract a JSON string value for a given key (no ArduinoJson dependency).
+// Returns empty String if key not found.
+static String jsonStr(const String& json, const char* key) {
+    int pos = json.indexOf(key);
+    if (pos < 0) return "";
+    int colon = json.indexOf(':', pos);
+    if (colon < 0) return "";
+    // Find opening quote of value (skip whitespace/null)
+    int q1 = json.indexOf('"', colon + 1);
+    if (q1 < 0) {
+        // Value might be null or a number — check for null
+        int npos = json.indexOf("null", colon + 1);
+        if (npos >= 0 && npos < colon + 10) return "";
+        return "";
     }
+    int q2 = json.indexOf('"', q1 + 1);
+    if (q2 < 0) return "";
+    return json.substring(q1 + 1, q2);
+}
+
+// Extract a JSON integer value for a given key.
+static int jsonInt(const String& json, const char* key) {
+    int pos = json.indexOf(key);
+    if (pos < 0) return -1;
+    int colon = json.indexOf(':', pos);
+    if (colon < 0) return -1;
+    return json.substring(colon + 1).toInt();
+}
+
+// Parse a URL into host and path+query components.
+// E.g. "https://bucket.s3.us-west-2.amazonaws.com/key?params"
+//   → host = "bucket.s3.us-west-2.amazonaws.com"
+//   → path = "/key?params"
+static bool parseUrl(const String& url, char* host, size_t hostSz,
+                     char* path, size_t pathSz) {
+    int schemeEnd = url.indexOf("://");
+    if (schemeEnd < 0) return false;
+    int hostStart = schemeEnd + 3;
+    int pathStart = url.indexOf('/', hostStart);
+    if (pathStart < 0) {
+        strlcpy(host, url.substring(hostStart).c_str(), hostSz);
+        strlcpy(path, "/", pathSz);
+    } else {
+        url.substring(hostStart, pathStart).toCharArray(host, hostSz);
+        strlcpy(path, url.substring(pathStart).c_str(), pathSz);
+    }
+    return true;
+}
+
+// Make an HTTPS GET request to the API Gateway presign endpoint.
+static String s3ApiGet(const char* queryParams) {
+    WiFiClientSecure tls; tls.setInsecure();
+    if (!tls.connect(g_apiHost, 443)) {
+        DBG.printf("S3: TLS connect failed to %s\n", g_apiHost);
+        return "";
+    }
+    tls.printf("GET /prod/presign?%s HTTP/1.1\r\n"
+               "Host: %s\r\n"
+               "x-api-key: %s\r\n"
+               "Connection: close\r\n\r\n",
+               queryParams, g_apiHost, g_apiKey);
+    return httpReadResponse(tls);
+}
+
+// Make an HTTPS POST to the API Gateway /complete endpoint.
+static bool s3ApiComplete(const char* uploadId, const char* key,
+                          const char* partsJson) {
+    WiFiClientSecure tls; tls.setInsecure();
+    if (!tls.connect(g_apiHost, 443)) {
+        DBG.println("S3: TLS connect failed (complete)");
+        return false;
+    }
+    // Build JSON body
+    char body[2048];
+    snprintf(body, sizeof(body),
+        "{\"upload_id\":\"%s\",\"key\":\"%s\",\"parts\":[%s]}",
+        uploadId, key, partsJson);
+    int bodyLen = strlen(body);
+
+    tls.printf("POST /prod/complete HTTP/1.1\r\n"
+               "Host: %s\r\n"
+               "x-api-key: %s\r\n"
+               "Content-Type: application/json\r\n"
+               "Content-Length: %d\r\n"
+               "Connection: close\r\n\r\n",
+               g_apiHost, g_apiKey, bodyLen);
+    tls.print(body);
+
+    String resp = httpReadResponse(tls);
+    bool ok = resp.indexOf("\"ok\"") >= 0;
+    if (!ok) DBG.printf("S3: complete failed: %s\n", resp.substring(0, 200).c_str());
+    return ok;
+}
+
+// Upload a file from /harvested/<name> to S3 using pre-signed URLs.
+// Small files (<5 MB): single PUT.  Large files: multipart with resume.
+static bool s3UploadFile(const char* name) {
+    if (!g_netConnected) { DBG.println("S3: no WiFi"); return false; }
+    if (!s3LoadCreds()) return false;
 
     // Open file
     char fpath[80]; snprintf(fpath, sizeof(fpath), "/harvested/%s", name);
@@ -786,183 +796,225 @@ static bool dbxUploadFile(const char* name) {
     FsFile f; bool fok = f.open(&sd, fpath, O_RDONLY);
     uint32_t fileSize = fok ? f.fileSize() : 0;
     xSemaphoreGive(g_sd_mutex);
-    if (!fok || fileSize == 0) { DBG.printf("DBX: can't open %s\n", fpath); return false; }
+    if (!fok || fileSize == 0) { DBG.printf("S3: can't open %s\n", fpath); return false; }
 
-    // Check for a stored session to resume
-    char sessionId[128] = "";
-    uint32_t offset = 0;
+    // ── Small file: single pre-signed PUT ────────────────────────────────────
+    if (fileSize <= S3_CHUNK_SIZE) {
+        // Request a single pre-signed PUT URL
+        char query[256];
+        snprintf(query, sizeof(query), "file=%s&size=%u&device=%s", name, fileSize, g_deviceId);
+        String resp = s3ApiGet(query);
+        String url = jsonStr(resp, "\"url\"");
+        if (!url.length()) {
+            DBG.printf("S3: presign failed: %s\n", resp.substring(0, 200).c_str());
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
+            return false;
+        }
+
+        // Parse URL into host + path
+        char s3Host[128], s3Path[1600];
+        if (!parseUrl(url, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
+            DBG.println("S3: URL parse failed");
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
+            return false;
+        }
+
+        // HTTPS PUT
+        WiFiClientSecure tls; tls.setInsecure();
+        if (!tls.connect(s3Host, 443)) {
+            DBG.printf("S3: TLS connect failed to %s\n", s3Host);
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
+            return false;
+        }
+
+        uint32_t xfrStart = millis();
+        tls.printf("PUT %s HTTP/1.1\r\n"
+                   "Host: %s\r\n"
+                   "Content-Length: %u\r\n"
+                   "Connection: close\r\n\r\n",
+                   s3Path, s3Host, fileSize);
+
+        if (!httpStreamChunk(tls, f, fileSize)) {
+            DBG.println("S3: stream failed");
+            tls.stop();
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
+            return false;
+        }
+        xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
+
+        // Check response
+        String putResp = httpReadResponse(tls);
+        float elapsed = (millis() - xfrStart) / 1000.0f;
+        DBG.printf("S3: uploaded '%s' OK (%u bytes, %.0f KB/s)\n", name, fileSize,
+                   elapsed > 0 ? fileSize / 1024.0f / elapsed : 0);
+        return true;
+    }
+
+    // ── Large file: multipart upload ─────────────────────────────────────────
+    char uploadId[256] = "";
+    char s3Key[128] = "";
+    uint32_t startPart = 1;
+    uint32_t totalParts = 0;
+
+    // Check NVS for interrupted session
     {
-        Preferences p; p.begin("dbxup", true);
+        Preferences p; p.begin("s3up", true);
         String storedName = p.getString("name", "");
         if (storedName == name) {
-            strlcpy(sessionId, p.getString("sid", "").c_str(), sizeof(sessionId));
-            offset = p.getUInt("offset", 0);
+            strlcpy(uploadId, p.getString("uid", "").c_str(), sizeof(uploadId));
+            strlcpy(s3Key, p.getString("key", "").c_str(), sizeof(s3Key));
+            startPart = p.getUInt("part", 1);
+            totalParts = p.getUInt("parts", 0);
         }
         p.end();
     }
 
-    // ── Start new session if none stored ──────────────────────────────────────
-    if (!sessionId[0]) {
-        offset = 0;
-        WiFiClientSecure tls; tls.setInsecure();
-        if (!tls.connect("content.dropboxapi.com", 443)) {
-            DBG.println("DBX: TLS connect failed (start)");
+    // Start new multipart upload if no session
+    if (!uploadId[0]) {
+        char query[256];
+        snprintf(query, sizeof(query), "file=%s&size=%u&device=%s", name, fileSize, g_deviceId);
+        String resp = s3ApiGet(query);
+
+        String uid = jsonStr(resp, "\"upload_id\"");
+        String key = jsonStr(resp, "\"key\"");
+        totalParts = jsonInt(resp, "\"parts\"");
+
+        if (!uid.length() || !key.length() || totalParts <= 0) {
+            DBG.printf("S3: multipart start failed: %s\n", resp.substring(0, 200).c_str());
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
             return false;
         }
 
-        // Start with 0 bytes — just get a session ID
-        tls.printf("POST /2/files/upload_session/start HTTP/1.1\r\n"
-                   "Host: content.dropboxapi.com\r\n"
-                   "Authorization: Bearer %s\r\n"
-                   "Dropbox-API-Arg: {}\r\n"
-                   "Content-Type: application/octet-stream\r\n"
-                   "Content-Length: 0\r\n"
-                   "Connection: close\r\n\r\n", g_dbxToken);
+        strlcpy(uploadId, uid.c_str(), sizeof(uploadId));
+        strlcpy(s3Key, key.c_str(), sizeof(s3Key));
+        startPart = 1;
 
-        String resp = dbxReadResponse(tls);
-        // Parse session_id
-        int q1 = resp.indexOf("\"session_id\"");
-        if (q1 < 0) {
-            DBG.printf("DBX: start failed: %s\n", resp.substring(0, 200).c_str());
-            if (resp.indexOf("invalid_access_token") >= 0) g_dbxToken[0] = 0;
-            xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
-            return false;
-        }
-        int v1 = resp.indexOf('"', resp.indexOf(':', q1) + 1);
-        int v2 = resp.indexOf('"', v1 + 1);
-        resp.substring(v1 + 1, v2).toCharArray(sessionId, sizeof(sessionId));
-        DBG.printf("DBX: session started (%d chars): %s\n",
-                   (int)strlen(sessionId), sessionId);
-
-        // Persist session immediately
-        Preferences p; p.begin("dbxup", false);
-        p.putString("sid", sessionId);
+        // Persist session
+        Preferences p; p.begin("s3up", false);
         p.putString("name", name);
-        p.putUInt("offset", 0);
+        p.putString("uid", uploadId);
+        p.putString("key", s3Key);
+        p.putUInt("part", 1);
+        p.putUInt("parts", totalParts);
         p.putUInt("size", fileSize);
         p.end();
+
+        DBG.printf("S3: multipart started, %u parts, upload_id=%s\n",
+                   totalParts, uploadId);
     } else {
-        DBG.printf("DBX: resuming session %s at offset %u/%u\n",
-                   sessionId, offset, fileSize);
+        DBG.printf("S3: resuming multipart at part %u/%u\n", startPart, totalParts);
     }
 
-    // Seek file to resume offset
-    if (offset > 0) {
+    // Seek file to resume position
+    uint32_t resumeOffset = (startPart - 1) * S3_CHUNK_SIZE;
+    if (resumeOffset > 0) {
         xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-        f.seekSet(offset);
+        f.seekSet(resumeOffset);
         xSemaphoreGive(g_sd_mutex);
     }
 
-    // ── Send chunks via append_v2 ────────────────────────────────────────────
     uint32_t xfrStart = millis();
-    while (offset < fileSize) {
-        if (!g_dbxToken[0] || millis() >= g_dbxTokenExpMs) {
-            if (!dbxRefreshToken()) {
-                xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
-                return false;
-            }
-        }
 
+    // Upload each part
+    for (uint32_t partNum = startPart; partNum <= totalParts; partNum++) {
+        uint32_t offset = (partNum - 1) * S3_CHUNK_SIZE;
         uint32_t chunkSize = fileSize - offset;
-        if (chunkSize > DBX_CHUNK_SIZE) chunkSize = DBX_CHUNK_SIZE;
+        if (chunkSize > S3_CHUNK_SIZE) chunkSize = S3_CHUNK_SIZE;
 
-        WiFiClientSecure tls; tls.setInsecure();
-        if (!tls.connect("content.dropboxapi.com", 443)) {
-            DBG.println("DBX: TLS connect failed (append)");
+        // Get pre-signed URL for this part
+        char query[512];
+        snprintf(query, sizeof(query), "upload_id=%s&key=%s&part=%u",
+                 uploadId, s3Key, partNum);
+        String resp = s3ApiGet(query);
+        String url = jsonStr(resp, "\"url\"");
+        if (!url.length()) {
+            DBG.printf("S3: presign part %u failed: %s\n", partNum,
+                       resp.substring(0, 200).c_str());
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
             return false;
         }
 
-        char apiArg[256];
-        snprintf(apiArg, sizeof(apiArg),
-            "{\"cursor\":{\"session_id\":\"%s\",\"offset\":%u},\"close\":false}",
-            sessionId, offset);
+        // Parse URL
+        char s3Host[128], s3Path[1600];
+        if (!parseUrl(url, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
+            DBG.println("S3: URL parse failed");
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
+            return false;
+        }
 
-        tls.printf("POST /2/files/upload_session/append_v2 HTTP/1.1\r\n"
-                   "Host: content.dropboxapi.com\r\n"
-                   "Authorization: Bearer %s\r\n"
-                   "Dropbox-API-Arg: %s\r\n"
-                   "Content-Type: application/octet-stream\r\n"
+        // PUT this chunk
+        WiFiClientSecure tls; tls.setInsecure();
+        if (!tls.connect(s3Host, 443)) {
+            DBG.printf("S3: TLS connect failed to %s (part %u)\n", s3Host, partNum);
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
+            return false;
+        }
+
+        tls.printf("PUT %s HTTP/1.1\r\n"
+                   "Host: %s\r\n"
                    "Content-Length: %u\r\n"
                    "Connection: close\r\n\r\n",
-                   g_dbxToken, apiArg, chunkSize);
+                   s3Path, s3Host, chunkSize);
 
-        if (!dbxStreamChunk(tls, f, chunkSize)) {
-            DBG.printf("DBX: stream failed at offset %u\n", offset);
+        if (!httpStreamChunk(tls, f, chunkSize)) {
+            DBG.printf("S3: stream failed at part %u\n", partNum);
             tls.stop();
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
             return false;
         }
 
-        // Check response (append returns empty body on success, or error JSON)
-        String statusLine = tls.readStringUntil('\n');
-        String resp = dbxReadResponse(tls);
+        // Read response and capture ETag
+        char etag[64] = "";
+        String putResp = httpReadResponse(tls, etag, sizeof(etag));
 
-        if (statusLine.indexOf("200") < 0) {
-            DBG.printf("DBX: append failed at %u: %s %s\n", offset,
-                       statusLine.c_str(), resp.substring(0, 200).c_str());
-            if (resp.indexOf("invalid_access_token") >= 0) g_dbxToken[0] = 0;
-            if (resp.indexOf("not_found") >= 0) dbxClearSession();  // stale session
+        if (!etag[0]) {
+            DBG.printf("S3: no ETag in response for part %u\n", partNum);
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
             return false;
         }
 
-        offset += chunkSize;
-
-        // Persist progress to NVS after each successful chunk
+        // Persist progress + etag to NVS
         {
-            Preferences p; p.begin("dbxup", false);
-            p.putUInt("offset", offset);
+            Preferences p; p.begin("s3up", false);
+            char etagKey[12]; snprintf(etagKey, sizeof(etagKey), "etag%u", partNum);
+            p.putString(etagKey, etag);
+            p.putUInt("part", partNum + 1);
             p.end();
         }
 
         float elapsed = (millis() - xfrStart) / 1000.0f;
-        DBG.printf("DBX: %u/%u bytes (%.0f%%, %.0f KB/s)\n",
-                   offset, fileSize, offset * 100.0f / fileSize,
-                   elapsed > 0 ? offset / 1024.0f / elapsed : 0);
+        uint32_t totalSent = offset + chunkSize;
+        DBG.printf("S3: part %u/%u done (%u/%u bytes, %.0f%%, %.0f KB/s)\n",
+                   partNum, totalParts, totalSent, fileSize,
+                   totalSent * 100.0f / fileSize,
+                   elapsed > 0 ? totalSent / 1024.0f / elapsed : 0);
     }
     xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
 
-    // ── Finish: commit the file ──────────────────────────────────────────────
+    // ── Complete multipart upload ────────────────────────────────────────────
+    // Build parts JSON array: [{"part":1,"etag":"..."},...]
+    String partsJson = "";
     {
-        if (!g_dbxToken[0] || millis() >= g_dbxTokenExpMs) {
-            if (!dbxRefreshToken()) return false;
+        Preferences p; p.begin("s3up", true);
+        for (uint32_t i = 1; i <= totalParts; i++) {
+            char etagKey[12]; snprintf(etagKey, sizeof(etagKey), "etag%u", i);
+            String etag = p.getString(etagKey, "");
+            if (i > 1) partsJson += ",";
+            partsJson += "{\"part\":" + String(i) + ",\"etag\":\"" + etag + "\"}";
         }
-
-        WiFiClientSecure tls; tls.setInsecure();
-        if (!tls.connect("content.dropboxapi.com", 443)) {
-            DBG.println("DBX: TLS connect failed (finish)");
-            return false;
-        }
-
-        char apiArg[256];
-        snprintf(apiArg, sizeof(apiArg),
-            "{\"cursor\":{\"session_id\":\"%s\",\"offset\":%u},"
-            "\"commit\":{\"path\":\"/%s\",\"mode\":\"add\",\"autorename\":true}}",
-            sessionId, fileSize, name);
-
-        tls.printf("POST /2/files/upload_session/finish HTTP/1.1\r\n"
-                   "Host: content.dropboxapi.com\r\n"
-                   "Authorization: Bearer %s\r\n"
-                   "Dropbox-API-Arg: %s\r\n"
-                   "Content-Type: application/octet-stream\r\n"
-                   "Content-Length: 0\r\n"
-                   "Connection: close\r\n\r\n",
-                   g_dbxToken, apiArg);
-
-        String resp = dbxReadResponse(tls);
-        if (resp.indexOf("\"path_display\"") < 0) {
-            DBG.printf("DBX: finish failed: %s\n", resp.substring(0, 200).c_str());
-            return false;
-        }
+        p.end();
     }
 
-    // Success — clear stored session
-    dbxClearSession();
+    if (!s3ApiComplete(uploadId, s3Key, partsJson.c_str())) {
+        DBG.println("S3: complete_multipart failed");
+        return false;
+    }
+
+    s3ClearSession();
 
     float elapsed = (millis() - xfrStart) / 1000.0f;
-    DBG.printf("DBX: uploaded '%s' OK (%u bytes, %.0f KB/s)\n", name, fileSize,
+    DBG.printf("S3: uploaded '%s' OK (%u bytes, %u parts, %.0f KB/s)\n",
+               name, fileSize, totalParts,
                elapsed > 0 ? fileSize / 1024.0f / elapsed : 0);
     return true;
 }
@@ -1034,10 +1086,10 @@ static void uploadTask(void* /*param*/) {
                 vTaskDelay(pdMS_TO_TICKS(60000)); continue;
             }
 
-            // Upload to Dropbox; on failure retry after a delay
+            // Upload to S3; on failure retry after a delay
             DBG.printf("Uploading: %s (%.1f MB) heap=%u min=%u\n",
                        name, fileMb, ESP.getFreeHeap(), ESP.getMinFreeHeap());
-            bool uploaded = dbxUploadFile(name);
+            bool uploaded = s3UploadFile(name);
             if (!uploaded) {
                 DBG.printf("Upload failed for %s — retrying in 30s\n", name);
                 vTaskDelay(pdMS_TO_TICKS(30000)); continue;  // retry same file
@@ -1291,14 +1343,23 @@ void setup() {
     if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
         for (;;) { DBG.println("SSD1306 failed"); delay(1000); }
     }
-    // Provision Dropbox credentials on first boot (if NVS is empty)
+    // Provision S3 upload credentials on first boot (if NVS is empty)
     {
-        Preferences p; p.begin("dbx", false);
-        if (p.getString("app_key", "").isEmpty()) {
-            p.putString("app_key",    "82un1zz0uurgszt");
-            p.putString("app_secret", "hc3wapn8hsgzuva");
-            p.putString("refresh",    "J0Iqey6GFFsAAAAAAAAAAa7xToJsNmRAqr1Ok5WOGyqGlIhJI0wcSdL2_LKv6quE");
-            DBG.println("Dropbox credentials provisioned");
+        Preferences p; p.begin("s3", false);
+        if (p.getString("api_host", "").isEmpty()) {
+            p.putString("api_host", "disw6oxjed.execute-api.us-west-2.amazonaws.com");
+            p.putString("api_key",  "7fFErx7ZCt9Vr2fvYfyOT7YxxeEjay4G5bpmfYdm");
+            DBG.println("S3 upload credentials provisioned");
+        }
+        // Auto-generate device_id from MAC address if not set
+        if (p.getString("device_id", "").isEmpty()) {
+            uint8_t mac[6];
+            esp_read_mac(mac, ESP_MAC_WIFI_STA);
+            char macStr[16];
+            snprintf(macStr, sizeof(macStr), "%02X%02X%02X%02X%02X%02X",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            p.putString("device_id", macStr);
+            DBG.printf("Device ID: %s\n", macStr);
         }
         p.end();
     }
@@ -1400,18 +1461,17 @@ static void processCLI(const char* cmd) {
         saveNetwork(ssid, pass);
         DBG.printf("CLI: WiFi saved: '%s'\n", ssid);
 
-    } else if (strncmp(cmd, "SETDBX ", 7) == 0) {
-        char appKey[32], appSecret[32], refresh[128];
-        if (sscanf(cmd + 7, "%31s %31s %127s", appKey, appSecret, refresh) < 3) {
-            DBG.println("CLI: SETDBX <app_key> <app_secret> <refresh_token>"); return;
+    } else if (strncmp(cmd, "SETS3 ", 6) == 0) {
+        char apiHost[128], apiKey[64];
+        if (sscanf(cmd + 6, "%127s %63s", apiHost, apiKey) < 2) {
+            DBG.println("CLI: SETS3 <api_host> <api_key>"); return;
         }
-        Preferences p; p.begin("dbx", false);
-        p.putString("app_key", appKey);
-        p.putString("app_secret", appSecret);
-        p.putString("refresh", refresh);
+        Preferences p; p.begin("s3", false);
+        p.putString("api_host", apiHost);
+        p.putString("api_key", apiKey);
         p.end();
-        g_dbxToken[0] = 0;  // force re-auth on next upload
-        DBG.printf("CLI: Dropbox saved: app_key=%s\n", appKey);
+        g_apiHost[0] = 0; g_apiKey[0] = 0;  // force reload on next upload
+        DBG.printf("CLI: S3 saved: api_host=%s\n", apiHost);
 
     } else if (strcmp(cmd, "STATUS") == 0) {
         char ipStr[20] = "disconnected";
@@ -1420,10 +1480,10 @@ static void processCLI(const char* cmd) {
             ipStr, g_apMode ? "yes" : "no",
             g_filesQueued, g_filesUploaded,
             g_mbQueued, g_mbUploaded);
-        Preferences p; p.begin("dbx", true);
-        DBG.printf("CLI: dropbox app_key=%s refresh=%s\n",
-            p.getString("app_key","(none)").c_str(),
-            p.getString("refresh","").length() > 0 ? "yes" : "no");
+        Preferences p; p.begin("s3", true);
+        DBG.printf("CLI: s3 api_host=%s device=%s\n",
+            p.getString("api_host","(none)").c_str(),
+            p.getString("device_id","(none)").c_str());
         p.end();
 
     } else if (strcmp(cmd, "RESETBOOT") == 0) {
@@ -1461,7 +1521,7 @@ static void processCLI(const char* cmd) {
 
     } else {
         DBG.printf("CLI: unknown: '%s'\n", cmd);
-        DBG.println("CLI: commands: SETWIFI SETFTP STATUS REBOOT");
+        DBG.println("CLI: commands: SETWIFI SETS3 STATUS UPLOAD FORMAT REBOOT");
     }
 }
 
