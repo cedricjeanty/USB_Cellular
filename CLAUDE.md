@@ -1,5 +1,75 @@
 # Developer Brief: USB WiFi Airbridge
 
+Two hardware variants exist: a Raspberry Pi Zero 2 W (legacy, being deprecated) and an
+ESP32-S3 (active development on `esp32-s3` branch). Both present a USB mass storage
+device to a legacy host, harvest files when idle, and upload via WiFi.
+
+## ESP32-S3 Variant (Active)
+
+**Hardware:** ESP32-S3-DevKitC-1 (4 MB flash, 2 MB PSRAM)
+
+**USB:** TinyUSB mass storage (ARDUINO_USB_MODE=0) + CDC serial
+
+**Storage:** SD card via SPI (CS=10, MOSI=11, MISO=12, SCK=13)
+
+**Display:** SSD1306 128×64 OLED at I2C GPIO 7 (SCL) / 8 (SDA), addr 0x3C
+
+**Upload:** S3 via pre-signed URLs from a Lambda backend (no AWS creds on device)
+
+**Source:** `esp32/src/main.cpp` (PlatformIO + Arduino)
+
+### S3 Upload Architecture
+
+```
+ESP32 → GET /presign (API Gateway + Lambda) → pre-signed S3 PUT URL
+ESP32 → PUT file data → S3 bucket (direct)
+```
+
+- Lambda: `airbridge-presign` in us-west-2, source in `lambda/presign.py`
+- API Gateway requires `x-api-key` header (fleet key, rate-limited)
+- Small files (<5 MB): single PUT. Large files: S3 multipart with NVS resume.
+- Files land in S3 as `<device_mac>/<filename>`
+- Device ID auto-generated from WiFi MAC address
+
+### ESP32 NVS Namespaces
+
+| Namespace | Keys | Purpose |
+|-----------|------|---------|
+| `s3` | `api_host`, `api_key`, `device_id` | Upload credentials |
+| `s3up` | `name`, `uid`, `key`, `parts`, `part`, `etagN` | Multipart resume state |
+| `wifi` | `ssid0`..`ssid4`, `pass0`..`pass4`, `count` | Saved WiFi networks |
+
+### ESP32 Serial CLI
+
+| Command | Description |
+|---------|-------------|
+| `SETWIFI <ssid> <pass>` | Save a WiFi network |
+| `SETS3 <api_host> <api_key>` | Set S3 upload backend |
+| `STATUS` | Show WiFi, upload stats, S3 config |
+| `UPLOAD` | Trigger upload task manually |
+| `FORMAT` | Format SD card (destroys all data) |
+| `REBOOT` | Reboot device |
+
+### Flashing (device looks like a USB drive when running)
+
+1. **1200-baud touch:** open CDC port at 1200 baud and close → enters ROM bootloader
+   - `stty -F /dev/ttyACM0 1200` (or python serial)
+   - Wait for new `/dev/ttyACM*` to appear
+   - `~/.local/bin/pio run -t upload --upload-port /dev/ttyACM<N>`
+   - Do NOT do a second 1200-baud reset after flash
+2. **Manual download mode:** hold BOOT, press RESET → flash normally
+
+### Build
+
+```bash
+cd esp32 && ~/.local/bin/pio run          # compile only
+cd esp32 && ~/.local/bin/pio run -t upload # compile + flash
+```
+
+---
+
+## Raspberry Pi Variant (Legacy — being deprecated)
+
 **Environment:** Raspberry Pi Zero 2 W running Raspberry Pi OS (Lite)
 
 **Access:** `cedric@pizerologs.local`
@@ -95,10 +165,16 @@ client mode when attempting to join the new network.
 
 ## 5. Files
 
-* `main.py` — Primary state machine (harvest loop + upload worker thread)
-* `wifi_manager.py` — WiFi status (`get_wifi_info`, `rssi_to_csq`, `is_connected`), FTP/HTTP upload
-* `captive_portal.py` — NM hotspot AP + captive portal HTTP server
-* `display_handler.py` — SSD1306 OLED display (no Pillow/luma.oled needed)
+### ESP32-S3
+* `esp32/src/main.cpp` — Single-file firmware: USB MSC, harvest, S3 upload, WiFi, OLED, CLI
+* `esp32/platformio.ini` — PlatformIO build config (board, libs, flags)
+* `lambda/presign.py` — Lambda function for S3 pre-signed URL generation
+
+### Raspberry Pi (legacy)
+* `src/airbridge/main.py` — Primary state machine (harvest loop + upload worker thread)
+* `src/airbridge/wifi_manager.py` — WiFi status, FTP/HTTP upload
+* `src/airbridge/captive_portal.py` — NM hotspot AP + captive portal HTTP server
+* `src/airbridge/display_handler.py` — SSD1306 OLED display
 * `config.yaml` — FTP server settings, poll interval, `wifi_ap` ssid/channel
 
 ## 6. Configuration (`config.yaml`)
