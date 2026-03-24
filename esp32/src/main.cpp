@@ -623,10 +623,13 @@ static String httpReadResponse(WiFiClientSecure& tls, char* etag = nullptr, size
     while (tls.connected()) {
         String line = tls.readStringUntil('\n');
         if (line.indexOf("chunked") >= 0) chunked = true;
-        // Capture ETag header if requested
+        // Capture ETag header if requested (strip surrounding quotes)
         if (etag && etagSz > 0 && line.startsWith("ETag:")) {
             String val = line.substring(5);
             val.trim();
+            // S3 returns ETags in quotes: "abc123" — strip them for clean JSON
+            if (val.startsWith("\"") && val.endsWith("\""))
+                val = val.substring(1, val.length() - 1);
             strlcpy(etag, val.c_str(), etagSz);
         }
         if (line == "\r") break;
@@ -660,7 +663,7 @@ static String httpReadResponse(WiFiClientSecure& tls, char* etag = nullptr, size
 // Stream `len` bytes from an open FsFile at current position to a TLS connection.
 // Returns true if all bytes sent.
 static bool httpStreamChunk(WiFiClientSecure& tls, FsFile& f, uint32_t len) {
-    uint8_t cbuf[8192];
+    static uint8_t cbuf[8192];  // static: keep off 16 KB task stack
     uint32_t remaining = len;
     while (remaining > 0) {
         uint32_t toRead = (remaining < sizeof(cbuf)) ? remaining : sizeof(cbuf);
@@ -798,6 +801,8 @@ static bool s3UploadFile(const char* name) {
     xSemaphoreGive(g_sd_mutex);
     if (!fok || fileSize == 0) { DBG.printf("S3: can't open %s\n", fpath); return false; }
 
+    static char s3Path[2500];  // shared by single-PUT and multipart paths
+
     // ── Small file: single pre-signed PUT ────────────────────────────────────
     if (fileSize <= S3_CHUNK_SIZE) {
         // Request a single pre-signed PUT URL
@@ -812,7 +817,7 @@ static bool s3UploadFile(const char* name) {
         }
 
         // Parse URL into host + path
-        char s3Host[128], s3Path[1600];
+        char s3Host[128];
         if (!parseUrl(url, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
             DBG.println("S3: URL parse failed");
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
@@ -934,13 +939,14 @@ static bool s3UploadFile(const char* name) {
             return false;
         }
 
-        // Parse URL
-        char s3Host[128], s3Path[1600];
+        // Parse URL (reuses static s3Path buffer from single-PUT path above)
+        char s3Host[128];
         if (!parseUrl(url, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
             DBG.println("S3: URL parse failed");
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
             return false;
         }
+        DBG.printf("S3: part %u URL len=%d path=%d\n", partNum, url.length(), (int)strlen(s3Path));
 
         // PUT this chunk
         WiFiClientSecure tls; tls.setInsecure();
@@ -968,7 +974,9 @@ static bool s3UploadFile(const char* name) {
         String putResp = httpReadResponse(tls, etag, sizeof(etag));
 
         if (!etag[0]) {
-            DBG.printf("S3: no ETag in response for part %u\n", partNum);
+            DBG.printf("S3: no ETag for part %u, resp(%d): %s\n",
+                       partNum, putResp.length(), putResp.substring(0, 300).c_str());
+            s3ClearSession();  // stale upload_id — next retry starts fresh
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
             return false;
         }
@@ -1006,7 +1014,8 @@ static bool s3UploadFile(const char* name) {
     }
 
     if (!s3ApiComplete(uploadId, s3Key, partsJson.c_str())) {
-        DBG.println("S3: complete_multipart failed");
+        DBG.println("S3: complete_multipart failed — clearing session");
+        s3ClearSession();  // stale upload — next retry starts fresh
         return false;
     }
 
@@ -1244,7 +1253,7 @@ static void doHarvest() {
         FsFile sf, df;
         bool copied = false;
         if (sf.open(&sd, src, O_RDONLY) && df.open(&sd, dst, O_WRONLY | O_CREAT)) {
-            uint8_t cpbuf[512];
+            static uint8_t cpbuf[8192];  // static: save stack in 16 KB harvest task
             uint32_t rem = fileBytes;
             copied = true;
             while (rem > 0) {
@@ -1421,7 +1430,7 @@ void setup() {
         if (h.open(&sd, "/harvested", O_RDONLY)) {
             while (f.openNext(&h, O_RDONLY)) {
                 char name[64]; f.getName(name, sizeof(name));
-                if (!f.isDir() && !f.isHidden() && !f.isSystem()) {
+                if (!f.isDir() && name[0] != '.' && f.fileSize() > 0) {
                     g_filesQueued++;
                     g_mbQueued += (float)f.fileSize() / 1e6f;
                 }
