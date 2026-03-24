@@ -11,6 +11,7 @@
 #include "freertos/semphr.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <lwip/sockets.h>
 #include <DNSServer.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -660,6 +661,15 @@ static String httpReadResponse(WiFiClientSecure& tls, char* etag = nullptr, size
     return body;
 }
 
+// Enlarge the TCP send buffer on a connected WiFiClientSecure socket.
+// The default lwIP SO_SNDBUF is 5760 which caps throughput at ~94 KB/s.
+static void enlargeSendBuffer(WiFiClientSecure& tls, int size = 32768) {
+    int fd = tls.fd();
+    if (fd >= 0) {
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
+    }
+}
+
 // Stream `len` bytes from an open FsFile at current position to a TLS connection.
 // Returns true if all bytes sent.
 static bool httpStreamChunk(WiFiClientSecure& tls, FsFile& f, uint32_t len) {
@@ -831,6 +841,7 @@ static bool s3UploadFile(const char* name) {
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
             return false;
         }
+        enlargeSendBuffer(tls);
 
         uint32_t xfrStart = millis();
         tls.printf("PUT %s HTTP/1.1\r\n"
@@ -955,6 +966,7 @@ static bool s3UploadFile(const char* name) {
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); f.close(); xSemaphoreGive(g_sd_mutex);
             return false;
         }
+        enlargeSendBuffer(tls);
 
         tls.printf("PUT %s HTTP/1.1\r\n"
                    "Host: %s\r\n"
