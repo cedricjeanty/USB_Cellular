@@ -1,0 +1,54 @@
+# AirBridge ESP32-S3 — ESP-IDF sdkconfig
+# Board: ESP32-S3-DevKitC-1 (4 MB flash, 2 MB PSRAM)
+
+# Flash
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+
+# PSRAM — disabled (octal PSRAM init fails on this board variant)
+# CONFIG_SPIRAM is not set
+
+# FreeRTOS
+CONFIG_FREERTOS_HZ=1000
+
+# ── Upload throughput tuning ─────────────────────────────────────
+# TCP send buffer & window: default 5760 caps HTTPS upload at ~94 KB/s
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+
+# mbedTLS: asymmetric buffers (large TX for upload, small RX for responses)
+CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=16384
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
+
+# Hardware crypto accelerators
+CONFIG_MBEDTLS_HARDWARE_AES=y
+CONFIG_MBEDTLS_HARDWARE_SHA=y
+CONFIG_MBEDTLS_HARDWARE_MPI=y
+
+# ── USB ──────────────────────────────────────────────────────────
+CONFIG_TINYUSB_ENABLED=y
+CONFIG_TINYUSB_MSC_ENABLED=y
+CONFIG_TINYUSB_CDC_ENABLED=y
+
+# ── FAT filesystem ──────────────────────────────────────────────
+CONFIG_FATFS_LFN_HEAP=y
+# SD card uses 512-byte sectors (default 4096 breaks MBR parsing)
+CONFIG_FATFS_SECTOR_4096=n
+CONFIG_FATFS_SECTOR_512=y
+CONFIG_FATFS_MAX_LFN=255
+CONFIG_FATFS_API_ENCODING_UTF_8=y
+CONFIG_FATFS_CODEPAGE_850=y
+
+# ── WiFi ─────────────────────────────────────────────────────────
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
+
+# ── Watchdog ─────────────────────────────────────────────────────
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+
+# ── Partition table ──────────────────────────────────────────────
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
