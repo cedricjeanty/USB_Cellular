@@ -16,7 +16,15 @@ device to a legacy host, harvest files when idle, and upload via WiFi.
 
 **Upload:** S3 via pre-signed URLs from a Lambda backend (no AWS creds on device)
 
-**Source:** `esp32/src/main.cpp` (PlatformIO + Arduino)
+**Source:** `esp32/src/main.cpp` (PlatformIO)
+
+**Two firmware branches:**
+- `esp32-s3` — Arduino framework (90 KB/s upload, legacy)
+- `esp32-idf` — ESP-IDF native (279 KB/s upload, active development)
+  - 32KB TCP send/receive buffers (vs Arduino's fixed 5760)
+  - Custom sdkconfig for lwIP/mbedTLS tuning
+  - Uses esp_tls + cert bundle for HTTPS
+  - Local esp_tinyusb component for custom MSC callbacks
 
 ### S3 Upload Architecture
 
@@ -52,11 +60,10 @@ ESP32 → PUT file data → S3 bucket (direct)
 
 ### Flashing (device looks like a USB drive when running)
 
-1. **1200-baud touch:** open CDC port at 1200 baud and close → enters ROM bootloader
-   - `stty -F /dev/ttyACM0 1200` (or python serial)
-   - Wait for new `/dev/ttyACM*` to appear
-   - `~/.local/bin/pio run -t upload --upload-port /dev/ttyACM<N>`
-   - Do NOT do a second 1200-baud reset after flash
+1. **1200-baud touch:** open CDC port at 1200 baud and close → enters bootloader
+   - Arduino branch: enters JTAG bootloader, flash on new ttyACM port
+   - ESP-IDF branch: enters ROM USB bootloader (303a:0009), flash on ttyACM0
+   - **ESP-IDF: must power cycle after flash** (ROM bootloader doesn't auto-reset)
 2. **Manual download mode:** hold BOOT, press RESET → flash normally
 
 ### Build
@@ -65,6 +72,14 @@ ESP32 → PUT file data → S3 bucket (direct)
 cd esp32 && ~/.local/bin/pio run          # compile only
 cd esp32 && ~/.local/bin/pio run -t upload # compile + flash
 ```
+
+### ESP-IDF Branch Notes
+
+- **Power cycle required** after flashing (not soft REBOOT) — stale SPI state
+- SD card must be formatted by ESP-IDF FATFS on first boot (`format_if_mount_failed=true`, then set to `false`)
+- `sdkconfig.defaults` in esp32/ controls lwIP/mbedTLS tuning
+- Delete `sdkconfig.esp32s3` to force sdkconfig.defaults to be re-applied
+- Local `components/esp_tinyusb/` overrides default MSC storage (custom read/write tracking)
 
 ---
 
@@ -165,9 +180,11 @@ client mode when attempting to join the new network.
 
 ## 5. Files
 
-### ESP32-S3
+### ESP32-S3 (both branches)
 * `esp32/src/main.cpp` — Single-file firmware: USB MSC, harvest, S3 upload, WiFi, OLED, CLI
-* `esp32/platformio.ini` — PlatformIO build config (board, libs, flags)
+* `esp32/platformio.ini` — PlatformIO build config (Arduino on esp32-s3, ESP-IDF on esp32-idf)
+* `esp32/sdkconfig.defaults` — ESP-IDF branch only: lwIP/mbedTLS tuning (32KB TCP buffers)
+* `esp32/components/esp_tinyusb/` — ESP-IDF branch only: local TinyUSB component with custom MSC callbacks
 * `lambda/presign.py` — Lambda function for S3 pre-signed URL generation
 
 ### Raspberry Pi (legacy)
