@@ -2025,7 +2025,7 @@ static void doHarvest() {
     bool ok = false;
     for (int i = 0; i < 3 && !ok; i++) {
         ok = sd_reinit_and_mount();
-        ESP_LOGI(TAG, "doHarvest: sd reinit attempt %d = %s", i+1, ok ? "OK" : "FAIL");
+        cdc_printf("doHarvest: reinit attempt %d = %s\r\n", i+1, ok ? "OK" : "FAIL");
         if (!ok) vTaskDelay(pdMS_TO_TICKS(500));
     }
 
@@ -2056,8 +2056,9 @@ static void doHarvest() {
     stack[0].dir = opendir(stack[0].dirpath);
     stack[0].prefix[0] = '\0';
 
+    cdc_printf("doHarvest: opendir(%s) = %s\r\n", stack[0].dirpath, stack[0].dir ? "ok" : "FAIL");
     if (!stack[0].dir) {
-        ESP_LOGE(TAG, "doHarvest: can't open root dir");
+        cdc_printf("doHarvest: can't open root dir\r\n");
         xSemaphoreGive(g_sd_mutex);
         g_writeDetected = false; g_lastWriteMs = 0;
         g_hostWasConnected = false; g_hostConnected = false;
@@ -2083,6 +2084,9 @@ static void doHarvest() {
 
         struct stat st;
         if (stat(fullpath, &st) != 0) continue;
+
+        cdc_printf("doHarvest: found '%s' %lu bytes %s\r\n", name, (unsigned long)st.st_size,
+                   S_ISDIR(st.st_mode) ? "DIR" : "FILE");
 
         if (S_ISDIR(st.st_mode)) {
             if (depth < 3) {
@@ -2157,7 +2161,7 @@ static void doHarvest() {
 
     g_filesQueued += count;
     if (count > 0) g_mbQueued += usedMb;
-    ESP_LOGI(TAG, "doHarvest: done %u file(s) (%.1f MB)", count, usedMb);
+    cdc_printf("doHarvest: done %u file(s) (%.1f MB)\r\n", count, usedMb);
 
     g_writeDetected = false; g_lastWriteMs = 0;
     g_hostWasConnected = false; g_hostConnected = false;
