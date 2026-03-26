@@ -27,6 +27,7 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_tls.h"
+#include "esp_crt_bundle.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "driver/spi_master.h"
@@ -335,6 +336,7 @@ static uint16_t g_filesUploaded  = 0;
 static float    g_hostWrittenMb  = 0.0f;
 static float    g_mbQueued       = 0.0f;
 static float    g_mbUploaded     = 0.0f;
+static float    g_lastUploadKBps = 0.0f;  // speed of last upload for STATUS display
 static float    g_sdTotalMb      = 0.0f;
 static uint32_t g_lastDisplayMs  = 0;
 static uint32_t g_lastHarvestMs  = 0;
@@ -1371,7 +1373,7 @@ static bool s3LoadCreds() {
     if (g_apiHost[0] && g_apiKey[0] && g_deviceId[0]) return true;
     nvs_handle_t h;
     if (nvs_open("s3", NVS_READONLY, &h) != ESP_OK) {
-        ESP_LOGI(TAG, "S3: no credentials in NVS");
+        cdc_printf("S3: no credentials in NVS\r\n");
         return false;
     }
     nvs_get_string(h, "api_host", g_apiHost, sizeof(g_apiHost));
@@ -1379,7 +1381,7 @@ static bool s3LoadCreds() {
     nvs_get_string(h, "device_id", g_deviceId, sizeof(g_deviceId));
     nvs_close(h);
     if (!g_apiHost[0] || !g_apiKey[0]) {
-        ESP_LOGI(TAG, "S3: no credentials in NVS");
+        cdc_printf("S3: no credentials in NVS\r\n");
         return false;
     }
     return true;
@@ -1464,14 +1466,22 @@ done_headers:
 // Connect TLS to host:443, returns esp_tls handle or nullptr.
 static esp_tls_t* tls_connect(const char* host) {
     esp_tls_cfg_t cfg = {};
-    cfg.skip_common_name = true;  // like setInsecure()
-    // For pre-signed S3 URLs, we skip cert verification (same as Arduino setInsecure)
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;  // use built-in Mozilla CA bundle
+    cfg.timeout_ms = 10000;
 
     esp_tls_t *tls = esp_tls_init();
     if (!tls) return nullptr;
 
-    if (esp_tls_conn_new_sync(host, strlen(host), 443, &cfg, tls) != 1) {
-        ESP_LOGE(TAG, "TLS connect failed to %s", host);
+    int ret = esp_tls_conn_new_sync(host, strlen(host), 443, &cfg, tls);
+    if (ret != 1) {
+        int esp_err = 0, mbedtls_err = 0;
+        esp_tls_error_handle_t err_handle;
+        if (esp_tls_get_error_handle(tls, &err_handle) == ESP_OK && err_handle) {
+            esp_err = err_handle->last_error;
+            mbedtls_err = err_handle->esp_tls_error_code;
+        }
+        cdc_printf("TLS fail: host=%s ret=%d esp=0x%x mbed=0x%x heap=%lu\r\n",
+                   host, ret, esp_err, mbedtls_err, (unsigned long)esp_get_free_heap_size());
         esp_tls_conn_destroy(tls);
         return nullptr;
     }
@@ -1571,7 +1581,7 @@ static bool parseUrl(const std::string& url, char* host, size_t hostSz,
 static std::string s3ApiGet(const char* queryParams) {
     esp_tls_t* tls = tls_connect(g_apiHost);
     if (!tls) {
-        ESP_LOGE(TAG, "S3: TLS connect failed to %s", g_apiHost);
+        cdc_printf("S3: TLS connect failed to %s", g_apiHost);
         return "";
     }
     char req[512];
@@ -1595,7 +1605,7 @@ static bool s3ApiComplete(const char* uploadId, const char* key,
                           const char* partsJson) {
     esp_tls_t* tls = tls_connect(g_apiHost);
     if (!tls) {
-        ESP_LOGI(TAG, "S3: TLS connect failed (complete)");
+        cdc_printf("S3: TLS connect failed (complete)\r\n");
         return false;
     }
     char body[2048];
@@ -1622,13 +1632,13 @@ static bool s3ApiComplete(const char* uploadId, const char* key,
     std::string resp = httpReadResponse(tls);
     esp_tls_conn_destroy(tls);
     bool ok = resp.find("\"ok\"") != std::string::npos;
-    if (!ok) ESP_LOGE(TAG, "S3: complete failed: %.200s", resp.c_str());
+    if (!ok) cdc_printf("S3: complete failed: %.200s", resp.c_str());
     return ok;
 }
 
 // Upload a file from /sdcard/harvested/<name> to S3 using pre-signed URLs.
 static bool s3UploadFile(const char* name) {
-    if (!g_netConnected) { ESP_LOGI(TAG, "S3: no WiFi"); return false; }
+    if (!g_netConnected) { cdc_printf("S3: no WiFi\r\n"); return false; }
     if (!s3LoadCreds()) return false;
 
     char fpath[128];
@@ -1644,7 +1654,7 @@ static bool s3UploadFile(const char* name) {
     }
     xSemaphoreGive(g_sd_mutex);
     if (!f || fileSize == 0) {
-        ESP_LOGE(TAG, "S3: can't open %s", fpath);
+        cdc_printf("S3: can't open %s", fpath);
         if (f) fclose(f);
         return false;
     }
@@ -1658,21 +1668,21 @@ static bool s3UploadFile(const char* name) {
         std::string resp = s3ApiGet(query);
         std::string url = jsonStr(resp, "\"url\"");
         if (url.empty()) {
-            ESP_LOGE(TAG, "S3: presign failed: %.200s", resp.c_str());
+            cdc_printf("S3: presign failed: %.200s", resp.c_str());
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
             return false;
         }
 
         char s3Host[128];
         if (!parseUrl(url, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
-            ESP_LOGI(TAG, "S3: URL parse failed");
+            cdc_printf("S3: URL parse failed\r\n");
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
             return false;
         }
 
         esp_tls_t* tls = tls_connect(s3Host);
         if (!tls) {
-            ESP_LOGE(TAG, "S3: TLS connect failed to %s", s3Host);
+            cdc_printf("S3: TLS connect failed to %s", s3Host);
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
             return false;
         }
@@ -1686,14 +1696,14 @@ static bool s3UploadFile(const char* name) {
             "Connection: close\r\n\r\n",
             s3Path, s3Host, fileSize);
         if (!tls_write_all(tls, hdr, hlen)) {
-            ESP_LOGI(TAG, "S3: header send failed");
+            cdc_printf("S3: header send failed\r\n");
             esp_tls_conn_destroy(tls);
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
             return false;
         }
 
         if (!httpStreamChunk(tls, f, fileSize)) {
-            ESP_LOGI(TAG, "S3: stream failed");
+            cdc_printf("S3: stream failed\r\n");
             esp_tls_conn_destroy(tls);
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
             return false;
@@ -1703,8 +1713,8 @@ static bool s3UploadFile(const char* name) {
         std::string putResp = httpReadResponse(tls);
         esp_tls_conn_destroy(tls);
         float elapsed = (millis() - xfrStart) / 1000.0f;
-        ESP_LOGI(TAG, "S3: uploaded '%s' OK (%u bytes, %.0f KB/s)", name, fileSize,
-                 elapsed > 0 ? fileSize / 1024.0f / elapsed : 0);
+        g_lastUploadKBps = elapsed > 0 ? fileSize / 1024.0f / elapsed : 0;
+        cdc_printf("S3: uploaded '%s' OK (%u bytes, %.0f KB/s)\r\n", name, fileSize, g_lastUploadKBps);
         return true;
     }
 
@@ -1741,7 +1751,7 @@ static bool s3UploadFile(const char* name) {
         totalParts = jsonInt(resp, "\"parts\"");
 
         if (uid.empty() || key.empty() || totalParts == 0) {
-            ESP_LOGE(TAG, "S3: multipart start failed: %.200s", resp.c_str());
+            cdc_printf("S3: multipart start failed: %.200s", resp.c_str());
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
             return false;
         }
@@ -1763,9 +1773,9 @@ static bool s3UploadFile(const char* name) {
             nvs_close(h);
         }
 
-        ESP_LOGI(TAG, "S3: multipart started, %u parts, upload_id=%s", totalParts, uploadId);
+        cdc_printf("S3: multipart started, %u parts, upload_id=%s", totalParts, uploadId);
     } else {
-        ESP_LOGI(TAG, "S3: resuming multipart at part %u/%u", startPart, totalParts);
+        cdc_printf("S3: resuming multipart at part %u/%u", startPart, totalParts);
     }
 
     // Seek file to resume position
@@ -1790,22 +1800,22 @@ static bool s3UploadFile(const char* name) {
         std::string resp = s3ApiGet(query);
         std::string url = jsonStr(resp, "\"url\"");
         if (url.empty()) {
-            ESP_LOGE(TAG, "S3: presign part %u failed: %.200s", partNum, resp.c_str());
+            cdc_printf("S3: presign part %u failed: %.200s", partNum, resp.c_str());
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
             return false;
         }
 
         char s3Host[128];
         if (!parseUrl(url, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
-            ESP_LOGI(TAG, "S3: URL parse failed");
+            cdc_printf("S3: URL parse failed\r\n");
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
             return false;
         }
-        ESP_LOGI(TAG, "S3: part %u URL len=%d path=%d", partNum, (int)url.length(), (int)strlen(s3Path));
+        cdc_printf("S3: part %u URL len=%d path=%d", partNum, (int)url.length(), (int)strlen(s3Path));
 
         esp_tls_t* tls = tls_connect(s3Host);
         if (!tls) {
-            ESP_LOGE(TAG, "S3: TLS connect failed to %s (part %u)", s3Host, partNum);
+            cdc_printf("S3: TLS connect failed to %s (part %u)", s3Host, partNum);
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
             return false;
         }
@@ -1824,7 +1834,7 @@ static bool s3UploadFile(const char* name) {
         }
 
         if (!httpStreamChunk(tls, f, chunkSize)) {
-            ESP_LOGE(TAG, "S3: stream failed at part %u", partNum);
+            cdc_printf("S3: stream failed at part %u", partNum);
             esp_tls_conn_destroy(tls);
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
             return false;
@@ -1835,7 +1845,7 @@ static bool s3UploadFile(const char* name) {
         esp_tls_conn_destroy(tls);
 
         if (!etag[0]) {
-            ESP_LOGE(TAG, "S3: no ETag for part %u, resp(%d): %.300s",
+            cdc_printf("S3: no ETag for part %u, resp(%d): %.300s",
                      partNum, (int)putResp.length(), putResp.c_str());
             s3ClearSession();
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
@@ -1856,7 +1866,7 @@ static bool s3UploadFile(const char* name) {
 
         float elapsed = (millis() - xfrStart) / 1000.0f;
         uint32_t totalSent = offset + chunkSize;
-        ESP_LOGI(TAG, "S3: part %u/%u done (%u/%u bytes, %.0f%%, %.0f KB/s)",
+        cdc_printf("S3: part %u/%u done (%u/%u bytes, %.0f%%, %.0f KB/s)\r\n",
                  partNum, totalParts, totalSent, fileSize,
                  totalSent * 100.0f / fileSize,
                  elapsed > 0 ? totalSent / 1024.0f / elapsed : 0);
@@ -1882,7 +1892,7 @@ static bool s3UploadFile(const char* name) {
     }
 
     if (!s3ApiComplete(uploadId, s3Key, partsJson.c_str())) {
-        ESP_LOGI(TAG, "S3: complete_multipart failed — clearing session");
+        cdc_printf("S3: complete_multipart failed — clearing session");
         s3ClearSession();
         return false;
     }
@@ -1890,9 +1900,9 @@ static bool s3UploadFile(const char* name) {
     s3ClearSession();
 
     float elapsed = (millis() - xfrStart) / 1000.0f;
-    ESP_LOGI(TAG, "S3: uploaded '%s' OK (%u bytes, %u parts, %.0f KB/s)",
-             name, fileSize, totalParts,
-             elapsed > 0 ? fileSize / 1024.0f / elapsed : 0);
+    g_lastUploadKBps = elapsed > 0 ? fileSize / 1024.0f / elapsed : 0;
+    cdc_printf("S3: uploaded '%s' OK (%u bytes, %u parts, %.0f KB/s)\r\n",
+             name, fileSize, totalParts, g_lastUploadKBps);
     return true;
 }
 
@@ -1911,6 +1921,8 @@ static bool isSkipped(const char* n) {
 // ── Upload task ─────────────────────────────────────────────────────────────
 static void uploadTask(void* param) {
     (void)param;
+    // Wait for USB CDC to be ready so speed logs are visible
+    vTaskDelay(pdMS_TO_TICKS(8000));
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
@@ -1941,11 +1953,11 @@ static void uploadTask(void* param) {
             }
             xSemaphoreGive(g_sd_mutex);
 
-            if (!name[0]) { ESP_LOGI(TAG, "Upload: no files in /harvested/"); break; }
+            if (!name[0]) { cdc_printf("Upload: no files in /harvested/\r\n"); break; }
 
             char path[128];
             snprintf(path, sizeof(path), "%s/harvested/%s", SD_MOUNT, name);
-            ESP_LOGI(TAG, "Upload: found %s", path);
+            cdc_printf("Upload: found %s\r\n", path);
 
             // Get file size before upload
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
@@ -1969,13 +1981,13 @@ static void uploadTask(void* param) {
                 vTaskDelay(pdMS_TO_TICKS(60000)); continue;
             }
 
-            ESP_LOGI(TAG, "Uploading: %s (%.1f MB) heap=%lu min=%lu",
+            cdc_printf("Uploading: %s (%.1f MB) heap=%lu min=%lu\r\n",
                      name, fileMb,
                      (unsigned long)esp_get_free_heap_size(),
                      (unsigned long)esp_get_minimum_free_heap_size());
             bool uploaded = s3UploadFile(name);
             if (!uploaded) {
-                ESP_LOGI(TAG, "Upload failed for %s — retrying in 30s", name);
+                cdc_printf("Upload failed for %s — retrying in 30s\r\n", name);
                 vTaskDelay(pdMS_TO_TICKS(30000)); continue;
             }
 
@@ -2210,6 +2222,7 @@ static void processCLI(const char* cmd) {
             g_mbQueued, g_mbUploaded,
             g_sd_ready ? "ok" : "FAIL", g_fatfs_mounted ? "ok" : "FAIL",
             (unsigned long)g_card_sectors);
+        if (g_lastUploadKBps > 0) cdc_printf("CLI: last_upload=%.0f KB/s\r\n", g_lastUploadKBps);
         cdc_printf("CLI: wr_det=%d wr_mb=%.2f host_was=%d last_wr=%lu cool=%lu\r\n",
             g_writeDetected, g_hostWrittenMb, g_hostWasConnected,
             (unsigned long)g_lastWriteMs, (unsigned long)g_harvestCoolMs);
@@ -2255,7 +2268,7 @@ static void processCLI(const char* cmd) {
         sdmmc_card_init(&g_sd_host, g_card);
         // Format and mount
         esp_vfs_fat_mount_config_t mount_cfg = {};
-        mount_cfg.format_if_mount_failed = true;
+        mount_cfg.format_if_mount_failed = false;
         mount_cfg.max_files = 5;
         esp_err_t ret = esp_vfs_fat_sdspi_mount(SD_MOUNT, &g_sd_host,
                                                   &g_slot_config, &mount_cfg, &g_card);
