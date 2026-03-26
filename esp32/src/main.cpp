@@ -312,6 +312,7 @@ static spi_host_device_t g_spi_host = SPI2_HOST;
 // FATFS mount handle
 static const char *SD_MOUNT = "/sdcard";
 static bool g_fatfs_mounted = false;
+static BYTE g_fatfs_pdrv = 0xFF;  // FATFS drive number, persists across mount/unmount
 
 // ── SD/SPI mutex ────────────────────────────────────────────────────────────
 static SemaphoreHandle_t g_sd_mutex = nullptr;
@@ -545,6 +546,8 @@ static bool sd_init() {
     bus_cfg.max_transfer_sz = 8192;
 
     esp_err_t ret = spi_bus_initialize(g_spi_host, &bus_cfg, SPI_DMA_CH_AUTO);
+    // Report SPI init result for debugging
+    int spi_ret = (int)ret;
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
         snprintf(g_sd_error, sizeof(g_sd_error), "SPI: %s", esp_err_to_name(ret));
         return false;
@@ -558,72 +561,63 @@ static bool sd_init() {
     g_slot_config.gpio_cs = (gpio_num_t)PIN_SD_CS;
     g_slot_config.host_id = g_spi_host;
 
-    // Step 1: Init SPI device + probe card (for MSC raw sector access)
-    ret = sdspi_host_init_device(&g_slot_config, &g_sd_host.slot);
-    if (ret != ESP_OK) {
-        snprintf(g_sd_error, sizeof(g_sd_error), "sdspi_dev: %s", esp_err_to_name(ret));
-        return false;
-    }
+    // Try manual init first to diagnose
+    int card_handle = -1;
+    ret = sdspi_host_init_device(&g_slot_config, &card_handle);
+    int dev_ret = (int)ret;
 
-    g_card = (sdmmc_card_t *)malloc(sizeof(sdmmc_card_t));
-    if (!g_card) return false;
-
-    ret = sdmmc_card_init(&g_sd_host, g_card);
-    if (ret != ESP_OK) {
-        snprintf(g_sd_error, sizeof(g_sd_error), "card_init: %s", esp_err_to_name(ret));
-        free(g_card); g_card = nullptr;
-        return false;
-    }
-
-    g_card_sectors = g_card->csd.capacity;
-
-    // Step 2: Mount FATFS using VFS diskio layer
-    // Register the card with FATFS diskio, then mount
-    BYTE pdrv = 0xFF;
-    ff_diskio_get_drive(&pdrv);
-    if (pdrv == 0xFF) {
-        snprintf(g_sd_error, sizeof(g_sd_error), "no_drive");
-    } else {
-        char drv[3] = {(char)('0' + pdrv), ':', 0};
-        ff_diskio_register_sdmmc(pdrv, g_card);
-
-        FATFS *fs = nullptr;
-        ret = esp_vfs_fat_register(SD_MOUNT, drv, 5, &fs);
-        if (ret == ESP_OK) {
-            // With FF_MULTI_PARTITION=1 (ESP-IDF default), VolToPart maps
-            // volume to (physical_drive, partition). Set partition=1 for MBR.
-            { BYTE vtp[2] = {pdrv, 1}; memcpy(const_cast<PARTITION*>(&VolToPart[pdrv]), vtp, 2); }
-            FRESULT fres = f_mount(fs, drv, 1);
-            if (fres == FR_OK) {
-                g_fatfs_mounted = true;
-            } else {
-                // Read the partition table entry to see what FATFS found
-                uint8_t *mbr = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
-                if (mbr) {
-                    sdmmc_read_sectors(g_card, mbr, 0, 1);
-                    uint8_t ptype = mbr[0x1C2];  // partition type of first entry
-                    uint32_t plba = mbr[0x1C6] | (mbr[0x1C7]<<8) | (mbr[0x1C8]<<16) | (mbr[0x1C9]<<24);
-                    snprintf(g_sd_error, sizeof(g_sd_error),
-                             "f_mount:FR=%d ptype=0x%02x plba=%lu SS=%u",
-                             fres, ptype, (unsigned long)plba, FF_MIN_SS);
-                    free(mbr);
-                }
-                esp_vfs_fat_unregister_path(SD_MOUNT);
-            }
-        } else {
-            snprintf(g_sd_error, sizeof(g_sd_error), "vfs_reg: %s", esp_err_to_name(ret));
+    sdmmc_card_t *tmp_card = nullptr;
+    int card_ret = -1;
+    if (ret == ESP_OK) {
+        g_sd_host.slot = card_handle;
+        tmp_card = (sdmmc_card_t *)calloc(1, sizeof(sdmmc_card_t));
+        if (tmp_card) {
+            ret = sdmmc_card_init(&g_sd_host, tmp_card);
+            card_ret = (int)ret;
         }
     }
 
-    ESP_LOGI(TAG, "SD: %lu sectors, fatfs=%s%s%s",
-             (unsigned long)g_card_sectors, g_fatfs_mounted ? "ok" : "FAIL",
-             g_sd_error[0] ? " err=" : "", g_sd_error);
-    return true;  // card works for MSC even if FATFS fails
+    if (dev_ret != 0 || card_ret != 0) {
+        snprintf(g_sd_error, sizeof(g_sd_error), "spi=%d dev=%d card=%d",
+                 spi_ret, dev_ret, card_ret);
+        if (tmp_card) free(tmp_card);
+        return false;
+    }
+
+    // Card works — now clean up and let esp_vfs_fat_sdspi_mount handle FATFS.
+    // We need to remove the SPI device first since sdspi_mount will re-add it.
+    free(tmp_card); tmp_card = nullptr;
+    sdspi_host_remove_device(card_handle);
+
+    esp_vfs_fat_mount_config_t mount_cfg = {};
+    mount_cfg.format_if_mount_failed = false;  // card already formatted
+    mount_cfg.max_files = 5;
+    mount_cfg.allocation_unit_size = 16 * 1024;
+
+    ret = esp_vfs_fat_sdspi_mount(SD_MOUNT, &g_sd_host,
+                                   &g_slot_config, &mount_cfg, &g_card);
+    if (ret == ESP_OK) {
+        g_fatfs_mounted = true;
+        g_card_sectors = g_card->csd.capacity;
+    } else {
+        snprintf(g_sd_error, sizeof(g_sd_error), "mount: %s", esp_err_to_name(ret));
+        // Fall back: re-init for MSC-only
+        sdspi_host_init_device(&g_slot_config, &card_handle);
+        g_sd_host.slot = card_handle;
+        g_card = (sdmmc_card_t *)calloc(1, sizeof(sdmmc_card_t));
+        if (g_card) {
+            sdmmc_card_init(&g_sd_host, g_card);
+            g_card_sectors = g_card->csd.capacity;
+        }
+    }
+
+    ESP_LOGI(TAG, "SD: %lu sectors, fatfs=%s",
+             (unsigned long)g_card_sectors, g_fatfs_mounted ? "ok" : "FAIL");
+    return true;
 }
 
 static bool sd_mount_fatfs() {
     if (g_fatfs_mounted) return true;
-    if (!g_card) return false;
 
     esp_vfs_fat_mount_config_t mount_cfg = {};
     mount_cfg.format_if_mount_failed = false;
@@ -632,10 +626,11 @@ static bool sd_mount_fatfs() {
     esp_err_t ret = esp_vfs_fat_sdspi_mount(SD_MOUNT, &g_sd_host,
                                              &g_slot_config, &mount_cfg, &g_card);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "FATFS mount failed: %s", esp_err_to_name(ret));
+        snprintf(g_sd_error, sizeof(g_sd_error), "remount: %s", esp_err_to_name(ret));
         return false;
     }
     g_fatfs_mounted = true;
+    g_card_sectors = g_card->csd.capacity;
     return true;
 }
 
@@ -647,33 +642,8 @@ static void sd_unmount_fatfs() {
 
 // Re-initialize card + remount FATFS (used by doHarvest after MSC writes)
 static bool sd_reinit_and_mount() {
-    // Unmount FATFS if mounted
-    if (g_fatfs_mounted) {
-        esp_vfs_fat_sdcard_unmount(SD_MOUNT, g_card);
-        g_fatfs_mounted = false;
-    }
-
-    // Re-init the card
-    esp_err_t ret = sdmmc_card_init(&g_sd_host, g_card);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "SD re-init failed: %s", esp_err_to_name(ret));
-        return false;
-    }
-    g_card_sectors = g_card->csd.capacity;
-
-    // Remount FATFS
-    esp_vfs_fat_mount_config_t mount_cfg = {};
-    mount_cfg.format_if_mount_failed = false;
-    mount_cfg.max_files = 5;
-
-    ret = esp_vfs_fat_sdspi_mount(SD_MOUNT, &g_sd_host,
-                                   &g_slot_config, &mount_cfg, &g_card);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "FATFS remount failed: %s", esp_err_to_name(ret));
-        return false;
-    }
-    g_fatfs_mounted = true;
-    return true;
+    sd_unmount_fatfs();
+    return sd_mount_fatfs();
 }
 
 // ── NVS helpers ─────────────────────────────────────────────────────────────
@@ -2240,6 +2210,9 @@ static void processCLI(const char* cmd) {
             g_mbQueued, g_mbUploaded,
             g_sd_ready ? "ok" : "FAIL", g_fatfs_mounted ? "ok" : "FAIL",
             (unsigned long)g_card_sectors);
+        cdc_printf("CLI: wr_det=%d wr_mb=%.2f host_was=%d last_wr=%lu cool=%lu\r\n",
+            g_writeDetected, g_hostWrittenMb, g_hostWasConnected,
+            (unsigned long)g_lastWriteMs, (unsigned long)g_harvestCoolMs);
         if (g_sd_error[0]) cdc_printf("CLI: sd_error=%s\r\n", g_sd_error);
         if (g_harvest_log[0]) { cdc_printf("%s", g_harvest_log); g_harvest_log[0] = 0; }
         nvs_handle_t h;
