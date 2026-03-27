@@ -53,6 +53,15 @@ CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
 # ── Watchdog ─────────────────────────────────────────────────────
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
 
+# ── Cellular modem (PPP over Serial) ────────────────────────────
+CONFIG_LWIP_PPP_SUPPORT=y
+CONFIG_LWIP_PPP_PAP_SUPPORT=y
+CONFIG_LWIP_PPP_NOTIFY_PHASE_SUPPORT=y
+
+# Redirect console from UART0 (GPIO 43/44) to USB Serial JTAG
+# so UART pins are free for SIM7600 modem
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
 # ── Partition table ──────────────────────────────────────────────
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

@@ -1,3 +1,5 @@
 ## IDF Component Manager Manifest File
 ## esp_tinyusb is a local component in components/esp_tinyusb (modified: no tusb_msc_storage.c)
-dependencies: {}
+dependencies:
+  espressif/esp_modem:
+    version: "^1.4.0"
