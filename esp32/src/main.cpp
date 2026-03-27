@@ -46,6 +46,10 @@
 #include "lwip/netdb.h"
 #include "esp_http_server.h"
 #include "dhcpserver/dhcpserver.h"
+#include "driver/uart.h"
+#include "esp_netif.h"
+#include "lwip/netif.h"
+#include "esp_netif_net_stack.h"
 
 static const char *TAG = "airbridge";
 
@@ -61,6 +65,12 @@ static inline uint32_t millis() {
 #define PIN_SD_MOSI  11
 #define PIN_SD_MISO  12
 #define PIN_SD_SCK   13
+
+// ── Modem (SIM7600) pin assignments ──────────────────────────────────────
+#define PIN_MODEM_TX   43
+#define PIN_MODEM_RX   44
+#define PIN_MODEM_RTS   1
+#define PIN_MODEM_CTS   2
 
 // ── Display constants ────────────────────────────────────────────────────────
 #define SCREEN_W   128
@@ -338,6 +348,8 @@ static float    g_mbQueued       = 0.0f;
 static float    g_mbUploaded     = 0.0f;
 static float    g_lastUploadKBps = 0.0f;  // speed of last upload for STATUS display
 static float    g_sdTotalMb      = 0.0f;
+static float    g_sdUsedMb       = 0.0f; // updated periodically for display
+static float    g_uploadingMb    = 0.0f; // live progress of current upload
 static uint32_t g_lastDisplayMs  = 0;
 static uint32_t g_lastHarvestMs  = 0;
 static uint32_t g_harvestCoolMs  = 30000;
@@ -383,6 +395,14 @@ static httpd_handle_t g_httpd = nullptr;
 static int g_dns_sock = -1;
 static TaskHandle_t g_dns_task = nullptr;
 
+// ── Cellular modem (SIM7600) ────────────────────────────────────────────────
+static esp_netif_t      *g_ppp_netif    = nullptr;
+static TaskHandle_t      g_modem_task   = nullptr;
+static volatile bool     g_pppConnected = false;
+static volatile bool     g_modemReady   = false;
+static char              g_modemOp[32]  = "";
+static int               g_modemRssi    = 99;
+
 // ── CDC CLI ─────────────────────────────────────────────────────────────────
 static char g_cli_buf[128];
 static int  g_cli_len = 0;
@@ -409,7 +429,10 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8],
 
 bool tud_msc_test_unit_ready_cb(uint8_t lun) {
     (void)lun;
-    if (g_msc_ejected || g_harvesting || !g_sd_ready) {
+    // Only report not-ready for real eject or SD failure — NOT during harvest.
+    // Reporting not-ready during harvest causes the host to see media removal,
+    // which marks the filesystem dirty and breaks drag-and-drop in file managers.
+    if (g_msc_ejected || !g_sd_ready) {
         tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
         return false;
     }
@@ -433,10 +456,13 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
     return (err == ESP_OK) ? (int32_t)bufsize : -1;
 }
 
+static uint32_t g_msc_write_calls = 0;
+static uint32_t g_msc_write_reject = 0;
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                             uint8_t *buffer, uint32_t bufsize) {
     (void)lun; (void)offset;
-    if (!g_sd_ready || g_harvesting || g_msc_ejected) return -1;
+    g_msc_write_calls++;
+    if (!g_sd_ready || g_harvesting || g_msc_ejected) { g_msc_write_reject++; return -1; }
     if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return -1;
     esp_err_t err = sdmmc_write_sectors(g_card, buffer, lba, bufsize / 512);
     xSemaphoreGive(g_sd_mutex);
@@ -1302,14 +1328,34 @@ static void _fmtSize(char* buf, size_t len, float mb) {
 static void updateDisplay() {
     oled_clear();
 
-    // Row 0: WiFi SSID + signal bars
-    char label[18]; strlcpy(label, g_wifiLabel, sizeof(label));
-    oled_text(0, 0, label);
+    // Row 0: Connection status + signal bars
+    {
+        char label[18];
+        int bars = 0;
+        if (g_pppConnected) {
+            // Cellular: show operator name + CSQ-based bars
+            if (g_modemOp[0]) strlcpy(label, g_modemOp, sizeof(label));
+            else              strlcpy(label, "Cellular", sizeof(label));
+            // CSQ 0-31: 0-9=1bar, 10-14=2, 15-19=3, 20+=4
+            if      (g_modemRssi >= 20) bars = 4;
+            else if (g_modemRssi >= 15) bars = 3;
+            else if (g_modemRssi >= 10) bars = 2;
+            else if (g_modemRssi >   0) bars = 1;
+        } else if (g_netConnected) {
+            strlcpy(label, g_wifiLabel, sizeof(label));
+            bars = g_wifiBars;
+        } else if (g_modemReady) {
+            strlcpy(label, "Connecting...", sizeof(label));
+        } else {
+            strlcpy(label, "No Network", sizeof(label));
+        }
+        oled_text(0, 0, label);
 
-    const int8_t xs[4] = {108,113,118,123}, hs[4] = {2,4,6,8};
-    for (int i = 0; i < 4; i++) {
-        if (i < g_wifiBars) oled_rect(xs[i], 8-hs[i], 3, hs[i], true);
-        else                 oled_rect(xs[i], 8-hs[i], 3, hs[i], false);
+        const int8_t xs[4] = {108,113,118,123}, hs[4] = {2,4,6,8};
+        for (int i = 0; i < 4; i++) {
+            if (i < bars) oled_rect(xs[i], 8-hs[i], 3, hs[i], true);
+            else          oled_rect(xs[i], 8-hs[i], 3, hs[i], false);
+        }
     }
     oled_hline(0, 127, 9);
 
@@ -1321,18 +1367,19 @@ static void updateDisplay() {
     else                                                   { lbl = "USB READY";  lx = 10; }
     oled_text(lx, 12, lbl, 2);
 
-    // Row 36: USB storage bar
-    char sz[12]; _fmtSize(sz, sizeof(sz), g_hostWrittenMb);
+    // Row 36: SD storage bar (used / total)
+    char sz[12]; _fmtSize(sz, sizeof(sz), g_sdUsedMb);
     int sizeW = strlen(sz) * 6;
     int sizeX = 128 - sizeW;
     int barX  = 20;
     int barW  = sizeX - 2 - barX;
-    oled_text(0, 36, "USB");
+    oled_text(0, 36, "SD");
     oled_text(sizeX, 36, sz);
     if (barW > 2) {
         oled_rect(barX, 36, barW, 7, false);
-        if (g_sdTotalMb > 0.0f && g_hostWrittenMb >= 0.001f) {
-            int fill = (int)(g_hostWrittenMb / g_sdTotalMb * (barW - 2));
+        if (g_sdTotalMb > 0.0f && g_sdUsedMb >= 0.001f) {
+            int fill = (int)(g_sdUsedMb / g_sdTotalMb * (barW - 2));
+            if (fill > barW - 2) fill = barW - 2;
             if (fill > 0) oled_rect(barX+1, 37, fill, 5, true);
         }
     }
@@ -1340,8 +1387,10 @@ static void updateDisplay() {
     // Row 50: Upload progress bar
     {
         char upStr[12], remStr[12];
-        strcpy(upStr, "UP"); _fmtSize(upStr + 2, sizeof(upStr) - 2, g_mbUploaded);
-        strcpy(remStr, "R"); _fmtSize(remStr + 1, sizeof(remStr) - 1, g_mbQueued);
+        float uploaded = g_mbUploaded + g_uploadingMb;
+        float remaining = (g_mbQueued > g_uploadingMb) ? g_mbQueued - g_uploadingMb : 0;
+        strcpy(upStr, "UP"); _fmtSize(upStr + 2, sizeof(upStr) - 2, uploaded);
+        strcpy(remStr, "R"); _fmtSize(remStr + 1, sizeof(remStr) - 1, remaining);
         int upW  = strlen(upStr) * 6;
         int remW = strlen(remStr) * 6;
         int remX = 128 - remW;
@@ -1350,9 +1399,9 @@ static void updateDisplay() {
         oled_text(0, 50, upStr);
         if (ubW > 2) {
             oled_rect(ubX, 50, ubW, 7, false);
-            float totalMb = g_mbUploaded + g_mbQueued;
+            float totalMb = uploaded + remaining;
             if (totalMb > 0.001f) {
-                int fill = (int)(g_mbUploaded / totalMb * (ubW - 2));
+                int fill = (int)(uploaded / totalMb * (ubW - 2));
                 if (fill > 0) oled_rect(ubX+1, 51, fill, 5, true);
             }
         }
@@ -1522,6 +1571,7 @@ static bool httpStreamChunk(esp_tls_t* tls, FILE* f, uint32_t len) {
             else return false;
         }
         remaining -= n;
+        g_uploadingMb = (len - remaining) / 1e6f;
     }
     return true;
 }
@@ -1638,7 +1688,7 @@ static bool s3ApiComplete(const char* uploadId, const char* key,
 
 // Upload a file from /sdcard/harvested/<name> to S3 using pre-signed URLs.
 static bool s3UploadFile(const char* name) {
-    if (!g_netConnected) { cdc_printf("S3: no WiFi\r\n"); return false; }
+    if (!g_netConnected && !g_pppConnected) { cdc_printf("S3: no network\r\n"); return false; }
     if (!s3LoadCreds()) return false;
 
     char fpath[128];
@@ -1918,6 +1968,383 @@ static bool isSkipped(const char* n) {
     return false;
 }
 
+// ── Cellular modem task (SIM7600 via raw UART + PPPoS) ──────────────────────
+
+// Send AT command, wait for response, return response string
+static int modem_at_cmd(const char* cmd, char* resp, int resp_size, int timeout_ms) {
+    // Send command
+    uart_write_bytes(UART_NUM_1, cmd, strlen(cmd));
+    uart_write_bytes(UART_NUM_1, "\r", 1);
+
+    // Read response with timeout
+    int total = 0;
+    uint32_t start = millis();
+    while ((millis() - start) < (uint32_t)timeout_ms && total < resp_size - 1) {
+        uint8_t buf[128];
+        int len = uart_read_bytes(UART_NUM_1, buf, sizeof(buf),
+                                  pdMS_TO_TICKS(100));
+        if (len > 0) {
+            int copy = std::min(len, resp_size - 1 - total);
+            memcpy(resp + total, buf, copy);
+            total += copy;
+            // Check if we have a final response
+            resp[total] = '\0';
+            if (strstr(resp, "OK") || strstr(resp, "ERROR") ||
+                strstr(resp, "CONNECT")) {
+                break;
+            }
+        }
+    }
+    resp[total] = '\0';
+    return total;
+}
+
+// PPPoS output callback — sends PPP frames to modem UART
+static uint32_t g_ppp_tx_bytes = 0;
+static uint32_t g_ppp_tx_calls = 0;
+static esp_err_t modem_ppp_transmit(void* h, void* buffer, size_t len) {
+    g_ppp_tx_calls++;
+    g_ppp_tx_bytes += len;
+    int written = uart_write_bytes(UART_NUM_1, buffer, len);
+    return (written == (int)len) ? ESP_OK : ESP_FAIL;
+}
+
+// PPP netif driver glue
+static esp_err_t modem_post_attach(esp_netif_t* netif, esp_netif_iodriver_handle driver) {
+    // Set the driver transmit function
+    const esp_netif_driver_ifconfig_t driver_cfg = {
+        .handle = driver,
+        .transmit = modem_ppp_transmit,
+    };
+    return esp_netif_set_driver_config(netif, &driver_cfg);
+}
+
+static void modem_ip_event_handler(void* arg, esp_event_base_t event_base,
+                                    int32_t event_id, void* event_data) {
+    if (event_id == IP_EVENT_PPP_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
+        cdc_printf("Modem: PPP IP=" IPSTR "\r\n", IP2STR(&event->ip_info.ip));
+        g_pppConnected = true;
+    } else if (event_id == IP_EVENT_PPP_LOST_IP) {
+        cdc_printf("Modem: PPP lost IP\r\n");
+        g_pppConnected = false;
+    }
+}
+
+static void modemTask(void* param) {
+    (void)param;
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    // ── Init UART ────────────────────────────────────────────────────────
+    cdc_printf("Modem: init UART1 TX=%d RX=%d...\r\n", PIN_MODEM_TX, PIN_MODEM_RX);
+    uart_config_t uart_cfg = {};
+    uart_cfg.baud_rate  = 115200;
+    uart_cfg.data_bits  = UART_DATA_8_BITS;
+    uart_cfg.parity     = UART_PARITY_DISABLE;
+    uart_cfg.stop_bits  = UART_STOP_BITS_1;
+    uart_cfg.flow_ctrl  = UART_HW_FLOWCTRL_DISABLE;
+    uart_cfg.source_clk = UART_SCLK_DEFAULT;
+
+    uart_driver_delete(UART_NUM_1);  // clean up any prior install
+    esp_err_t err = uart_driver_install(UART_NUM_1, 4096, 0, 0, nullptr, 0);
+    if (err != ESP_OK) {
+        cdc_printf("Modem: uart_driver_install failed: %s\r\n", esp_err_to_name(err));
+        g_modem_task = nullptr;
+        vTaskDelete(nullptr);
+        return;
+    }
+    uart_param_config(UART_NUM_1, &uart_cfg);
+    uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+    // ── Wait for modem boot + sync ───────────────────────────────────────
+    cdc_printf("Modem: waiting for SIM7600 boot...\r\n");
+
+    // Drain any boot messages for up to 15s, look for RDY
+    bool ready = false;
+    uint32_t t0 = millis();
+    while (millis() - t0 < 15000) {
+        char buf[256];
+        int len = uart_read_bytes(UART_NUM_1, (uint8_t*)buf, sizeof(buf) - 1,
+                                  pdMS_TO_TICKS(500));
+        if (len > 0) {
+            buf[len] = '\0';
+            cdc_printf("Modem: boot> %s", buf);
+            if (strstr(buf, "SMS DONE") || strstr(buf, "PB DONE")) {
+                ready = true;
+                break;
+            }
+        }
+    }
+
+    // Flush + sync with AT
+    uart_flush(UART_NUM_1);
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    char resp[512];
+    for (int i = 0; i < 5; i++) {
+        int len = modem_at_cmd("AT", resp, sizeof(resp), 2000);
+        if (len > 0 && strstr(resp, "OK")) {
+            cdc_printf("Modem: AT sync OK\r\n");
+            ready = true;
+            break;
+        }
+        cdc_printf("Modem: AT sync attempt %d: [%s]\r\n", i + 1, resp);
+    }
+
+    if (!ready) {
+        cdc_printf("Modem: AT sync failed, task exiting\r\n");
+        uart_driver_delete(UART_NUM_1);
+        g_modem_task = nullptr;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    g_modemReady = true;
+
+    // ── Disable echo ─────────────────────────────────────────────────────
+    modem_at_cmd("ATE0", resp, sizeof(resp), 1000);
+
+    // ── Increase baud rate ──────────────────────────────────────────────
+    {
+        // Try baud rates from highest to lowest (no flow control first)
+        const int bauds[] = { 3000000, 2000000, 1500000, 921600, 460800 };
+        bool upgraded = false;
+        for (int i = 0; i < 5 && !upgraded; i++) {
+            cdc_printf("Modem: trying %d baud...\r\n", bauds[i]);
+            char cmd[32];
+            snprintf(cmd, sizeof(cmd), "AT+IPR=%d", bauds[i]);
+            modem_at_cmd(cmd, resp, sizeof(resp), 2000);
+            // Modem responds OK at old baud, THEN switches
+
+            vTaskDelay(pdMS_TO_TICKS(200));
+            uart_set_baudrate(UART_NUM_1, bauds[i]);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            uart_flush(UART_NUM_1);
+
+            // Verify at new baud (multiple attempts)
+            bool ok = false;
+            for (int j = 0; j < 5; j++) {
+                int len = modem_at_cmd("AT", resp, sizeof(resp), 1000);
+                if (len > 0 && strstr(resp, "OK")) {
+                    ok = true;
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+
+            if (ok) {
+                cdc_printf("Modem: baud upgraded to %d\r\n", bauds[i]);
+                upgraded = true;
+
+                // Now try enabling HW flow control at the new baud
+                modem_at_cmd("AT+IFC=2,2", resp, sizeof(resp), 2000);
+                if (strstr(resp, "OK")) {
+                    uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
+                                 PIN_MODEM_RTS, PIN_MODEM_CTS);
+                    uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_CTS_RTS, 122);
+                    vTaskDelay(pdMS_TO_TICKS(100));
+
+                    // Verify flow control works
+                    int len = modem_at_cmd("AT", resp, sizeof(resp), 2000);
+                    if (len > 0 && strstr(resp, "OK")) {
+                        cdc_printf("Modem: HW flow control enabled\r\n");
+                    } else {
+                        // Flow control broke things — disable it
+                        cdc_printf("Modem: HW flow control failed, disabling\r\n");
+                        uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_DISABLE, 0);
+                        uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
+                                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+                        modem_at_cmd("AT+IFC=0,0", resp, sizeof(resp), 2000);
+                    }
+                }
+            } else {
+                // Failed — modem is at new baud but ESP can't talk to it
+                // Try to reset modem baud: send AT+IPR=115200 at the failed baud
+                cdc_printf("Modem: %d failed, resetting...\r\n", bauds[i]);
+                modem_at_cmd("AT+IPR=115200", resp, sizeof(resp), 2000);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                uart_set_baudrate(UART_NUM_1, 115200);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                uart_flush(UART_NUM_1);
+                // Verify recovery
+                modem_at_cmd("AT", resp, sizeof(resp), 2000);
+            }
+        }
+        if (!upgraded) {
+            cdc_printf("Modem: staying at 115200\r\n");
+        }
+    }
+
+    // ── Read modem info ──────────────────────────────────────────────────
+    if (modem_at_cmd("AT+CIMI", resp, sizeof(resp), 2000) > 0) {
+        cdc_printf("Modem: IMSI: %s", resp);
+    }
+
+    if (modem_at_cmd("AT+COPS?", resp, sizeof(resp), 5000) > 0) {
+        // Parse operator name from +COPS: 0,0,"OperatorName",7
+        char* q1 = strchr(resp, '"');
+        if (q1) {
+            char* q2 = strchr(q1 + 1, '"');
+            if (q2) {
+                int olen = std::min((int)(q2 - q1 - 1), (int)sizeof(g_modemOp) - 1);
+                memcpy(g_modemOp, q1 + 1, olen);
+                g_modemOp[olen] = '\0';
+            }
+        }
+        cdc_printf("Modem: Operator=%s\r\n", g_modemOp);
+    }
+
+    if (modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000) > 0) {
+        // Parse +CSQ: rssi,ber
+        char* p = strstr(resp, "+CSQ:");
+        if (p) {
+            int rssi = 99, ber = 99;
+            sscanf(p, "+CSQ: %d,%d", &rssi, &ber);
+            g_modemRssi = rssi;
+            cdc_printf("Modem: RSSI=%d BER=%d\r\n", rssi, ber);
+        }
+    }
+
+    // ── Check registration ───────────────────────────────────────────────
+    if (modem_at_cmd("AT+CREG?", resp, sizeof(resp), 2000) > 0) {
+        cdc_printf("Modem: REG: %s", resp);
+    }
+
+    // ── Set APN ──────────────────────────────────────────────────────────
+    modem_at_cmd("AT+CGDCONT=1,\"IP\",\"hologram\"", resp, sizeof(resp), 5000);
+    cdc_printf("Modem: APN set: %s", resp);
+
+    // ── Dial PPP ─────────────────────────────────────────────────────────
+    cdc_printf("Modem: dialing PPP (ATD*99#)...\r\n");
+    uart_write_bytes(UART_NUM_1, "ATD*99#\r", 8);
+
+    // Wait for CONNECT
+    bool connected = false;
+    t0 = millis();
+    char connbuf[256] = "";
+    int connlen = 0;
+    while (millis() - t0 < 30000) {
+        int len = uart_read_bytes(UART_NUM_1, (uint8_t*)connbuf + connlen,
+                                  sizeof(connbuf) - 1 - connlen, pdMS_TO_TICKS(500));
+        if (len > 0) {
+            connlen += len;
+            connbuf[connlen] = '\0';
+            if (strstr(connbuf, "CONNECT")) {
+                connected = true;
+                cdc_printf("Modem: CONNECT received!\r\n");
+                break;
+            }
+            if (strstr(connbuf, "ERROR") || strstr(connbuf, "NO CARRIER")) {
+                cdc_printf("Modem: dial failed: %s\r\n", connbuf);
+                break;
+            }
+        }
+    }
+
+    if (!connected) {
+        cdc_printf("Modem: PPP dial failed, task exiting\r\n");
+        uart_driver_delete(UART_NUM_1);
+        g_modem_task = nullptr;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    // ── Create PPP netif and start PPPoS ─────────────────────────────────
+    esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_GOT_IP,
+                               modem_ip_event_handler, nullptr);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_LOST_IP,
+                               modem_ip_event_handler, nullptr);
+
+    // Create a simple driver handle (just needs to be non-null)
+    static int driver_handle;
+    esp_netif_driver_ifconfig_t driver_cfg = {};
+    driver_cfg.handle = &driver_handle;
+    driver_cfg.transmit = modem_ppp_transmit;
+
+    const esp_netif_driver_base_t driver_base = {
+        .post_attach = modem_post_attach,
+    };
+
+    esp_netif_config_t netif_ppp_config = ESP_NETIF_DEFAULT_PPP();
+    g_ppp_netif = esp_netif_new(&netif_ppp_config);
+    if (!g_ppp_netif) {
+        cdc_printf("Modem: failed to create PPP netif\r\n");
+        uart_driver_delete(UART_NUM_1);
+        g_modem_task = nullptr;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    // Attach driver to netif
+    esp_netif_attach(g_ppp_netif, (esp_netif_iodriver_handle)&driver_base);
+
+    // Start PPP
+    esp_netif_action_start(g_ppp_netif, nullptr, 0, nullptr);
+    esp_netif_action_connected(g_ppp_netif, nullptr, 0, nullptr);
+
+    cdc_printf("Modem: PPPoS started, feeding UART data...\r\n");
+
+    // ── PPP data pump: UART ↔ PPPoS ──────────────────────────────────────
+    // This loop MUST run continuously — all TCP/IP over cellular depends on it.
+    // Any blocking call (connect, send, recv) must happen in a DIFFERENT task.
+    bool test_launched = false;
+    while (true) {
+        uint8_t buf[1024];
+        int len = uart_read_bytes(UART_NUM_1, buf, sizeof(buf), pdMS_TO_TICKS(20));
+        if (len > 0) {
+            esp_netif_receive(g_ppp_netif, buf, len, nullptr);
+        }
+
+        // Once PPP is up, set as default route for all outgoing traffic
+        if (g_pppConnected && !test_launched) {
+            test_launched = true;
+
+            esp_netif_ip_info_t ip_info;
+            if (esp_netif_get_ip_info(g_ppp_netif, &ip_info) == ESP_OK) {
+                cdc_printf("Modem: PPP ip=" IPSTR " gw=" IPSTR "\r\n",
+                    IP2STR(&ip_info.ip), IP2STR(&ip_info.gw));
+            }
+
+            struct netif* ppp_lwip_netif = (struct netif*)esp_netif_get_netif_impl(g_ppp_netif);
+            if (ppp_lwip_netif) netif_set_default(ppp_lwip_netif);
+            esp_netif_set_default_netif(g_ppp_netif);
+            cdc_printf("Modem: cellular ready — set as default route\r\n");
+        }
+
+        // ── Periodic RSSI refresh: escape PPP → AT+CSQ → resume PPP ─────
+        // ONLY when idle (no queued uploads) — the +++ escape pauses PPP ~3s
+        static uint32_t lastCsqMs = 0;
+        if (g_pppConnected && g_filesQueued == 0 && (millis() - lastCsqMs) > 15000) {
+            lastCsqMs = millis();
+
+            // Send +++ with 1s guard time to enter command mode
+            vTaskDelay(pdMS_TO_TICKS(1100));
+            uart_write_bytes(UART_NUM_1, "+++", 3);
+            vTaskDelay(pdMS_TO_TICKS(1100));
+
+            // Drain response (should be "OK")
+            char csqResp[128];
+            uart_read_bytes(UART_NUM_1, (uint8_t*)csqResp,
+                            sizeof(csqResp) - 1, pdMS_TO_TICKS(500));
+
+            // Query signal quality
+            int len = modem_at_cmd("AT+CSQ", csqResp, sizeof(csqResp), 2000);
+            if (len > 0) {
+                char* p = strstr(csqResp, "+CSQ:");
+                if (p) {
+                    int rssi = 99, ber = 99;
+                    sscanf(p, "+CSQ: %d,%d", &rssi, &ber);
+                    g_modemRssi = rssi;
+                }
+            }
+
+            // Return to data mode
+            modem_at_cmd("ATO", csqResp, sizeof(csqResp), 2000);
+        }
+    }
+}
+
 // ── Upload task ─────────────────────────────────────────────────────────────
 static void uploadTask(void* param) {
     (void)param;
@@ -1968,16 +2395,16 @@ static void uploadTask(void* param) {
             }
             xSemaphoreGive(g_sd_mutex);
 
-            // Wait for WiFi
+            // Wait for network (WiFi or cellular)
             {
                 uint32_t waited = 0;
-                while (!g_netConnected && waited < 90000) {
-                    if (waited == 0) ESP_LOGI(TAG, "Upload: waiting for WiFi...");
+                while (!g_netConnected && !g_pppConnected && waited < 90000) {
+                    if (waited == 0) ESP_LOGI(TAG, "Upload: waiting for network...");
                     vTaskDelay(pdMS_TO_TICKS(2000)); waited += 2000;
                 }
             }
-            if (!g_netConnected) {
-                ESP_LOGI(TAG, "Upload: no WiFi after 90s — will retry in 60s");
+            if (!g_netConnected && !g_pppConnected) {
+                ESP_LOGI(TAG, "Upload: no network after 90s — will retry in 60s");
                 vTaskDelay(pdMS_TO_TICKS(60000)); continue;
             }
 
@@ -1985,7 +2412,9 @@ static void uploadTask(void* param) {
                      name, fileMb,
                      (unsigned long)esp_get_free_heap_size(),
                      (unsigned long)esp_get_minimum_free_heap_size());
+            g_uploadingMb = 0.0f;
             bool uploaded = s3UploadFile(name);
+            g_uploadingMb = 0.0f;
             if (!uploaded) {
                 cdc_printf("Upload failed for %s — retrying in 30s\r\n", name);
                 vTaskDelay(pdMS_TO_TICKS(30000)); continue;
@@ -2012,8 +2441,9 @@ static void uploadTask(void* param) {
 static void doHarvest() {
     ESP_LOGI(TAG, "doHarvest: start");
     g_harvesting = true;
-    g_msc_ejected = true;  // tell host the drive was ejected
-    ESP_LOGI(TAG, "doHarvest: media ejected");
+    // Don't set g_msc_ejected — that triggers host "media removed" which
+    // marks filesystem dirty and breaks file manager drag-and-drop.
+    // g_harvesting already blocks MSC read/write callbacks.
     vTaskDelay(pdMS_TO_TICKS(500));
     updateDisplay();
 
@@ -2161,6 +2591,18 @@ static void doHarvest() {
 
     g_filesQueued += count;
     if (count > 0) g_mbQueued += usedMb;
+
+    // Update SD used space while we have exclusive access
+    {
+        FATFS* fs;
+        DWORD freeClusters;
+        if (f_getfree("0:", &freeClusters, &fs) == FR_OK) {
+            DWORD totalSectors = (fs->n_fatent - 2) * fs->csize;
+            DWORD freeSectors  = freeClusters * fs->csize;
+            g_sdUsedMb = (totalSectors - freeSectors) * 512.0f / 1e6f;
+        }
+    }
+
     cdc_printf("doHarvest: done %u file(s) (%.1f MB)\r\n", count, usedMb);
 
     g_writeDetected = false; g_lastWriteMs = 0;
@@ -2170,7 +2612,7 @@ static void doHarvest() {
     g_harvesting = false;
     g_msc_ejected = false;
     g_lastHarvestMs = millis();
-    g_harvestCoolMs = (count > 0) ? QUIET_WINDOW_MS : 300000UL;
+    g_harvestCoolMs = QUIET_WINDOW_MS;
     ESP_LOGI(TAG, "doHarvest: media re-inserted (%u files, cooldown %us)",
              count, g_harvestCoolMs / 1000);
 
@@ -2230,6 +2672,9 @@ static void processCLI(const char* cmd) {
         cdc_printf("CLI: wr_det=%d wr_mb=%.2f host_was=%d last_wr=%lu cool=%lu\r\n",
             g_writeDetected, g_hostWrittenMb, g_hostWasConnected,
             (unsigned long)g_lastWriteMs, (unsigned long)g_harvestCoolMs);
+        cdc_printf("CLI: msc_wr=%lu msc_rej=%lu ejected=%d harvesting=%d\r\n",
+            (unsigned long)g_msc_write_calls, (unsigned long)g_msc_write_reject,
+            g_msc_ejected, g_harvesting);
         if (g_sd_error[0]) cdc_printf("CLI: sd_error=%s\r\n", g_sd_error);
         if (g_harvest_log[0]) { cdc_printf("%s", g_harvest_log); g_harvest_log[0] = 0; }
         nvs_handle_t h;
@@ -2294,9 +2739,84 @@ static void processCLI(const char* cmd) {
         vTaskDelay(pdMS_TO_TICKS(200));
         esp_restart();
 
+    } else if (strcmp(cmd, "MODEM") == 0) {
+        cdc_printf("CLI: modem=%s ppp=%s rssi=%d op=%s\r\n",
+            g_modemReady ? "ready" : "none",
+            g_pppConnected ? "connected" : "disconnected",
+            g_modemRssi, g_modemOp);
+
+    } else if (strcmp(cmd, "MODEM_START") == 0) {
+        if (!g_modem_task) {
+            xTaskCreatePinnedToCore(modemTask, "modem", 8192, nullptr, 1,
+                                    &g_modem_task, 1);
+            cdc_printf("CLI: modem task started\r\n");
+        } else {
+            cdc_printf("CLI: modem task already running\r\n");
+        }
+
+    } else if (strcmp(cmd, "CELLTEST") == 0) {
+        if (!g_pppConnected) {
+            cdc_printf("CLI: PPP not connected — run MODEM_START first\r\n");
+        } else if (!s3LoadCreds()) {
+            cdc_printf("CLI: no S3 credentials — run SETS3 first\r\n");
+        } else {
+            cdc_printf("CLI: launching 10 MB cellular upload speed test...\r\n");
+            xTaskCreatePinnedToCore([](void*) {
+                const uint32_t TEST_SIZE = 10UL * 1024 * 1024;
+                const char* testName = "celltest_10mb.bin";
+
+                // Create 10 MB test file on SD
+                cdc_printf("CellTest: creating %lu byte test file...\r\n", (unsigned long)TEST_SIZE);
+                char filepath[80];
+                snprintf(filepath, sizeof(filepath), "%s/harvested/%s", SD_MOUNT, testName);
+
+                xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                FILE* f = fopen(filepath, "wb");
+                if (f) {
+                    static uint8_t block[4096];
+                    memset(block, 0xAA, sizeof(block));
+                    uint32_t remaining = TEST_SIZE;
+                    while (remaining > 0) {
+                        uint32_t toWrite = (remaining < sizeof(block)) ? remaining : sizeof(block);
+                        fwrite(block, 1, toWrite, f);
+                        remaining -= toWrite;
+                    }
+                    fclose(f);
+                }
+                xSemaphoreGive(g_sd_mutex);
+
+                if (!f) {
+                    cdc_printf("CellTest: failed to create test file\r\n");
+                    vTaskDelete(nullptr); return;
+                }
+
+                // Upload using existing S3 multipart infrastructure
+                uint32_t startMs = millis();
+                bool ok = s3UploadFile(testName);
+                uint32_t elapsed = millis() - startMs;
+                float kbps = (elapsed > 0) ? (TEST_SIZE / 1024.0f) / (elapsed / 1000.0f) : 0;
+
+                if (ok) {
+                    cdc_printf("CellTest: SUCCESS! %lu bytes in %.1fs = %.1f KB/s\r\n",
+                        (unsigned long)TEST_SIZE, elapsed / 1000.0f, kbps);
+                } else {
+                    cdc_printf("CellTest: FAILED after %.1fs\r\n", elapsed / 1000.0f);
+                }
+
+                // Clean up test file and marker
+                remove(filepath);
+                char marker[96];
+                snprintf(marker, sizeof(marker), "%s/harvested/.done__%s", SD_MOUNT, testName);
+                remove(marker);
+
+                s3ClearSession();
+                vTaskDelete(nullptr);
+            }, "celltest", 16384, nullptr, 3, nullptr, 1);
+        }
+
     } else {
         cdc_printf("CLI: unknown: '%s'\r\n", cmd);
-        cdc_printf("CLI: commands: SETWIFI SETS3 STATUS UPLOAD FORMAT REBOOT\r\n");
+        cdc_printf("CLI: commands: SETWIFI SETS3 STATUS UPLOAD FORMAT REBOOT MODEM MODEM_START CELLTEST\r\n");
     }
 }
 
@@ -2314,15 +2834,29 @@ static void main_loop_task(void* param) {
         uint32_t now = millis();
         if (g_sd_ready && now - g_lastDisplayMs >= DISPLAY_INTERVAL_MS) {
             g_lastDisplayMs = now;
+            // Update SD used space (only when MSC is ejected to avoid SPI conflict)
+            if (g_fatfs_mounted && g_msc_ejected &&
+                xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                FATFS* fs;
+                DWORD freeClusters;
+                if (f_getfree("0:", &freeClusters, &fs) == FR_OK) {
+                    DWORD totalSectors = (fs->n_fatent - 2) * fs->csize;
+                    DWORD freeSectors  = freeClusters * fs->csize;
+                    g_sdUsedMb = (totalSectors - freeSectors) * 512.0f / 1e6f;
+                }
+                xSemaphoreGive(g_sd_mutex);
+            }
             updateDisplay();
         }
 
+        // Snapshot volatile write timestamp to avoid race with MSC callback
+        uint32_t lastWr = g_lastWriteMs;
         if (!g_harvesting && g_writeDetected && g_hostWasConnected &&
-            g_lastWriteMs != 0 && (now - g_lastWriteMs) >= QUIET_WINDOW_MS &&
+            lastWr != 0 && now >= lastWr && (now - lastWr) >= QUIET_WINDOW_MS &&
             (now - g_lastHarvestMs) >= g_harvestCoolMs &&
             g_hostWrittenMb > 0.01f) {
-            ESP_LOGI(TAG, "Harvest trigger: %.1f KB written, %us idle",
-                     g_hostWrittenMb * 1024.0f, (now - g_lastWriteMs) / 1000);
+            cdc_printf("Harvest: %.1f KB written, %us idle\r\n",
+                     g_hostWrittenMb * 1024.0f, (now - lastWr) / 1000);
             if (g_harvest_task) xTaskNotifyGive(g_harvest_task);
         }
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -2470,6 +3004,7 @@ extern "C" void app_main(void) {
     xTaskCreatePinnedToCore(uploadTask,    "upload",    16384, nullptr, 1, &g_upload_task,  1);
     xTaskCreatePinnedToCore(harvestTask,   "harvest",   16384, nullptr, 1, &g_harvest_task, 1);
     xTaskCreatePinnedToCore(wifiTask,      "wifi",       8192, nullptr, 1, &g_wifi_task,    1);
+    xTaskCreatePinnedToCore(modemTask,     "modem",      8192, nullptr, 1, &g_modem_task,   1);
     xTaskCreatePinnedToCore(main_loop_task, "main_loop", 4096, nullptr, 1, nullptr,         0);
 
     // ── Scan /harvested/ for leftover files from before last reboot ─────
