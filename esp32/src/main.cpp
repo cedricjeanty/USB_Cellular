@@ -1585,6 +1585,21 @@ static void s3ClearSession() {
     }
 }
 
+// URL-encode a string for use in query parameters.
+static std::string urlEncode(const char* s) {
+    std::string out;
+    for (; *s; s++) {
+        if (isalnum((unsigned char)*s) || *s == '-' || *s == '_' || *s == '.' || *s == '~') {
+            out += *s;
+        } else {
+            char hex[4];
+            snprintf(hex, sizeof(hex), "%%%02X", (unsigned char)*s);
+            out += hex;
+        }
+    }
+    return out;
+}
+
 // Extract a JSON string value for a given key (no JSON library dependency).
 static std::string jsonStr(const std::string& json, const char* key) {
     size_t pos = json.find(key);
@@ -1713,8 +1728,9 @@ static bool s3UploadFile(const char* name) {
 
     // ── Small file: single pre-signed PUT ────────────────────────────────
     if (fileSize <= S3_CHUNK_SIZE) {
-        char query[256];
-        snprintf(query, sizeof(query), "file=%s&size=%u&device=%s", name, fileSize, g_deviceId);
+        std::string enc = urlEncode(name);
+        char query[512];
+        snprintf(query, sizeof(query), "file=%s&size=%u&device=%s", enc.c_str(), fileSize, g_deviceId);
         std::string resp = s3ApiGet(query);
         std::string url = jsonStr(resp, "\"url\"");
         if (url.empty()) {
@@ -1792,8 +1808,9 @@ static bool s3UploadFile(const char* name) {
 
     // Start new multipart upload if no session
     if (!uploadId[0]) {
-        char query[256];
-        snprintf(query, sizeof(query), "file=%s&size=%u&device=%s", name, fileSize, g_deviceId);
+        std::string enc = urlEncode(name);
+        char query[512];
+        snprintf(query, sizeof(query), "file=%s&size=%u&device=%s", enc.c_str(), fileSize, g_deviceId);
         std::string resp = s3ApiGet(query);
 
         std::string uid = jsonStr(resp, "\"upload_id\"");
@@ -1844,9 +1861,10 @@ static bool s3UploadFile(const char* name) {
         uint32_t chunkSize = fileSize - offset;
         if (chunkSize > S3_CHUNK_SIZE) chunkSize = S3_CHUNK_SIZE;
 
-        char query[512];
+        std::string encKey = urlEncode(s3Key);
+        char query[1024];
         snprintf(query, sizeof(query), "upload_id=%s&key=%s&part=%u",
-                 uploadId, s3Key, partNum);
+                 uploadId, encKey.c_str(), partNum);
         std::string resp = s3ApiGet(query);
         std::string url = jsonStr(resp, "\"url\"");
         if (url.empty()) {
@@ -2961,6 +2979,17 @@ extern "C" void app_main(void) {
     }
 
     g_sdTotalMb = g_card_sectors * 512.0f / 1e6f;
+
+    // Initialize SD used space for display
+    if (g_fatfs_mounted) {
+        FATFS* fs;
+        DWORD freeClusters;
+        if (f_getfree("0:", &freeClusters, &fs) == FR_OK) {
+            DWORD totalSectors = (fs->n_fatent - 2) * fs->csize;
+            DWORD freeSectors  = freeClusters * fs->csize;
+            g_sdUsedMb = (totalSectors - freeSectors) * 512.0f / 1e6f;
+        }
+    }
 
     // FATFS already mounted by sd_init() — no separate mount needed
 
