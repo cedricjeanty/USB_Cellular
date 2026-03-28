@@ -350,6 +350,8 @@ static float    g_lastUploadKBps = 0.0f;  // speed of last upload for STATUS dis
 static float    g_sdTotalMb      = 0.0f;
 static float    g_sdUsedMb       = 0.0f; // updated periodically for display
 static float    g_uploadingMb    = 0.0f; // live progress of current upload
+static float    g_usbWriteKBps   = 0.0f; // live USB write speed for display
+static float    g_uploadKBps     = 0.0f; // live upload speed for display
 static uint32_t g_lastDisplayMs  = 0;
 static uint32_t g_lastHarvestMs  = 0;
 static uint32_t g_harvestCoolMs  = 30000;
@@ -1359,53 +1361,79 @@ static void updateDisplay() {
     }
     oled_hline(0, 127, 9);
 
-    // Row 12: Status label (big text)
-    const char* lbl; int lx;
-    if (g_harvesting)                                      { lbl = "HARVEST";    lx = 22; }
-    else if (g_lastIoMs && millis() - g_lastIoMs < 2000)   { lbl = "USB ACTIVE"; lx =  4; }
-    else if (g_writeDetected)                              { lbl = "USB  IDLE";  lx = 10; }
-    else                                                   { lbl = "USB READY";  lx = 10; }
-    oled_text(lx, 12, lbl, 2);
+    // ── Split Gauges: USB IN │ UPLOAD ──────────────────────────────────
+    float uploaded  = g_mbUploaded + g_uploadingMb;
+    float remaining = (g_mbQueued > g_uploadingMb) ? g_mbQueued - g_uploadingMb : 0;
+    float usbSessionMb = g_hostWrittenMb;  // USB bytes received this session
 
-    // Row 36: SD storage bar (used / total)
-    char sz[12]; _fmtSize(sz, sizeof(sz), g_sdUsedMb);
-    int sizeW = strlen(sz) * 6;
-    int sizeX = 128 - sizeW;
-    int barX  = 20;
-    int barW  = sizeX - 2 - barX;
-    oled_text(0, 36, "SD");
-    oled_text(sizeX, 36, sz);
-    if (barW > 2) {
-        oled_rect(barX, 36, barW, 7, false);
-        if (g_sdTotalMb > 0.0f && g_sdUsedMb >= 0.001f) {
-            int fill = (int)(g_sdUsedMb / g_sdTotalMb * (barW - 2));
-            if (fill > barW - 2) fill = barW - 2;
-            if (fill > 0) oled_rect(barX+1, 37, fill, 5, true);
+    // Row 11: labels
+    // "USB IN" = 6 chars * 6px = 36px, centered in 0-62: (62-36)/2 = 13
+    oled_text(13, 11, "USB IN");
+    // "UPLOAD" = 6 chars * 6px = 36px, centered in 65-127: 65 + (62-36)/2 = 78
+    oled_text(78, 11, "UPLOAD");
+    // Vertical divider
+    for (int y = 11; y < 37; y += 2) oled_rect(63, y, 1, 1, true);
+
+    // Row 20: speeds (centered in each half)
+    {
+        char usbSpd[12], upSpd[12];
+        if (g_usbWriteKBps > 0.5f)
+            snprintf(usbSpd, sizeof(usbSpd), "%dKB/s", (int)g_usbWriteKBps);
+        else
+            strlcpy(usbSpd, "0KB/s", sizeof(usbSpd));
+
+        if (g_uploadKBps > 0.5f)
+            snprintf(upSpd, sizeof(upSpd), "%dKB/s", (int)g_uploadKBps);
+        else
+            strlcpy(upSpd, "0KB/s", sizeof(upSpd));
+
+        int usbW = strlen(usbSpd) * 6;
+        int upW  = strlen(upSpd) * 6;
+        oled_text((62 - usbW) / 2, 20, usbSpd);
+        oled_text(65 + (62 - upW) / 2, 20, upSpd);
+    }
+
+    // Row 29: totals (centered in each half)
+    {
+        char usbTot[12], upTot[12];
+        _fmtSize(usbTot, sizeof(usbTot), usbSessionMb);
+        _fmtSize(upTot, sizeof(upTot), uploaded);
+        int usbW = strlen(usbTot) * 6;
+        int upW  = strlen(upTot) * 6;
+        oled_text((62 - usbW) / 2, 29, usbTot);
+        oled_text(65 + (62 - upW) / 2, 29, upTot);
+    }
+
+    // Row 38: divider
+    oled_hline(0, 127, 38);
+
+    // Row 41: progress bar (upload progress)
+    {
+        float totalMb = uploaded + remaining;
+        oled_rect(0, 41, 128, 9, false);
+        if (totalMb > 0.001f) {
+            int fill = (int)(uploaded / totalMb * 126);
+            if (fill > 126) fill = 126;
+            if (fill > 0) oled_rect(1, 42, fill, 7, true);
         }
     }
 
-    // Row 50: Upload progress bar
+    // Row 52: remaining + ETA
     {
-        char upStr[12], remStr[12];
-        float uploaded = g_mbUploaded + g_uploadingMb;
-        float remaining = (g_mbQueued > g_uploadingMb) ? g_mbQueued - g_uploadingMb : 0;
-        strcpy(upStr, "UP"); _fmtSize(upStr + 2, sizeof(upStr) - 2, uploaded);
-        strcpy(remStr, "R"); _fmtSize(remStr + 1, sizeof(remStr) - 1, remaining);
-        int upW  = strlen(upStr) * 6;
-        int remW = strlen(remStr) * 6;
-        int remX = 128 - remW;
-        int ubX  = upW + 2;
-        int ubW  = remX - 2 - ubX;
-        oled_text(0, 50, upStr);
-        if (ubW > 2) {
-            oled_rect(ubX, 50, ubW, 7, false);
-            float totalMb = uploaded + remaining;
-            if (totalMb > 0.001f) {
-                int fill = (int)(uploaded / totalMb * (ubW - 2));
-                if (fill > 0) oled_rect(ubX+1, 51, fill, 5, true);
-            }
+        char remStr[14], etaStr[14];
+        snprintf(remStr, sizeof(remStr), "REM:"); _fmtSize(remStr + 4, sizeof(remStr) - 4, remaining);
+        oled_text(0, 52, remStr);
+
+        if (g_uploadKBps > 0.5f && remaining > 0.001f) {
+            int etaSec = (int)(remaining * 1024.0f / g_uploadKBps);
+            int mm = etaSec / 60, ss = etaSec % 60;
+            if (mm > 99) snprintf(etaStr, sizeof(etaStr), "ETA %dh%02d", mm / 60, mm % 60);
+            else         snprintf(etaStr, sizeof(etaStr), "ETA %d:%02d", mm, ss);
+        } else {
+            strlcpy(etaStr, "ETA --:--", sizeof(etaStr));
         }
-        oled_text(remX, 50, remStr);
+        int etaW = strlen(etaStr) * 6;
+        oled_text(128 - etaW, 52, etaStr);
     }
 
     oled_flush();
@@ -2120,8 +2148,9 @@ static void modemTask(void* param) {
 
     g_modemReady = true;
 
-    // ── Disable echo ─────────────────────────────────────────────────────
+    // ── Disable echo and net LED ────────────────────────────────────────
     modem_at_cmd("ATE0", resp, sizeof(resp), 1000);
+    // Note: SIM7600 NET LED is hardwired — AT+CNETLIGHT/CSGS/CGFUNC all ERROR
 
     // ── Increase baud rate ──────────────────────────────────────────────
     {
@@ -2625,7 +2654,7 @@ static void doHarvest() {
 
     g_writeDetected = false; g_lastWriteMs = 0;
     g_hostWasConnected = false; g_hostConnected = false;
-    g_hostWrittenMb = 0.0f;
+    // Note: g_hostWrittenMb NOT reset — it's a session-cumulative display metric
 
     g_harvesting = false;
     g_msc_ejected = false;
@@ -2852,6 +2881,24 @@ static void main_loop_task(void* param) {
         uint32_t now = millis();
         if (g_sd_ready && now - g_lastDisplayMs >= DISPLAY_INTERVAL_MS) {
             g_lastDisplayMs = now;
+
+            // ── Compute live speeds from deltas ──────────────────────────
+            {
+                static float    prevUsbMb = 0;
+                static float    prevUpMb  = 0;
+                static uint32_t prevMs    = 0;
+                float dt = (prevMs > 0) ? (now - prevMs) / 1000.0f : 1.0f;
+                if (dt > 0.1f) {
+                    float usbDelta = g_hostWrittenMb - prevUsbMb;
+                    float upDelta  = (g_mbUploaded + g_uploadingMb) - prevUpMb;
+                    g_usbWriteKBps = (usbDelta > 0) ? (usbDelta * 1024.0f / dt) : 0;
+                    g_uploadKBps   = (upDelta > 0)  ? (upDelta  * 1024.0f / dt) : 0;
+                    prevUsbMb = g_hostWrittenMb;
+                    prevUpMb  = g_mbUploaded + g_uploadingMb;
+                    prevMs    = now;
+                }
+            }
+
             // Update SD used space (only when MSC is ejected to avoid SPI conflict)
             if (g_fatfs_mounted && g_msc_ejected &&
                 xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -2871,8 +2918,7 @@ static void main_loop_task(void* param) {
         uint32_t lastWr = g_lastWriteMs;
         if (!g_harvesting && g_writeDetected && g_hostWasConnected &&
             lastWr != 0 && now >= lastWr && (now - lastWr) >= QUIET_WINDOW_MS &&
-            (now - g_lastHarvestMs) >= g_harvestCoolMs &&
-            g_hostWrittenMb > 0.01f) {
+            (now - g_lastHarvestMs) >= g_harvestCoolMs) {
             cdc_printf("Harvest: %.1f KB written, %us idle\r\n",
                      g_hostWrittenMb * 1024.0f, (now - lastWr) / 1000);
             if (g_harvest_task) xTaskNotifyGive(g_harvest_task);
@@ -2989,6 +3035,21 @@ extern "C" void app_main(void) {
             DWORD freeSectors  = freeClusters * fs->csize;
             g_sdUsedMb = (totalSectors - freeSectors) * 512.0f / 1e6f;
         }
+    }
+
+    // ── Boot splash: show SD capacity ──────────────────────────────────
+    if (g_oled_ok) {
+        oled_clear();
+        oled_text(22, 4, "AirBridge", 2);
+        char sdLine[22];
+        char usedStr[10], totalStr[10];
+        _fmtSize(usedStr, sizeof(usedStr), g_sdUsedMb);
+        _fmtSize(totalStr, sizeof(totalStr), g_sdTotalMb);
+        snprintf(sdLine, sizeof(sdLine), "SD %s / %s", usedStr, totalStr);
+        int sdW = strlen(sdLine) * 6;
+        oled_text((128 - sdW) / 2, 30, sdLine);
+        oled_text(22, 48, "Booting...");
+        oled_flush();
     }
 
     // FATFS already mounted by sd_init() — no separate mount needed
