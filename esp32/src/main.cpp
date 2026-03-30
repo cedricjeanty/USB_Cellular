@@ -2292,6 +2292,7 @@ static void modemTask(void* param) {
 
     // ── Disable echo and net LED ────────────────────────────────────────
     modem_at_cmd("ATE0", resp, sizeof(resp), 1000);
+    modem_at_cmd("AT+CTZU=1", resp, sizeof(resp), 1000);  // enable auto time zone update (NITZ)
     // Note: SIM7600 NET LED is hardwired — AT+CNETLIGHT/CSGS/CGFUNC all ERROR
 
     // ── Sync time from cellular network ──────────────────────────────────
