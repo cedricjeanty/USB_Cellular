@@ -403,7 +403,8 @@ static TaskHandle_t g_dns_task = nullptr;
 // ── Time tracking (synced from cellular network) ────────────────────────────
 static uint32_t g_bootEpoch   = 0;  // unix epoch at boot (from AT+CCLK)
 static uint32_t g_bootMs      = 0;  // millis() when epoch was captured
-static char     g_logFileName[40] = "";  // per-session log name (set after time sync)
+static char     g_logFileName[48] = "";  // per-session log name (set after time sync)
+static uint32_t g_bootCount      = 0;   // persistent boot counter from NVS
 
 // ── Cellular modem (SIM7600) ────────────────────────────────────────────────
 static esp_netif_t      *g_ppp_netif    = nullptr;
@@ -2330,7 +2331,8 @@ static void modemTask(void* param) {
                 struct tm utc;
                 gmtime_r(&epoch, &utc);
                 snprintf(g_logFileName, sizeof(g_logFileName),
-                         "logs/%04d%02d%02d_%02d%02d%02d.log",
+                         "logs/%04lu_%04d%02d%02d_%02d%02d%02d.log",
+                         (unsigned long)g_bootCount,
                          utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
                          utc.tm_hour, utc.tm_min, utc.tm_sec);
                 cdc_printf("Modem: time synced 20%02d-%02d-%02d %02d:%02d:%02d TZ%c%d\r\n",
@@ -2555,10 +2557,10 @@ static void modemTask(void* param) {
             if (ppp_lwip_netif) netif_set_default(ppp_lwip_netif);
             esp_netif_set_default_netif(g_ppp_netif);
             cdc_printf("Modem: cellular ready — set as default route\r\n");
-            // Set fallback log filename if time hasn't synced yet
+            // Set fallback log filename (no time yet — will be renamed if time syncs)
             if (!g_logFileName[0]) {
                 snprintf(g_logFileName, sizeof(g_logFileName),
-                         "logs/boot_%lu.log", (unsigned long)(millis() / 1000));
+                         "logs/%04lu.log", (unsigned long)g_bootCount);
             }
         }
 
@@ -2614,7 +2616,8 @@ static void modemTask(void* param) {
                                 g_bootMs = millis();
                                 struct tm utc; gmtime_r(&ep, &utc);
                                 snprintf(g_logFileName, sizeof(g_logFileName),
-                                    "logs/%04d%02d%02d_%02d%02d%02d.log",
+                                    "logs/%04lu_%04d%02d%02d_%02d%02d%02d.log",
+                                    (unsigned long)g_bootCount,
                                     utc.tm_year+1900, utc.tm_mon+1, utc.tm_mday,
                                     utc.tm_hour, utc.tm_min, utc.tm_sec);
                                 log_write("Time synced: 20%02d-%02d-%02d %02d:%02d:%02d", yy,mo,dd,hh,mi,ss);
@@ -3297,6 +3300,7 @@ extern "C" void app_main(void) {
             nvs_set_u32(h, "boots", boots);
             nvs_commit(h);
             nvs_close(h);
+            g_bootCount = boots;
 
             esp_reset_reason_t reason = esp_reset_reason();
             ESP_LOGI(TAG, "Boot #%u  reset_reason=%d  heap=%lu",
