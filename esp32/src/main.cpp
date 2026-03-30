@@ -5,6 +5,7 @@
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
 #include <cstring>
+#include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -349,7 +350,9 @@ static float    g_mbUploaded     = 0.0f;
 static float    g_lastUploadKBps = 0.0f;  // speed of last upload for STATUS display
 static float    g_sdTotalMb      = 0.0f;
 static float    g_sdUsedMb       = 0.0f; // updated periodically for display
-static float    g_uploadingMb    = 0.0f; // live progress of current upload
+static volatile bool g_splashActive = true; // hold splash screen on boot
+static float    g_uploadingMb    = 0.0f; // live progress of current file upload
+static float    g_uploadBaseMb   = 0.0f; // base offset for multipart (completed parts)
 static float    g_usbWriteKBps   = 0.0f; // live USB write speed for display
 static float    g_uploadKBps     = 0.0f; // live upload speed for display
 static uint32_t g_lastDisplayMs  = 0;
@@ -397,6 +400,11 @@ static httpd_handle_t g_httpd = nullptr;
 static int g_dns_sock = -1;
 static TaskHandle_t g_dns_task = nullptr;
 
+// ── Time tracking (synced from cellular network) ────────────────────────────
+static uint32_t g_bootEpoch   = 0;  // unix epoch at boot (from AT+CCLK)
+static uint32_t g_bootMs      = 0;  // millis() when epoch was captured
+static char     g_logFileName[40] = "";  // per-session log name (set after time sync)
+
 // ── Cellular modem (SIM7600) ────────────────────────────────────────────────
 static esp_netif_t      *g_ppp_netif    = nullptr;
 static TaskHandle_t      g_modem_task   = nullptr;
@@ -411,6 +419,7 @@ static int  g_cli_len = 0;
 
 // ── Forward declarations ────────────────────────────────────────────────────
 static void processCLI(const char* cmd);
+static void log_write(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void updateDisplay();
 static void disp(const char* line1, const char* line2 = nullptr);
 static bool sd_mount_fatfs();
@@ -482,17 +491,45 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
 // as built-in commands. tud_msc_scsi_cb is only for non-built-in SCSI commands.
 int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16],
                          void *buffer, uint16_t bufsize) {
-    (void)lun; (void)buffer; (void)bufsize;
+    (void)lun;
 
-    // Handle PREVENT ALLOW MEDIUM REMOVAL
-    if (scsi_cmd[0] == 0x1E) {
-        tud_msc_set_sense(lun, 0, 0, 0);
-        return 0;
+    switch (scsi_cmd[0]) {
+        case 0x1E:  // PREVENT ALLOW MEDIUM REMOVAL
+            tud_msc_set_sense(lun, 0, 0, 0);
+            return 0;
+
+        case 0x35:  // SYNCHRONIZE CACHE (host flushes write cache)
+            tud_msc_set_sense(lun, 0, 0, 0);
+            return 0;
+
+        case 0x23: { // READ FORMAT CAPACITIES
+            uint8_t* p = (uint8_t*)buffer;
+            if (bufsize >= 12) {
+                memset(p, 0, 12);
+                p[3] = 8;  // capacity list length
+                // Current capacity
+                uint32_t sectors = g_card_sectors;
+                p[4] = (sectors >> 24) & 0xFF;
+                p[5] = (sectors >> 16) & 0xFF;
+                p[6] = (sectors >>  8) & 0xFF;
+                p[7] = sectors & 0xFF;
+                p[8] = 0x02;  // formatted media
+                p[9] = 0;     // block size 512
+                p[10] = 0x02;
+                p[11] = 0x00;
+                tud_msc_set_sense(lun, 0, 0, 0);
+                return 12;
+            }
+            tud_msc_set_sense(lun, 0, 0, 0);
+            return 0;
+        }
+
+        default:
+            // Log unknown SCSI commands for debugging avionics compatibility
+            log_write("SCSI unknown cmd=0x%02X", scsi_cmd[0]);
+            tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);
+            return -1;
     }
-
-    // Default: unsupported command
-    tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);
-    return -1;
 }
 
 bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bool load_eject) {
@@ -500,6 +537,7 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, boo
     if (load_eject) {
         g_hostConnected = start;
         if (start) g_hostWasConnected = true;
+        log_write("USB host %s", start ? "connected" : "ejected");
     }
     return true;
 }
@@ -561,6 +599,93 @@ static void cdc_printf(const char* fmt, ...) {
         tud_cdc_write(buf, len);
         tud_cdc_write_flush();
     }
+}
+
+// ── File-based logger (readable from USB) ───────────────────────────────────
+// Buffers log entries in RAM. Flushed to /sdcard/airbridge.log during harvest
+// (when we have exclusive FATFS access — can't write while MSC is active).
+#define LOG_BUF_SIZE 8192
+static char g_log_buf[LOG_BUF_SIZE];
+static int  g_log_len = 0;
+static SemaphoreHandle_t g_log_mutex = nullptr;
+
+static void log_init() {
+    g_log_mutex = xSemaphoreCreateMutex();
+    g_log_len = 0;
+}
+
+// Buffer a log entry in RAM (call anytime)
+static void log_write(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+static void log_write(const char* fmt, ...) {
+    if (!g_log_mutex) return;
+    if (xSemaphoreTake(g_log_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
+
+    // Prepend timestamp: real time if synced, otherwise uptime
+    int avail = LOG_BUF_SIZE - g_log_len;
+    if (avail > 24) {
+        int n;
+        if (g_bootEpoch > 0) {
+            uint32_t now = g_bootEpoch + (millis() - g_bootMs) / 1000;
+            time_t t = (time_t)now;
+            struct tm tm;
+            gmtime_r(&t, &tm);
+            n = snprintf(g_log_buf + g_log_len, avail, "[%02d/%02d %02d:%02d:%02d] ",
+                         tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+        } else {
+            n = snprintf(g_log_buf + g_log_len, avail, "[+%lus] ", (unsigned long)(millis() / 1000));
+        }
+        g_log_len += n;
+        avail -= n;
+    }
+
+    if (avail > 1) {
+        va_list args;
+        va_start(args, fmt);
+        int n = vsnprintf(g_log_buf + g_log_len, avail, fmt, args);
+        va_end(args);
+        if (n > 0) {
+            g_log_len += (n < avail) ? n : avail - 1;
+        }
+    }
+
+    // Add newline
+    if (g_log_len < LOG_BUF_SIZE - 1) {
+        g_log_buf[g_log_len++] = '\n';
+    }
+
+    // If buffer is getting full, discard oldest half
+    if (g_log_len > LOG_BUF_SIZE - 256) {
+        int half = g_log_len / 2;
+        // Find next newline after halfway point
+        while (half < g_log_len && g_log_buf[half] != '\n') half++;
+        if (half < g_log_len) half++;
+        memmove(g_log_buf, g_log_buf + half, g_log_len - half);
+        g_log_len -= half;
+    }
+
+    xSemaphoreGive(g_log_mutex);
+}
+
+// Flush buffered log to SD card file (call ONLY with exclusive FATFS access)
+static void log_flush_to_sd() {
+    if (!g_log_mutex || g_log_len == 0) return;
+    if (xSemaphoreTake(g_log_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+
+    FILE* f = fopen("/sdcard/airbridge.log", "a");
+    if (f) {
+        // Truncate if file is too large
+        fseek(f, 0, SEEK_END);
+        if (ftell(f) > 64 * 1024) {
+            fclose(f);
+            f = fopen("/sdcard/airbridge.log", "w");
+        }
+        if (f) {
+            fwrite(g_log_buf, 1, g_log_len, f);
+            fclose(f);
+        }
+    }
+    g_log_len = 0;
+    xSemaphoreGive(g_log_mutex);
 }
 
 // ── SD card init ────────────────────────────────────────────────────────────
@@ -1424,8 +1549,15 @@ static void updateDisplay() {
         snprintf(remStr, sizeof(remStr), "REM:"); _fmtSize(remStr + 4, sizeof(remStr) - 4, remaining);
         oled_text(0, 52, remStr);
 
-        if (g_uploadKBps > 0.5f && remaining > 0.001f) {
-            int etaSec = (int)(remaining * 1024.0f / g_uploadKBps);
+        // Smoothed speed for stable ETA (EMA alpha=0.2)
+        static float etaKBps = 0;
+        if (g_uploadKBps > 0.5f)
+            etaKBps = etaKBps * 0.8f + g_uploadKBps * 0.2f;
+        else if (etaKBps < 1.0f)
+            etaKBps = 0;
+
+        if (etaKBps > 0.5f && remaining > 0.001f) {
+            int etaSec = (int)(remaining * 1024.0f / etaKBps);
             int mm = etaSec / 60, ss = etaSec % 60;
             if (mm > 99) snprintf(etaStr, sizeof(etaStr), "ETA %dh%02d", mm / 60, mm % 60);
             else         snprintf(etaStr, sizeof(etaStr), "ETA %d:%02d", mm, ss);
@@ -1599,7 +1731,7 @@ static bool httpStreamChunk(esp_tls_t* tls, FILE* f, uint32_t len) {
             else return false;
         }
         remaining -= n;
-        g_uploadingMb = (len - remaining) / 1e6f;
+        g_uploadingMb = g_uploadBaseMb + (len - remaining) / 1e6f;
     }
     return true;
 }
@@ -1809,6 +1941,7 @@ static bool s3UploadFile(const char* name) {
         float elapsed = (millis() - xfrStart) / 1000.0f;
         g_lastUploadKBps = elapsed > 0 ? fileSize / 1024.0f / elapsed : 0;
         cdc_printf("S3: uploaded '%s' OK (%u bytes, %.0f KB/s)\r\n", name, fileSize, g_lastUploadKBps);
+        log_write("Upload OK: %s %u bytes %.0f KB/s", name, fileSize, g_lastUploadKBps);
         return true;
     }
 
@@ -1936,6 +2069,9 @@ static bool s3UploadFile(const char* name) {
             return false;
         }
 
+        // Update base so next part's progress continues from here
+        g_uploadBaseMb = (float)partNum * S3_CHUNK_SIZE / 1e6f;
+
         char etag[64] = "";
         std::string putResp = httpReadResponse(tls, etag, sizeof(etag));
         esp_tls_conn_destroy(tls);
@@ -1997,6 +2133,7 @@ static bool s3UploadFile(const char* name) {
 
     float elapsed = (millis() - xfrStart) / 1000.0f;
     g_lastUploadKBps = elapsed > 0 ? fileSize / 1024.0f / elapsed : 0;
+    log_write("Upload OK: %s %u bytes %u parts %.0f KB/s", name, fileSize, totalParts, g_lastUploadKBps);
     cdc_printf("S3: uploaded '%s' OK (%u bytes, %u parts, %.0f KB/s)\r\n",
              name, fileSize, totalParts, g_lastUploadKBps);
     return true;
@@ -2005,7 +2142,8 @@ static bool s3UploadFile(const char* name) {
 // ── Skip list ───────────────────────────────────────────────────────────────
 static const char* const SKIP_NAMES[] = {
     "System Volume Information", "desktop.ini", "Thumbs.db",
-    ".Spotlight-V100", ".Trashes", ".fseventsd", "harvested", nullptr
+    ".Spotlight-V100", ".Trashes", ".fseventsd", "harvested",
+    "airbridge.log", nullptr
 };
 static bool isSkipped(const char* n) {
     if (n[0] == '.' || n[0] == '~') return true;
@@ -2070,10 +2208,13 @@ static void modem_ip_event_handler(void* arg, esp_event_base_t event_base,
     if (event_id == IP_EVENT_PPP_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
         cdc_printf("Modem: PPP IP=" IPSTR "\r\n", IP2STR(&event->ip_info.ip));
+        log_write("PPP got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         g_pppConnected = true;
     } else if (event_id == IP_EVENT_PPP_LOST_IP) {
         cdc_printf("Modem: PPP lost IP\r\n");
+        log_write("PPP lost IP");
         g_pppConnected = false;
+        g_modemRssi = 0;
     }
 }
 
@@ -2132,6 +2273,7 @@ static void modemTask(void* param) {
         int len = modem_at_cmd("AT", resp, sizeof(resp), 2000);
         if (len > 0 && strstr(resp, "OK")) {
             cdc_printf("Modem: AT sync OK\r\n");
+            log_write("Modem: AT sync OK");
             ready = true;
             break;
         }
@@ -2151,6 +2293,55 @@ static void modemTask(void* param) {
     // ── Disable echo and net LED ────────────────────────────────────────
     modem_at_cmd("ATE0", resp, sizeof(resp), 1000);
     // Note: SIM7600 NET LED is hardwired — AT+CNETLIGHT/CSGS/CGFUNC all ERROR
+
+    // ── Sync time from cellular network ──────────────────────────────────
+    // AT+CCLK? returns: +CCLK: "YY/MM/DD,HH:MM:SS±TZ"
+    if (modem_at_cmd("AT+CCLK?", resp, sizeof(resp), 2000) > 0) {
+        cdc_printf("Modem: CCLK raw: %s", resp);
+        char* q = strchr(resp, '"');
+        if (q) {
+            int yy = 0, mo = 0, dd = 0, hh = 0, mi = 0, ss = 0;
+            char tzSign = '+';
+            int tzVal = 0;
+            // SIM7600 format: "YY/MM/DD,HH:MM:SS"±TZ  (TZ after closing quote)
+            sscanf(q + 1, "%d/%d/%d,%d:%d:%d", &yy, &mo, &dd, &hh, &mi, &ss);
+            // Find TZ after closing quote
+            char* q2 = strchr(q + 1, '"');
+            if (q2) sscanf(q2 + 1, "%c%d", &tzSign, &tzVal);
+            cdc_printf("Modem: parsed yy=%d mo=%d dd=%d %d:%d:%d tz=%c%d\r\n",
+                       yy, mo, dd, hh, mi, ss, tzSign, tzVal);
+            if (yy >= 24 && yy <= 50 && mo >= 1 && mo <= 12) {
+                struct tm tm = {};
+                tm.tm_year = yy + 100;  // years since 1900
+                tm.tm_mon  = mo - 1;
+                tm.tm_mday = dd;
+                tm.tm_hour = hh;
+                tm.tm_min  = mi;
+                tm.tm_sec  = ss;
+                time_t epoch = mktime(&tm);
+                // Adjust for timezone (quarter-hours from UTC)
+                int tzOffsetSec = tzVal * 15 * 60;
+                if (tzSign == '-') tzOffsetSec = -tzOffsetSec;
+                epoch -= tzOffsetSec;  // convert local → UTC
+                g_bootEpoch = (uint32_t)epoch;
+                g_bootMs = millis();
+                // Generate dated log filename for this boot session
+                struct tm utc;
+                gmtime_r(&epoch, &utc);
+                snprintf(g_logFileName, sizeof(g_logFileName),
+                         "logs/%04d%02d%02d_%02d%02d%02d.log",
+                         utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                         utc.tm_hour, utc.tm_min, utc.tm_sec);
+                cdc_printf("Modem: time synced 20%02d-%02d-%02d %02d:%02d:%02d TZ%c%d\r\n",
+                           yy, mo, dd, hh, mi, ss, tzSign, tzVal);
+                log_write("Time: 20%02d-%02d-%02d %02d:%02d:%02d TZ%c%d",
+                          yy, mo, dd, hh, mi, ss, tzSign, tzVal);
+            } else {
+                cdc_printf("Modem: CCLK invalid (yy=%d mo=%d) — no time sync\r\n", yy, mo);
+                log_write("CCLK invalid: %s", q);
+            }
+        }
+    }
 
     // ── Increase baud rate ──────────────────────────────────────────────
     {
@@ -2182,6 +2373,7 @@ static void modemTask(void* param) {
 
             if (ok) {
                 cdc_printf("Modem: baud upgraded to %d\r\n", bauds[i]);
+                log_write("Modem: baud %d", bauds[i]);
                 upgraded = true;
 
                 // Now try enabling HW flow control at the new baud
@@ -2240,6 +2432,7 @@ static void modemTask(void* param) {
             }
         }
         cdc_printf("Modem: Operator=%s\r\n", g_modemOp);
+        log_write("Modem: operator=%s", g_modemOp);
     }
 
     if (modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000) > 0) {
@@ -2250,6 +2443,7 @@ static void modemTask(void* param) {
             sscanf(p, "+CSQ: %d,%d", &rssi, &ber);
             g_modemRssi = rssi;
             cdc_printf("Modem: RSSI=%d BER=%d\r\n", rssi, ber);
+            log_write("Modem: RSSI=%d", rssi);
         }
     }
 
@@ -2280,10 +2474,12 @@ static void modemTask(void* param) {
             if (strstr(connbuf, "CONNECT")) {
                 connected = true;
                 cdc_printf("Modem: CONNECT received!\r\n");
+                log_write("Modem: PPP CONNECT");
                 break;
             }
             if (strstr(connbuf, "ERROR") || strstr(connbuf, "NO CARRIER")) {
                 cdc_printf("Modem: dial failed: %s\r\n", connbuf);
+                log_write("Modem: dial failed");
                 break;
             }
         }
@@ -2331,6 +2527,7 @@ static void modemTask(void* param) {
     esp_netif_action_connected(g_ppp_netif, nullptr, 0, nullptr);
 
     cdc_printf("Modem: PPPoS started, feeding UART data...\r\n");
+    log_write("Modem: PPPoS started");
 
     // ── PPP data pump: UART ↔ PPPoS ──────────────────────────────────────
     // This loop MUST run continuously — all TCP/IP over cellular depends on it.
@@ -2357,12 +2554,23 @@ static void modemTask(void* param) {
             if (ppp_lwip_netif) netif_set_default(ppp_lwip_netif);
             esp_netif_set_default_netif(g_ppp_netif);
             cdc_printf("Modem: cellular ready — set as default route\r\n");
+            // Set fallback log filename if time hasn't synced yet
+            if (!g_logFileName[0]) {
+                snprintf(g_logFileName, sizeof(g_logFileName),
+                         "logs/boot_%lu.log", (unsigned long)(millis() / 1000));
+            }
         }
 
+        // ── Track last PPP data for stale detection ─────────────────────
+        static uint32_t lastPppRxMs = 0;
+        if (len > 0) lastPppRxMs = millis();
+
         // ── Periodic RSSI refresh: escape PPP → AT+CSQ → resume PPP ─────
-        // ONLY when idle (no queued uploads) — the +++ escape pauses PPP ~3s
+        // 15s when idle, 60s during uploads (the +++ escape pauses PPP ~3s)
         static uint32_t lastCsqMs = 0;
-        if (g_pppConnected && g_filesQueued == 0 && (millis() - lastCsqMs) > 15000) {
+        bool uploading = (g_filesQueued > 0 || g_uploadingMb > 0);
+        uint32_t csqInterval = uploading ? 60000 : 15000;
+        if (g_pppConnected && (millis() - lastCsqMs) > csqInterval) {
             lastCsqMs = millis();
 
             // Send +++ with 1s guard time to enter command mode
@@ -2372,22 +2580,151 @@ static void modemTask(void* param) {
 
             // Drain response (should be "OK")
             char csqResp[128];
-            uart_read_bytes(UART_NUM_1, (uint8_t*)csqResp,
-                            sizeof(csqResp) - 1, pdMS_TO_TICKS(500));
+            int drained = uart_read_bytes(UART_NUM_1, (uint8_t*)csqResp,
+                            sizeof(csqResp) - 1, pdMS_TO_TICKS(1000));
 
-            // Query signal quality
-            int len = modem_at_cmd("AT+CSQ", csqResp, sizeof(csqResp), 2000);
-            if (len > 0) {
-                char* p = strstr(csqResp, "+CSQ:");
-                if (p) {
-                    int rssi = 99, ber = 99;
-                    sscanf(p, "+CSQ: %d,%d", &rssi, &ber);
-                    g_modemRssi = rssi;
-                }
+            bool inCmdMode = false;
+            if (drained > 0) {
+                csqResp[drained] = '\0';
+                inCmdMode = (strstr(csqResp, "OK") != nullptr);
             }
 
-            // Return to data mode
-            modem_at_cmd("ATO", csqResp, sizeof(csqResp), 2000);
+            if (inCmdMode) {
+                // Retry time sync if we don't have it yet
+                if (g_bootEpoch == 0) {
+                    int clen = modem_at_cmd("AT+CCLK?", csqResp, sizeof(csqResp), 2000);
+                    if (clen > 0) {
+                        char* cq = strchr(csqResp, '"');
+                        if (cq) {
+                            int yy=0,mo=0,dd=0,hh=0,mi=0,ss=0;
+                            char tzs='+'; int tzv=0;
+                            sscanf(cq+1, "%d/%d/%d,%d:%d:%d", &yy,&mo,&dd,&hh,&mi,&ss);
+                            char* cq2 = strchr(cq+1, '"');
+                            if (cq2) sscanf(cq2+1, "%c%d", &tzs, &tzv);
+                            if (yy >= 24 && yy <= 50 && mo >= 1 && mo <= 12) {
+                                struct tm ctm = {};
+                                ctm.tm_year = yy+100; ctm.tm_mon = mo-1; ctm.tm_mday = dd;
+                                ctm.tm_hour = hh; ctm.tm_min = mi; ctm.tm_sec = ss;
+                                time_t ep = mktime(&ctm);
+                                int tzoff = tzv * 15 * 60;
+                                if (tzs == '-') tzoff = -tzoff;
+                                ep -= tzoff;
+                                g_bootEpoch = (uint32_t)ep;
+                                g_bootMs = millis();
+                                struct tm utc; gmtime_r(&ep, &utc);
+                                snprintf(g_logFileName, sizeof(g_logFileName),
+                                    "logs/%04d%02d%02d_%02d%02d%02d.log",
+                                    utc.tm_year+1900, utc.tm_mon+1, utc.tm_mday,
+                                    utc.tm_hour, utc.tm_min, utc.tm_sec);
+                                log_write("Time synced: 20%02d-%02d-%02d %02d:%02d:%02d", yy,mo,dd,hh,mi,ss);
+                                cdc_printf("Modem: time synced 20%02d-%02d-%02d\r\n", yy,mo,dd);
+                            }
+                        }
+                    }
+                }
+
+                int len2 = modem_at_cmd("AT+CSQ", csqResp, sizeof(csqResp), 2000);
+                if (len2 > 0) {
+                    char* p = strstr(csqResp, "+CSQ:");
+                    if (p) {
+                        int rssi = 99, ber = 99;
+                        sscanf(p, "+CSQ: %d,%d", &rssi, &ber);
+                        // Only log when RSSI changes
+                        if (rssi != g_modemRssi) {
+                            log_write("RSSI: %d -> %d", g_modemRssi, rssi);
+                        }
+                        g_modemRssi = rssi;
+                    }
+                }
+                // Return to data mode — verify CONNECT response
+                int ato_len = modem_at_cmd("ATO", csqResp, sizeof(csqResp), 3000);
+                if (ato_len <= 0 || !strstr(csqResp, "CONNECT")) {
+                    log_write("Modem: ATO failed — PPP may be broken: %s", csqResp);
+                    cdc_printf("Modem: ATO failed: %s\r\n", csqResp);
+                }
+            } else {
+                log_write("Modem: +++ escape failed (no OK)");
+                cdc_printf("Modem: +++ escape failed\r\n");
+                // Don't set RSSI=0 here — the modem might still be in data mode
+            }
+            // Reset stale timer since we just paused the data pump intentionally
+            lastPppRxMs = millis();
+        }
+
+        // ── Detect PPP connection loss ───────────────────────────────────
+        // If no UART data for 3 minutes, consider connection lost.
+        if (g_pppConnected && lastPppRxMs > 0 &&
+            (millis() - lastPppRxMs) > 60000) {
+            cdc_printf("Modem: no PPP data for 60s — marking disconnected\r\n");
+            log_write("Modem: PPP stale — no data for 60s");
+            g_pppConnected = false;
+            g_modemRssi = 0;
+        }
+
+        // ── Opportunistic log upload via cellular ─────────────────────────
+        // 60s when idle, skip during file uploads. First upload 30s after connect.
+        // Each boot session uses a dated filename (logs/YYYYMMDD_HHMMSS.log).
+        // Full buffer is PUT each time (S3 overwrites same key with growing content).
+        static uint32_t lastLogUploadMs = 0;
+        static bool logUpRunning = false;
+        static uint32_t pppConnectMs = 0;
+        if (g_pppConnected && pppConnectMs == 0) pppConnectMs = millis();
+
+        uint32_t logInterval = uploading ? 0 : 60000;  // skip during uploads
+        uint32_t sinceConnect = pppConnectMs ? (millis() - pppConnectMs) : 0;
+        bool firstUpload = (lastLogUploadMs == 0 && sinceConnect > 30000);
+
+        if (g_pppConnected && !logUpRunning && g_log_len > 0 && g_logFileName[0] &&
+            (firstUpload || (logInterval > 0 && (millis() - lastLogUploadMs) > logInterval))) {
+            lastLogUploadMs = millis();
+            logUpRunning = true;
+            xTaskCreatePinnedToCore([](void*) {
+                if (!s3LoadCreds()) { logUpRunning = false; vTaskDelete(nullptr); return; }
+
+                // Snapshot the full log buffer
+                if (xSemaphoreTake(g_log_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+                    logUpRunning = false; vTaskDelete(nullptr); return;
+                }
+                static char logSnap[LOG_BUF_SIZE];
+                int snapLen = g_log_len;
+                memcpy(logSnap, g_log_buf, snapLen);
+                xSemaphoreGive(g_log_mutex);
+
+                if (snapLen == 0) { logUpRunning = false; vTaskDelete(nullptr); return; }
+
+                // Use dated session filename
+                std::string enc = urlEncode(g_logFileName);
+                char query[512];
+                snprintf(query, sizeof(query), "file=%s&size=%d&device=%s",
+                         enc.c_str(), snapLen, g_deviceId);
+                std::string resp = s3ApiGet(query);
+                std::string url = jsonStr(resp, "\"url\"");
+                if (url.empty()) { logUpRunning = false; vTaskDelete(nullptr); return; }
+
+                char s3Host[128];
+                static char s3Path[2500];
+                if (!parseUrl(url, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
+                    logUpRunning = false; vTaskDelete(nullptr); return;
+                }
+
+                esp_tls_t* tls = tls_connect(s3Host);
+                if (!tls) { logUpRunning = false; vTaskDelete(nullptr); return; }
+
+                char hdr[2700];
+                int hlen = snprintf(hdr, sizeof(hdr),
+                    "PUT %s HTTP/1.1\r\n"
+                    "Host: %s\r\n"
+                    "Content-Length: %d\r\n"
+                    "Connection: close\r\n\r\n",
+                    s3Path, s3Host, snapLen);
+
+                bool ok = tls_write_all(tls, hdr, hlen) &&
+                          tls_write_all(tls, logSnap, snapLen);
+                if (ok) httpReadResponse(tls);
+                esp_tls_conn_destroy(tls);
+                logUpRunning = false;
+                vTaskDelete(nullptr);
+            }, "log_up", 8192, nullptr, 2, nullptr, 1);
         }
     }
 }
@@ -2414,6 +2751,7 @@ static void uploadTask(void* param) {
                     while ((ent = readdir(dir)) != nullptr) {
                         if (ent->d_type == DT_DIR) continue;
                         if (ent->d_name[0] == '.') continue;
+                        if (strcmp(ent->d_name, "airbridge.log") == 0) continue;
                         // Skip 0-byte files
                         char fullpath[128];
                         snprintf(fullpath, sizeof(fullpath), "%s/%s", dirpath, ent->d_name);
@@ -2460,10 +2798,13 @@ static void uploadTask(void* param) {
                      (unsigned long)esp_get_free_heap_size(),
                      (unsigned long)esp_get_minimum_free_heap_size());
             g_uploadingMb = 0.0f;
+            g_uploadBaseMb = 0.0f;
             bool uploaded = s3UploadFile(name);
             g_uploadingMb = 0.0f;
+            g_uploadBaseMb = 0.0f;
             if (!uploaded) {
                 cdc_printf("Upload failed for %s — retrying in 30s\r\n", name);
+                log_write("Upload FAIL: %s", name);
                 vTaskDelay(pdMS_TO_TICKS(30000)); continue;
             }
 
@@ -2651,6 +2992,10 @@ static void doHarvest() {
     }
 
     cdc_printf("doHarvest: done %u file(s) (%.1f MB)\r\n", count, usedMb);
+    log_write("Harvest: %u file(s), %.1f MB", count, usedMb);
+
+    // Flush log buffer to SD while we have exclusive FATFS access
+    log_flush_to_sd();
 
     g_writeDetected = false; g_lastWriteMs = 0;
     g_hostWasConnected = false; g_hostConnected = false;
@@ -2879,7 +3224,7 @@ static void main_loop_task(void* param) {
         }
 
         uint32_t now = millis();
-        if (g_sd_ready && now - g_lastDisplayMs >= DISPLAY_INTERVAL_MS) {
+        if (g_sd_ready && !g_splashActive && now - g_lastDisplayMs >= DISPLAY_INTERVAL_MS) {
             g_lastDisplayMs = now;
 
             // ── Compute live speeds from deltas ──────────────────────────
@@ -2921,6 +3266,7 @@ static void main_loop_task(void* param) {
             (now - g_lastHarvestMs) >= g_harvestCoolMs) {
             cdc_printf("Harvest: %.1f KB written, %us idle\r\n",
                      g_hostWrittenMb * 1024.0f, (now - lastWr) / 1000);
+            log_write("Harvest trigger: %.1fKB, %us idle", g_hostWrittenMb * 1024.0f, (now - lastWr) / 1000);
             if (g_harvest_task) xTaskNotifyGive(g_harvest_task);
         }
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -2936,6 +3282,7 @@ extern "C" void app_main(void) {
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    log_init();
 
     g_sd_mutex = xSemaphoreCreateMutex();
 
@@ -3037,20 +3384,7 @@ extern "C" void app_main(void) {
         }
     }
 
-    // ── Boot splash: show SD capacity ──────────────────────────────────
-    if (g_oled_ok) {
-        oled_clear();
-        oled_text(22, 4, "AirBridge", 2);
-        char sdLine[22];
-        char usedStr[10], totalStr[10];
-        _fmtSize(usedStr, sizeof(usedStr), g_sdUsedMb);
-        _fmtSize(totalStr, sizeof(totalStr), g_sdTotalMb);
-        snprintf(sdLine, sizeof(sdLine), "SD %s / %s", usedStr, totalStr);
-        int sdW = strlen(sdLine) * 6;
-        oled_text((128 - sdW) / 2, 30, sdLine);
-        oled_text(22, 48, "Booting...");
-        oled_flush();
-    }
+    // Boot splash is shown later, after file scan
 
     // FATFS already mounted by sd_init() — no separate mount needed
 
@@ -3122,6 +3456,50 @@ extern "C" void app_main(void) {
             }
         }
     }
+
+    // ── Boot splash (10s) ──────────────────────────────────────────────
+    if (g_oled_ok) {
+        // Load device ID for display
+        s3LoadCreds();
+
+        oled_clear();
+        // "AirBridge" 2x: 9 chars * 12px = 108px, center: (128-108)/2 = 10
+        oled_text(10, 0, "AirBridge", 2);
+
+        // SD capacity
+        char sdLine[22];
+        char usedStr[10], totalStr[10];
+        _fmtSize(usedStr, sizeof(usedStr), g_sdUsedMb);
+        _fmtSize(totalStr, sizeof(totalStr), g_sdTotalMb);
+        snprintf(sdLine, sizeof(sdLine), "SD %s / %s", usedStr, totalStr);
+        int sdW = strlen(sdLine) * 6;
+        oled_text((128 - sdW) / 2, 22, sdLine);
+
+        // Pending uploads
+        if (g_filesQueued > 0) {
+            char pendLine[22];
+            char qStr[10];
+            _fmtSize(qStr, sizeof(qStr), g_mbQueued);
+            snprintf(pendLine, sizeof(pendLine), "%u file(s) %s queued", g_filesQueued, qStr);
+            int pW = strlen(pendLine) * 6;
+            oled_text((128 - pW) / 2, 34, pendLine);
+        }
+
+        // Device ID
+        if (g_deviceId[0]) {
+            char idLine[22];
+            snprintf(idLine, sizeof(idLine), "ID:%s", g_deviceId);
+            int idW = strlen(idLine) * 6;
+            oled_text((128 - idW) / 2, 48, idLine);
+        }
+
+        oled_flush();
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+    g_splashActive = false;
+    log_write("Boot: SD=%.1f/%.1fMB queued=%u heap=%lu",
+              g_sdUsedMb, g_sdTotalMb, g_filesQueued,
+              (unsigned long)esp_get_free_heap_size());
 
     ESP_LOGI(TAG, "app_main done — free heap: %lu, min: %lu",
              (unsigned long)esp_get_free_heap_size(),
