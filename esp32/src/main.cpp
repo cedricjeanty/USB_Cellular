@@ -2265,24 +2265,70 @@ static void modemTask(void* param) {
         }
     }
 
-    // Flush + sync with AT
+    // Flush + sync with AT.
+    // Modem may be at non-default baud/flow-control from previous session
+    // (AT+IPR and AT+IFC persist in SIM7600 NVRAM across power cycles).
     uart_flush(UART_NUM_1);
     vTaskDelay(pdMS_TO_TICKS(500));
 
     char resp[512];
-    for (int i = 0; i < 5; i++) {
-        int len = modem_at_cmd("AT", resp, sizeof(resp), 2000);
-        if (len > 0 && strstr(resp, "OK")) {
-            cdc_printf("Modem: AT sync OK\r\n");
-            log_write("Modem: AT sync OK");
-            ready = true;
-            break;
+    {
+        // Enable HW flow control (modem may have AT+IFC=2,2 persisted)
+        uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
+                     PIN_MODEM_RTS, PIN_MODEM_CTS);
+        uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_CTS_RTS, 122);
+
+        const int tryBauds[] = { 115200, 3000000, 921600, 460800 };
+        for (int b = 0; b < 4 && !ready; b++) {
+            uart_set_baudrate(UART_NUM_1, tryBauds[b]);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            uart_flush(UART_NUM_1);
+
+            // Try +++ escape first (modem may be in PPP data mode from previous session).
+            // The +++ needs 1s silence before and after — don't send AT before it.
+            vTaskDelay(pdMS_TO_TICKS(1200));
+            uart_write_bytes(UART_NUM_1, "+++", 3);
+            vTaskDelay(pdMS_TO_TICKS(1200));
+            uart_read_bytes(UART_NUM_1, (uint8_t*)resp, sizeof(resp) - 1, pdMS_TO_TICKS(500));
+            // Now try AT (modem should be in command mode, either from +++ or was already)
+            int len = modem_at_cmd("AT", resp, sizeof(resp), 500);
+            if (len > 0 && strstr(resp, "OK")) {
+                cdc_printf("Modem: found at %d (fc)\r\n", tryBauds[b]);
+                modem_at_cmd("AT+IFC=0,0", resp, sizeof(resp), 1000);
+                if (tryBauds[b] != 115200)
+                    modem_at_cmd("AT+IPR=115200", resp, sizeof(resp), 1000);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                ready = true;
+            }
         }
-        cdc_printf("Modem: AT sync attempt %d: [%s]\r\n", i + 1, resp);
+
+        // Reset ESP32 UART to 115200, no flow control for clean start
+        uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_DISABLE, 0);
+        uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
+                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+        uart_set_baudrate(UART_NUM_1, 115200);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        uart_flush(UART_NUM_1);
+
+        // Final fallback: try 115200 without flow control
+        if (!ready) {
+            for (int i = 0; i < 5 && !ready; i++) {
+                if (modem_at_cmd("AT", resp, sizeof(resp), 2000) > 0 && strstr(resp, "OK")) {
+                    ready = true;
+                }
+                cdc_printf("Modem: AT sync attempt %d\r\n", i + 1);
+            }
+        }
+    }
+
+    if (ready) {
+        cdc_printf("Modem: AT sync OK\r\n");
+        log_write("Modem: AT sync OK");
     }
 
     if (!ready) {
         cdc_printf("Modem: AT sync failed, task exiting\r\n");
+        log_write("Modem: AT sync failed");
         uart_driver_delete(UART_NUM_1);
         g_modem_task = nullptr;
         vTaskDelete(nullptr);
