@@ -363,6 +363,12 @@ static TaskHandle_t g_upload_task  = nullptr;
 static TaskHandle_t g_harvest_task = nullptr;
 static uint32_t     g_card_sectors = 0;
 
+// Cap USB-visible capacity at 8 GB (aircraft expects 4-16 GB FAT32 drive)
+#define MSC_MAX_SECTORS  ((uint32_t)(8ULL * 1024 * 1024 * 1024 / 512))  // 16,777,216
+static uint32_t msc_visible_sectors() {
+    return g_card_sectors < MSC_MAX_SECTORS ? g_card_sectors : MSC_MAX_SECTORS;
+}
+
 // Deferred harvest log
 static char g_harvest_log[512] = "";
 static char g_sd_error[128] = "";  // persists SD init errors for STATUS display
@@ -437,14 +443,20 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8],
     memcpy(vendor_id, "AirBridg", 8);
     memcpy(product_id, "SD Storage      ", 16);
     memcpy(product_rev, "1.0 ", 4);
+    log_write("SCSI: INQUIRY");
 }
 
+static uint32_t g_tur_count = 0;
 bool tud_msc_test_unit_ready_cb(uint8_t lun) {
     (void)lun;
+    g_tur_count++;
+    // Log first TUR and any failures (TUR is polled frequently so don't log every one)
+    if (g_tur_count == 1) log_write("SCSI: first TEST_UNIT_READY");
     // Only report not-ready for real eject or SD failure — NOT during harvest.
     // Reporting not-ready during harvest causes the host to see media removal,
     // which marks the filesystem dirty and breaks drag-and-drop in file managers.
     if (g_msc_ejected || !g_sd_ready) {
+        if (g_tur_count <= 3) log_write("SCSI: TUR not-ready (ejected=%d sd=%d)", g_msc_ejected, g_sd_ready);
         tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
         return false;
     }
@@ -453,13 +465,18 @@ bool tud_msc_test_unit_ready_cb(uint8_t lun) {
 
 void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_size) {
     (void)lun;
-    *block_count = g_card_sectors;
+    *block_count = msc_visible_sectors();
     *block_size  = 512;
+    log_write("SCSI: READ_CAPACITY %lu sectors (real=%lu)", (unsigned long)*block_count, (unsigned long)g_card_sectors);
 }
 
+static uint32_t g_read10_count = 0;
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                            void *buffer, uint32_t bufsize) {
     (void)lun; (void)offset;
+    g_read10_count++;
+    if (g_read10_count == 1) log_write("SCSI: first READ10 lba=%lu len=%lu", (unsigned long)lba, (unsigned long)bufsize);
+    if (lba + bufsize / 512 > msc_visible_sectors()) return -1;
     if (!g_sd_ready || g_harvesting || g_msc_ejected) return -1;
     if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return -1;
     esp_err_t err = sdmmc_read_sectors(g_card, buffer, lba, bufsize / 512);
@@ -474,6 +491,8 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                             uint8_t *buffer, uint32_t bufsize) {
     (void)lun; (void)offset;
     g_msc_write_calls++;
+    if (g_msc_write_calls == 1) log_write("SCSI: first WRITE10 lba=%lu len=%lu", (unsigned long)lba, (unsigned long)bufsize);
+    if (lba + bufsize / 512 > msc_visible_sectors()) { g_msc_write_reject++; return -1; }
     if (!g_sd_ready || g_harvesting || g_msc_ejected) { g_msc_write_reject++; return -1; }
     if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return -1;
     esp_err_t err = sdmmc_write_sectors(g_card, buffer, lba, bufsize / 512);
@@ -488,28 +507,31 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
     return (err == ESP_OK) ? (int32_t)bufsize : -1;
 }
 
-// TinyUSB handles TEST_UNIT_READY, START_STOP, READ_CAPACITY, INQUIRY, MODE_SENSE
-// as built-in commands. tud_msc_scsi_cb is only for non-built-in SCSI commands.
+// TinyUSB handles TEST_UNIT_READY, START_STOP, READ_CAPACITY, INQUIRY, MODE_SENSE(6)
+// as built-in commands. tud_msc_scsi_cb handles the rest (including MODE_SENSE(10)).
 int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16],
                          void *buffer, uint16_t bufsize) {
     (void)lun;
 
     switch (scsi_cmd[0]) {
         case 0x1E:  // PREVENT ALLOW MEDIUM REMOVAL
+            log_write("SCSI: PREVENT_ALLOW_MEDIUM_REMOVAL");
             tud_msc_set_sense(lun, 0, 0, 0);
             return 0;
 
         case 0x35:  // SYNCHRONIZE CACHE (host flushes write cache)
+            log_write("SCSI: SYNCHRONIZE_CACHE");
             tud_msc_set_sense(lun, 0, 0, 0);
             return 0;
 
         case 0x23: { // READ FORMAT CAPACITIES
+            log_write("SCSI: READ_FORMAT_CAPACITIES");
             uint8_t* p = (uint8_t*)buffer;
             if (bufsize >= 12) {
                 memset(p, 0, 12);
                 p[3] = 8;  // capacity list length
-                // Current capacity
-                uint32_t sectors = g_card_sectors;
+                // Current capacity (capped for avionics compatibility)
+                uint32_t sectors = msc_visible_sectors();
                 p[4] = (sectors >> 24) & 0xFF;
                 p[5] = (sectors >> 16) & 0xFF;
                 p[6] = (sectors >>  8) & 0xFF;
@@ -520,6 +542,25 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16],
                 p[11] = 0x00;
                 tud_msc_set_sense(lun, 0, 0, 0);
                 return 12;
+            }
+            tud_msc_set_sense(lun, 0, 0, 0);
+            return 0;
+        }
+
+        case 0x5A: { // MODE SENSE(10) — not handled by TinyUSB (only 0x1A/6-byte is)
+            log_write("SCSI: MODE_SENSE_10 page=0x%02X", scsi_cmd[2] & 0x3F);
+            // Return 8-byte header: not write-protected, no block descriptors, no mode pages
+            if (bufsize >= 8) {
+                uint8_t* p = (uint8_t*)buffer;
+                memset(p, 0, 8);
+                p[0] = 0;  // Mode data length MSB
+                p[1] = 6;  // Mode data length LSB (6 bytes follow)
+                // p[2] = 0: medium type (default)
+                // p[3] = 0: device-specific parameter (bit7=0 = not write-protected)
+                // p[4..5] = 0: reserved
+                // p[6..7] = 0: block descriptor length (none)
+                tud_msc_set_sense(lun, 0, 0, 0);
+                return 8;
             }
             tud_msc_set_sense(lun, 0, 0, 0);
             return 0;
@@ -3104,12 +3145,12 @@ static void processCLI(const char* cmd) {
     } else if (strcmp(cmd, "STATUS") == 0) {
         char ipStr[20] = "disconnected";
         if (g_netConnected) wifi_get_ip_str(ipStr, sizeof(ipStr));
-        cdc_printf("CLI: wifi=%s ap=%s files_q=%u files_up=%u mbq=%.2f mbup=%.2f sd=%s fatfs=%s sectors=%lu\r\n",
+        cdc_printf("CLI: wifi=%s ap=%s files_q=%u files_up=%u mbq=%.2f mbup=%.2f sd=%s fatfs=%s sectors=%lu usb_visible=%lu\r\n",
             ipStr, g_apMode ? "yes" : "no",
             g_filesQueued, g_filesUploaded,
             g_mbQueued, g_mbUploaded,
             g_sd_ready ? "ok" : "FAIL", g_fatfs_mounted ? "ok" : "FAIL",
-            (unsigned long)g_card_sectors);
+            (unsigned long)g_card_sectors, (unsigned long)msc_visible_sectors());
         if (g_lastUploadKBps > 0) cdc_printf("CLI: last_upload=%.0f KB/s\r\n", g_lastUploadKBps);
         cdc_printf("CLI: wr_det=%d wr_mb=%.2f host_was=%d last_wr=%lu cool=%lu\r\n",
             g_writeDetected, g_hostWrittenMb, g_hostWasConnected,
@@ -3144,32 +3185,89 @@ static void processCLI(const char* cmd) {
         }
 
     } else if (strcmp(cmd, "FORMAT") == 0) {
-        cdc_printf("CLI: formatting SD card — ALL DATA WILL BE LOST\r\n");
+        cdc_printf("CLI: formatting SD as 8GB FAT32 — ALL DATA WILL BE LOST\r\n");
         g_harvesting = true;
         g_msc_ejected = true;
         vTaskDelay(pdMS_TO_TICKS(500));
 
         xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-        // Unmount FATFS, format via mkfs, remount
+        // Unmount FATFS fully
         if (g_fatfs_mounted) {
             esp_vfs_fat_sdcard_unmount(SD_MOUNT, g_card);
             g_fatfs_mounted = false;
         }
-        // Re-init card
-        sdmmc_card_init(&g_sd_host, g_card);
-        // Format and mount
-        esp_vfs_fat_mount_config_t mount_cfg = {};
-        mount_cfg.format_if_mount_failed = false;
-        mount_cfg.max_files = 5;
-        esp_err_t ret = esp_vfs_fat_sdspi_mount(SD_MOUNT, &g_sd_host,
-                                                  &g_slot_config, &mount_cfg, &g_card);
-        if (ret == ESP_OK) {
-            g_fatfs_mounted = true;
+
+        // Re-init SPI device + card for raw access
+        int card_handle = -1;
+        sdspi_host_init_device(&g_slot_config, &card_handle);
+        g_sd_host.slot = card_handle;
+        g_card = (sdmmc_card_t *)calloc(1, sizeof(sdmmc_card_t));
+        bool fmt_ok = false;
+        if (g_card && sdmmc_card_init(&g_sd_host, g_card) == ESP_OK) {
             g_card_sectors = g_card->csd.capacity;
-            g_sd_ready = true;
-            cdc_printf("CLI: format OK\r\n");
-        } else {
-            cdc_printf("CLI: format FAILED\r\n");
+
+            // Register diskio so f_fdisk/f_mkfs can access the card
+            BYTE pdrv = 0xFF;
+            ff_diskio_get_drive(&pdrv);
+            if (pdrv != 0xFF) {
+                ff_diskio_register_sdmmc(pdrv, g_card);
+                char drv[3] = {(char)('0' + pdrv), ':', 0};
+
+                // Partition: cap at 8 GB for avionics compatibility
+                // f_fdisk plist values: percentage (1-100) or absolute sector count (>100)
+                uint32_t fmt_sectors = msc_visible_sectors();
+                cdc_printf("CLI: fdisk %lu sectors (%.1f GB of %.1f GB card)\r\n",
+                           (unsigned long)fmt_sectors,
+                           fmt_sectors * 512.0 / 1e9,
+                           g_card_sectors * 512.0 / 1e9);
+
+                LBA_t plist[] = {(LBA_t)fmt_sectors, 0, 0, 0};
+                void *work = malloc(4096);
+                if (work) {
+                    FRESULT fr = f_fdisk(pdrv, plist, work);
+                    if (fr == FR_OK) {
+                        cdc_printf("CLI: fdisk OK, formatting FAT32...\r\n");
+                        MKFS_PARM opt = {};
+                        opt.fmt = FM_FAT32;
+                        opt.n_fat = 2;
+                        opt.au_size = 16 * 1024;
+                        fr = f_mkfs(drv, &opt, work, 4096);
+                        if (fr == FR_OK) {
+                            cdc_printf("CLI: mkfs OK\r\n");
+                            fmt_ok = true;
+                        } else {
+                            cdc_printf("CLI: mkfs FAILED (%d)\r\n", fr);
+                        }
+                    } else {
+                        cdc_printf("CLI: fdisk FAILED (%d)\r\n", fr);
+                    }
+                    free(work);
+                }
+                ff_diskio_unregister(pdrv);
+            }
+            // Clean up raw SPI device so sdspi_mount can re-add it
+            sdspi_host_remove_device(card_handle);
+            free(g_card); g_card = nullptr;
+        }
+
+        // Remount via standard path
+        if (fmt_ok) {
+            esp_vfs_fat_mount_config_t mount_cfg = {};
+            mount_cfg.format_if_mount_failed = false;
+            mount_cfg.max_files = 5;
+            mount_cfg.allocation_unit_size = 16 * 1024;
+            esp_err_t ret = esp_vfs_fat_sdspi_mount(SD_MOUNT, &g_sd_host,
+                                                      &g_slot_config, &mount_cfg, &g_card);
+            if (ret == ESP_OK) {
+                g_fatfs_mounted = true;
+                g_card_sectors = g_card->csd.capacity;
+                g_sd_ready = true;
+                // Create harvested directory
+                mkdir("/sdcard/harvested", 0775);
+                cdc_printf("CLI: format complete, 8GB FAT32 ready\r\n");
+            } else {
+                cdc_printf("CLI: remount FAILED: %s\r\n", esp_err_to_name(ret));
+            }
         }
         xSemaphoreGive(g_sd_mutex);
 
@@ -3462,7 +3560,9 @@ extern "C" void app_main(void) {
 
         if (g_card_sectors > 0) {
             g_sd_ready = true;
-            ESP_LOGI(TAG, "MSC ready: %lu sectors (%.0f MB)",
+            uint32_t vis = msc_visible_sectors();
+            ESP_LOGI(TAG, "MSC ready: %lu visible sectors (%.0f MB), card=%lu sectors (%.0f MB)",
+                     (unsigned long)vis, vis * 512.0f / 1e6f,
                      (unsigned long)g_card_sectors, g_sdTotalMb);
             disp("USB drive ready", "");
         } else {
