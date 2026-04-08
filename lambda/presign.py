@@ -90,6 +90,30 @@ def handler(event, context):
             )
             return respond(200, {"url": url})
 
+    elif path == "/firmware" and method == "GET":
+        # Return latest firmware version metadata
+        try:
+            meta = s3.get_object(Bucket=BUCKET, Key="firmware/latest.json")
+            info = json.loads(meta["Body"].read())
+            return respond(200, info)
+        except Exception as e:
+            err = str(e)
+            if "NoSuchKey" in err or "404" in err or "AccessDenied" in err:
+                return respond(404, {"error": "no firmware available"})
+            return respond(500, {"error": err})
+
+    elif path == "/firmware/download" and method == "GET":
+        # Return pre-signed GET URL for firmware binary
+        try:
+            url = s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": BUCKET, "Key": "firmware/latest.bin"},
+                ExpiresIn=URL_EXPIRY,
+            )
+            return respond(200, {"url": url})
+        except Exception as e:
+            return respond(500, {"error": str(e)})
+
     elif path == "/complete" and method == "POST":
         body = json.loads(event.get("body", "{}"))
         upload_id = body.get("upload_id", "")

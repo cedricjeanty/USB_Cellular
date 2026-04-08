@@ -4,6 +4,8 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
+#define FW_VERSION "3.3.0"
+
 #include <cstring>
 #include <ctime>
 #include <cstdio>
@@ -51,8 +53,15 @@
 #include "esp_netif.h"
 #include "lwip/netif.h"
 #include "esp_netif_net_stack.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 
 static const char *TAG = "airbridge";
+
+// ── MSC-only mode (no CDC) ──────────────────────────────────────────────────
+// Default: MSC-only for avionics compatibility. Set via CLI: SETMODE CDC / SETMODE MSC
+// Persists in NVS. CDC mode gives serial console for debugging + config.
+static bool g_msc_only = false;  // default CDC+MSC until SETMODE MSC is run
 
 // ── Utility: millis() equivalent ─────────────────────────────────────────────
 static inline uint32_t millis() {
@@ -331,7 +340,7 @@ static SemaphoreHandle_t g_sd_mutex = nullptr;
 static volatile bool     g_sd_ready = false;
 
 // ── Harvest timing ──────────────────────────────────────────────────────────
-#define QUIET_WINDOW_MS     30000UL
+#define QUIET_WINDOW_MS     15000UL
 #define DISPLAY_INTERVAL_MS  1000UL
 
 static volatile bool     g_hostConnected    = false;
@@ -351,7 +360,9 @@ static float    g_lastUploadKBps = 0.0f;  // speed of last upload for STATUS dis
 static float    g_sdTotalMb      = 0.0f;
 static float    g_sdUsedMb       = 0.0f; // updated periodically for display
 static volatile bool g_splashActive = true; // hold splash screen on boot
+static volatile bool g_otaActive    = false; // suppress display during OTA download
 static float    g_uploadingMb    = 0.0f; // live progress of current file upload
+static volatile bool g_tlsActive = false; // suppress +++ escape during TLS
 static float    g_uploadBaseMb   = 0.0f; // base offset for multipart (completed parts)
 static float    g_usbWriteKBps   = 0.0f; // live USB write speed for display
 static float    g_uploadKBps     = 0.0f; // live upload speed for display
@@ -501,7 +512,7 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
         g_lastWriteMs      = millis();
         g_lastIoMs         = g_lastWriteMs;
         g_writeDetected    = true;
-        g_hostWasConnected = true;
+        g_hostWasConnected = true;  // any write proves a host is connected
         g_hostWrittenMb   += bufsize / 1e6f;
     }
     return (err == ESP_OK) ? (int32_t)bufsize : -1;
@@ -632,6 +643,7 @@ void cdc_rx_callback(int itf, cdcacm_event_t *event) {
 // Wrapper to print to USB CDC (similar to Serial.print)
 static void cdc_printf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void cdc_printf(const char* fmt, ...) {
+    if (g_msc_only) return;
     char buf[256];
     va_list args;
     va_start(args, fmt);
@@ -943,12 +955,23 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
+static bool g_wifiStarted = false;
+
 static void wifi_init() {
     g_wifi_events = xEventGroupCreate();
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    // Register IP event handler early (needed for PPP too)
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                wifi_event_handler, nullptr));
+    // Defer esp_wifi_init/start to save ~37KB heap for TLS
+    // WiFi is started on-demand by wifi_start_deferred() when needed
+}
+
+static void wifi_start_deferred() {
+    if (g_wifiStarted) return;
     g_sta_netif = esp_netif_create_default_wifi_sta();
     g_ap_netif  = esp_netif_create_default_wifi_ap();
 
@@ -957,12 +980,12 @@ static void wifi_init() {
 
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                                 wifi_event_handler, nullptr));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                                wifi_event_handler, nullptr));
 
-    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));  // we manage NVS ourselves
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+    g_wifiStarted = true;
+    ESP_LOGI(TAG, "WiFi started (heap=%lu)", (unsigned long)esp_get_free_heap_size());
 }
 
 // ── WiFi helpers ────────────────────────────────────────────────────────────
@@ -1389,7 +1412,19 @@ static void stopAP() {
 // ── WiFi task — mirrors Pi upload_worker WiFi/portal state machine ──────────
 static void wifiTask(void* param) {
     (void)param;
-    vTaskDelay(pdMS_TO_TICKS(2000));  // let USB/SD settle
+    // Don't start WiFi if cellular PPP is available — saves ~37KB heap for TLS.
+    // Only start WiFi as fallback when there's no cellular.
+    for (int i = 0; i < 120; i++) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (g_pppConnected) {
+            // Cellular is up — skip WiFi entirely to preserve heap
+            ESP_LOGI(TAG, "WiFi: skipped — cellular PPP active (heap=%lu)",
+                     (unsigned long)esp_get_free_heap_size());
+            for (;;) vTaskDelay(pdMS_TO_TICKS(60000)); // sleep forever
+        }
+    }
+    // No cellular after 2 min — start WiFi as fallback
+    wifi_start_deferred();
 
     enum WState { WS_TRY_KNOWN, WS_CONNECTED, WS_AP };
     WState   state     = WS_TRY_KNOWN;
@@ -1501,18 +1536,21 @@ static void updateDisplay() {
     {
         char label[18];
         int bars = 0;
-        if (g_pppConnected) {
-            // Cellular: show operator name + CSQ-based bars
+        if (g_pppConnected && g_modemRssi > 0) {
+            // Cellular data active + signal present
             if (g_modemOp[0]) strlcpy(label, g_modemOp, sizeof(label));
             else              strlcpy(label, "Cellular", sizeof(label));
             // CSQ 0-31: 0-9=1bar, 10-14=2, 15-19=3, 20+=4
             if      (g_modemRssi >= 20) bars = 4;
             else if (g_modemRssi >= 15) bars = 3;
             else if (g_modemRssi >= 10) bars = 2;
-            else if (g_modemRssi >   0) bars = 1;
+            else                        bars = 1;
         } else if (g_netConnected) {
             strlcpy(label, g_wifiLabel, sizeof(label));
             bars = g_wifiBars;
+        } else if (g_pppConnected) {
+            // PPP up but signal lost
+            strlcpy(label, "No Signal", sizeof(label));
         } else if (g_modemReady) {
             strlcpy(label, "Connecting...", sizeof(label));
         } else {
@@ -1520,10 +1558,10 @@ static void updateDisplay() {
         }
         oled_text(0, 0, label);
 
+        // Solid bars only (no outlines for inactive bars)
         const int8_t xs[4] = {108,113,118,123}, hs[4] = {2,4,6,8};
-        for (int i = 0; i < 4; i++) {
-            if (i < bars) oled_rect(xs[i], 8-hs[i], 3, hs[i], true);
-            else          oled_rect(xs[i], 8-hs[i], 3, hs[i], false);
+        for (int i = 0; i < bars; i++) {
+            oled_rect(xs[i], 8-hs[i], 3, hs[i], true);
         }
     }
     oled_hline(0, 127, 9);
@@ -1595,8 +1633,8 @@ static void updateDisplay() {
         static float etaKBps = 0;
         if (g_uploadKBps > 0.5f)
             etaKBps = etaKBps * 0.8f + g_uploadKBps * 0.2f;
-        else if (etaKBps < 1.0f)
-            etaKBps = 0;
+        else
+            etaKBps = 0;  // clear immediately when not uploading
 
         if (etaKBps > 0.5f && remaining > 0.001f) {
             int etaSec = (int)(remaining * 1024.0f / etaKBps);
@@ -1715,14 +1753,23 @@ done_headers:
 }
 
 // Connect TLS to host:443, returns esp_tls handle or nullptr.
+// Wrapper: destroy TLS connection and clear the +++ suppression flag
+static void tls_destroy(esp_tls_t* tls) {
+    esp_tls_conn_destroy(tls);
+    g_tlsActive = false;
+}
+
 static esp_tls_t* tls_connect(const char* host) {
     esp_tls_cfg_t cfg = {};
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;  // use built-in Mozilla CA bundle
-    cfg.timeout_ms = 10000;
+    cfg.skip_common_name = true;
+    cfg.use_global_ca_store = false;
+    cfg.crt_bundle_attach = nullptr;
+    cfg.timeout_ms = 30000;
 
     esp_tls_t *tls = esp_tls_init();
     if (!tls) return nullptr;
 
+    g_tlsActive = true;
     int ret = esp_tls_conn_new_sync(host, strlen(host), 443, &cfg, tls);
     if (ret != 1) {
         int esp_err = 0, mbedtls_err = 0;
@@ -1731,9 +1778,11 @@ static esp_tls_t* tls_connect(const char* host) {
             esp_err = err_handle->last_error;
             mbedtls_err = err_handle->esp_tls_error_code;
         }
+        log_write("TLS fail: host=%s ret=%d esp=0x%x mbed=0x%x heap=%lu",
+                  host, ret, esp_err, mbedtls_err, (unsigned long)esp_get_free_heap_size());
         cdc_printf("TLS fail: host=%s ret=%d esp=0x%x mbed=0x%x heap=%lu\r\n",
                    host, ret, esp_err, mbedtls_err, (unsigned long)esp_get_free_heap_size());
-        esp_tls_conn_destroy(tls);
+        tls_destroy(tls);
         return nullptr;
     }
     return tls;
@@ -1859,11 +1908,11 @@ static std::string s3ApiGet(const char* queryParams) {
         "Connection: close\r\n\r\n",
         queryParams, g_apiHost, g_apiKey);
     if (!tls_write_all(tls, req, rlen)) {
-        esp_tls_conn_destroy(tls);
+        tls_destroy(tls);
         return "";
     }
     std::string resp = httpReadResponse(tls);
-    esp_tls_conn_destroy(tls);
+    tls_destroy(tls);
     return resp;
 }
 
@@ -1892,21 +1941,340 @@ static bool s3ApiComplete(const char* uploadId, const char* key,
         g_apiHost, g_apiKey, bodyLen);
 
     if (!tls_write_all(tls, hdr, hlen) || !tls_write_all(tls, body, bodyLen)) {
-        esp_tls_conn_destroy(tls);
+        tls_destroy(tls);
         return false;
     }
 
     std::string resp = httpReadResponse(tls);
-    esp_tls_conn_destroy(tls);
+    tls_destroy(tls);
     bool ok = resp.find("\"ok\"") != std::string::npos;
     if (!ok) cdc_printf("S3: complete failed: %.200s", resp.c_str());
     return ok;
+}
+
+// ── OTA firmware update ─────────────────────────────────────────────────────
+
+static bool versionNewer(const char* available, const char* current) {
+    int av[3] = {0,0,0}, cv[3] = {0,0,0};
+    sscanf(available, "%d.%d.%d", &av[0], &av[1], &av[2]);
+    sscanf(current,   "%d.%d.%d", &cv[0], &cv[1], &cv[2]);
+    for (int i = 0; i < 3; i++) {
+        if (av[i] > cv[i]) return true;
+        if (av[i] < cv[i]) return false;
+    }
+    return false;
+}
+
+static char g_otaTargetVer[16] = "";
+
+static void otaDisplayProgress(int pct, uint32_t received, uint32_t total) {
+    oled_clear();
+    oled_text(14, 0, "AirBridge", 2);
+    oled_hline(0, 127, 20);
+    char title[24];
+    if (g_otaTargetVer[0])
+        snprintf(title, sizeof(title), "OTA v%s", g_otaTargetVer);
+    else
+        strlcpy(title, "OTA Update", sizeof(title));
+    int tw = oled_text_width(title);
+    oled_text((128 - tw) / 2, 24, title);
+    // Progress bar: 108px wide at y=38
+    oled_rect(10, 38, 108, 10, false);
+    int fillW = (pct * 106) / 100;
+    if (fillW > 0) oled_rect(11, 39, fillW, 8, true);
+    char line[28];
+    snprintf(line, sizeof(line), "%d%%  %.0fKB/%.0fKB", pct,
+             received / 1024.0f, total / 1024.0f);
+    int w = oled_text_width(line);
+    oled_text((128 - w) / 2, 52, line);
+    oled_flush();
+}
+
+static bool otaDownloadAndFlash(const char* host, const char* path, uint32_t expectedSize) {
+    esp_tls_t* tls = tls_connect(host);
+    if (!tls) { log_write("OTA: TLS connect failed to %s", host); return false; }
+
+    static char req[3072];
+    int rlen = snprintf(req, sizeof(req),
+        "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
+        path, host);
+    if (!tls_write_all(tls, req, rlen)) {
+        tls_destroy(tls);
+        return false;
+    }
+
+    // Read HTTP headers
+    char hdr_buf[2048];
+    int hdr_len = 0;
+    uint32_t contentLength = 0;
+    bool header_done = false;
+    uint32_t t0 = millis();
+    while (!header_done && millis() - t0 < 15000 && hdr_len < (int)sizeof(hdr_buf) - 1) {
+        int r = esp_tls_conn_read(tls, hdr_buf + hdr_len, 1);
+        if (r > 0) {
+            hdr_len += r;
+            hdr_buf[hdr_len] = '\0';
+            if (strstr(hdr_buf, "\r\n\r\n")) header_done = true;
+            t0 = millis();
+        } else if (r == ESP_TLS_ERR_SSL_WANT_READ) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        } else break;
+    }
+    if (!header_done) {
+        log_write("OTA: header read timeout");
+        tls_destroy(tls);
+        return false;
+    }
+
+    // Check for HTTP 200
+    if (!strstr(hdr_buf, "200")) {
+        log_write("OTA: HTTP error: %.80s", hdr_buf);
+        tls_destroy(tls);
+        return false;
+    }
+
+    // Extract Content-Length
+    const char* cl = strcasestr(hdr_buf, "content-length:");
+    if (cl) contentLength = strtoul(cl + 15, nullptr, 10);
+    if (contentLength == 0) contentLength = expectedSize;
+    log_write("OTA: downloading %lu bytes", (unsigned long)contentLength);
+
+    // Check if any body bytes were read past the header boundary
+    const char* body_start = strstr(hdr_buf, "\r\n\r\n") + 4;
+    int leftover = hdr_len - (body_start - hdr_buf);
+
+    // Find next OTA partition
+    const esp_partition_t* update_part = esp_ota_get_next_update_partition(NULL);
+    if (!update_part) {
+        log_write("OTA: no update partition found");
+        tls_destroy(tls);
+        return false;
+    }
+    log_write("OTA: target partition '%s' offset=0x%lx size=0x%lx",
+              update_part->label, (unsigned long)update_part->address,
+              (unsigned long)update_part->size);
+
+    esp_ota_handle_t ota_handle;
+    esp_err_t err = esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
+    if (err != ESP_OK) {
+        log_write("OTA: esp_ota_begin failed: %s", esp_err_to_name(err));
+        tls_destroy(tls);
+        return false;
+    }
+
+    // Write any leftover body bytes from header read
+    uint32_t received = 0;
+    if (leftover > 0) {
+        err = esp_ota_write(ota_handle, body_start, leftover);
+        if (err != ESP_OK) { esp_ota_abort(ota_handle); tls_destroy(tls); return false; }
+        received = leftover;
+    }
+
+    // Stream remaining body
+    uint8_t buf[4096];
+    uint32_t lastDispMs = 0;
+    t0 = millis();
+    while (received < contentLength) {
+        int r = esp_tls_conn_read(tls, buf, sizeof(buf));
+        if (r > 0) {
+            err = esp_ota_write(ota_handle, buf, r);
+            if (err != ESP_OK) {
+                log_write("OTA: write failed at %lu: %s", (unsigned long)received, esp_err_to_name(err));
+                esp_ota_abort(ota_handle);
+                tls_destroy(tls);
+                return false;
+            }
+            received += r;
+            t0 = millis();
+            if (millis() - lastDispMs > 500) {
+                int pct = (received * 100) / contentLength;
+                otaDisplayProgress(pct, received, contentLength);
+                lastDispMs = millis();
+            }
+        } else if (r == 0) break;
+        else if (r == ESP_TLS_ERR_SSL_WANT_READ || r == ESP_TLS_ERR_SSL_WANT_WRITE) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            if (millis() - t0 > 120000) { log_write("OTA: read timeout at %lu", (unsigned long)received); break; }
+        }
+        else { log_write("OTA: read error %d at %lu", r, (unsigned long)received); break; }
+    }
+    tls_destroy(tls);
+
+    if (received < contentLength) {
+        log_write("OTA: incomplete download %lu/%lu", (unsigned long)received, (unsigned long)contentLength);
+        esp_ota_abort(ota_handle);
+        return false;
+    }
+
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) {
+        log_write("OTA: esp_ota_end failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    err = esp_ota_set_boot_partition(update_part);
+    if (err != ESP_OK) {
+        log_write("OTA: set_boot_partition failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    log_write("OTA: success — %lu bytes flashed to %s", (unsigned long)received, update_part->label);
+    otaDisplayProgress(100, received, contentLength);
+    return true;
+}
+
+// Basic connectivity diagnostic — DNS + TCP before TLS
+static void netDiag() {
+    cdc_printf("DIAG: heap=%lu\r\n", (unsigned long)esp_get_free_heap_size());
+
+    // DNS resolve
+    struct addrinfo hints = {}, *res = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    int err = getaddrinfo("httpbin.org", "80", &hints, &res);
+    if (err != 0 || !res) {
+        cdc_printf("DIAG: DNS FAILED err=%d\r\n", err);
+        log_write("DIAG: DNS FAILED err=%d", err);
+        return;
+    }
+    char ip[16];
+    inet_ntoa_r(((struct sockaddr_in*)res->ai_addr)->sin_addr, ip, sizeof(ip));
+    cdc_printf("DIAG: DNS OK httpbin.org -> %s\r\n", ip);
+    log_write("DIAG: DNS OK -> %s", ip);
+
+    // Raw TCP connect
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) { cdc_printf("DIAG: socket failed\r\n"); freeaddrinfo(res); return; }
+    struct timeval tv = { .tv_sec = 10 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    err = connect(sock, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
+    if (err != 0) {
+        cdc_printf("DIAG: TCP connect FAILED err=%d errno=%d\r\n", err, errno);
+        log_write("DIAG: TCP FAILED errno=%d", errno);
+        close(sock);
+        return;
+    }
+    cdc_printf("DIAG: TCP OK\r\n");
+
+    // Simple HTTP GET
+    const char* req = "GET /ip HTTP/1.1\r\nHost: httpbin.org\r\nConnection: close\r\n\r\n";
+    send(sock, req, strlen(req), 0);
+    char buf[512] = {};
+    int n = recv(sock, buf, sizeof(buf) - 1, 0);
+    close(sock);
+    if (n > 0) {
+        buf[n] = '\0';
+        cdc_printf("DIAG: HTTP %d bytes: %.120s\r\n", n, buf);
+        log_write("DIAG: HTTP OK %d bytes", n);
+    } else {
+        cdc_printf("DIAG: HTTP recv failed n=%d errno=%d\r\n", n, errno);
+        log_write("DIAG: HTTP recv failed n=%d", n);
+    }
+}
+
+static bool otaCheck() {
+    if (!g_netConnected && !g_pppConnected) return false;
+    if (!s3LoadCreds()) return false;
+    g_tlsActive = true;  // suppress +++ for entire OTA check
+
+    log_write("OTA: checking for update (fw=%s)", FW_VERSION);
+
+    // Step 1: GET /prod/firmware — check version
+    esp_tls_t* tls = tls_connect(g_apiHost);
+    if (!tls) { log_write("OTA: TLS connect failed"); return false; }
+    char req[512];
+    int rlen = snprintf(req, sizeof(req),
+        "GET /prod/firmware HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "x-api-key: %s\r\n"
+        "Connection: close\r\n\r\n",
+        g_apiHost, g_apiKey);
+    if (!tls_write_all(tls, req, rlen)) { tls_destroy(tls); return false; }
+    std::string verResp = httpReadResponse(tls);
+    tls_destroy(tls);
+
+    if (verResp.empty() || verResp.find("\"error\"") != std::string::npos) {
+        log_write("OTA: no firmware available");
+        return false;
+    }
+
+    std::string newVer = jsonStr(verResp, "version");
+    int fwSizeInt = jsonInt(verResp, "size");
+    uint32_t fwSize = (fwSizeInt > 0) ? (uint32_t)fwSizeInt : 0;
+
+    if (newVer.empty() || !versionNewer(newVer.c_str(), FW_VERSION)) {
+        log_write("OTA: up to date (remote=%s, local=%s)", newVer.c_str(), FW_VERSION);
+        return false;
+    }
+    log_write("OTA: update available %s -> %s (%lu bytes)", FW_VERSION, newVer.c_str(), (unsigned long)fwSize);
+
+    // Show on OLED
+    oled_clear();
+    oled_text(14, 0, "AirBridge", 2);
+    oled_hline(0, 127, 20);
+    char updLine[28];
+    snprintf(updLine, sizeof(updLine), "Update: v%s", newVer.c_str());
+    int uw = oled_text_width(updLine);
+    oled_text((128 - uw) / 2, 28, updLine);
+    oled_text(22, 44, "Downloading...");
+    oled_flush();
+    g_otaActive = true;
+    strlcpy(g_otaTargetVer, newVer.c_str(), sizeof(g_otaTargetVer));
+
+    // Step 2: GET /prod/firmware/download — get presigned URL
+    tls = tls_connect(g_apiHost);
+    if (!tls) { log_write("OTA: TLS connect failed (download)"); return false; }
+    rlen = snprintf(req, sizeof(req),
+        "GET /prod/firmware/download HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "x-api-key: %s\r\n"
+        "Connection: close\r\n\r\n",
+        g_apiHost, g_apiKey);
+    if (!tls_write_all(tls, req, rlen)) { tls_destroy(tls); return false; }
+    std::string dlResp = httpReadResponse(tls);
+    tls_destroy(tls);
+
+    std::string dlUrl = jsonStr(dlResp, "url");
+    if (dlUrl.empty()) { log_write("OTA: no download URL"); return false; }
+
+    // Parse S3 presigned URL
+    char s3Host[128];
+    static char s3Path[2500];
+    if (!parseUrl(dlUrl, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
+        log_write("OTA: bad URL (len=%d)", (int)dlUrl.length());
+        return false;
+    }
+    log_write("OTA: downloading from %s path_len=%d size=%lu", s3Host, (int)strlen(s3Path), (unsigned long)fwSize);
+
+    // Step 3: Download and flash
+    if (!otaDownloadAndFlash(s3Host, s3Path, fwSize)) {
+        log_write("OTA: download/flash failed");
+        disp("OTA FAILED", "");
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        g_otaActive = false;
+        return false;
+    }
+
+    // Stage update: mark pending + record version. Applied on next power cycle.
+    nvs_handle_t h;
+    if (nvs_open("ota", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, "ota_status", "pending");
+        nvs_commit(h);
+        nvs_close(h);
+    }
+
+    log_write("OTA: v%s downloaded — ready to apply", newVer.c_str());
+    g_otaActive = false;
+    return true;
 }
 
 // Upload a file from /sdcard/harvested/<name> to S3 using pre-signed URLs.
 static bool s3UploadFile(const char* name) {
     if (!g_netConnected && !g_pppConnected) { cdc_printf("S3: no network\r\n"); return false; }
     if (!s3LoadCreds()) return false;
+    g_tlsActive = true;  // suppress +++ for entire upload session
 
     char fpath[128];
     snprintf(fpath, sizeof(fpath), "%s/harvested/%s", SD_MOUNT, name);
@@ -1965,21 +2333,21 @@ static bool s3UploadFile(const char* name) {
             s3Path, s3Host, fileSize);
         if (!tls_write_all(tls, hdr, hlen)) {
             cdc_printf("S3: header send failed\r\n");
-            esp_tls_conn_destroy(tls);
+            tls_destroy(tls);
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
             return false;
         }
 
         if (!httpStreamChunk(tls, f, fileSize)) {
             cdc_printf("S3: stream failed\r\n");
-            esp_tls_conn_destroy(tls);
+            tls_destroy(tls);
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
             return false;
         }
         xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
 
         std::string putResp = httpReadResponse(tls);
-        esp_tls_conn_destroy(tls);
+        tls_destroy(tls);
         float elapsed = (millis() - xfrStart) / 1000.0f;
         g_lastUploadKBps = elapsed > 0 ? fileSize / 1024.0f / elapsed : 0;
         cdc_printf("S3: uploaded '%s' OK (%u bytes, %.0f KB/s)\r\n", name, fileSize, g_lastUploadKBps);
@@ -1993,17 +2361,27 @@ static bool s3UploadFile(const char* name) {
     uint32_t startPart = 1;
     uint32_t totalParts = 0;
 
-    // Check NVS for interrupted session
+    // Check NVS for interrupted session (with retry limit)
     {
         nvs_handle_t h;
-        if (nvs_open("s3up", NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_open("s3up", NVS_READWRITE, &h) == ESP_OK) {
             char storedName[64] = "";
             nvs_get_string(h, "name", storedName, sizeof(storedName));
             if (strcmp(storedName, name) == 0) {
-                nvs_get_string(h, "uid", uploadId, sizeof(uploadId));
-                nvs_get_string(h, "key", s3Key, sizeof(s3Key));
-                uint32_t p = 1; nvs_get_u32(h, "part", &p); startPart = p;
-                uint32_t tp = 0; nvs_get_u32(h, "parts", &tp); totalParts = tp;
+                uint32_t retries = 0;
+                nvs_get_u32(h, "retries", &retries);
+                if (retries >= 3) {
+                    // Too many resume failures — start fresh
+                    log_write("S3: stale session for %s (retries=%lu), clearing", name, (unsigned long)retries);
+                    nvs_erase_all(h); nvs_commit(h);
+                } else {
+                    nvs_get_string(h, "uid", uploadId, sizeof(uploadId));
+                    nvs_get_string(h, "key", s3Key, sizeof(s3Key));
+                    uint32_t p = 1; nvs_get_u32(h, "part", &p); startPart = p;
+                    uint32_t tp = 0; nvs_get_u32(h, "parts", &tp); totalParts = tp;
+                    nvs_set_u32(h, "retries", retries + 1);
+                    nvs_commit(h);
+                }
             }
             nvs_close(h);
         }
@@ -2099,14 +2477,14 @@ static bool s3UploadFile(const char* name) {
             "Connection: close\r\n\r\n",
             s3Path, s3Host, chunkSize);
         if (!tls_write_all(tls, hdr, hlen)) {
-            esp_tls_conn_destroy(tls);
+            tls_destroy(tls);
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
             return false;
         }
 
         if (!httpStreamChunk(tls, f, chunkSize)) {
             cdc_printf("S3: stream failed at part %u", partNum);
-            esp_tls_conn_destroy(tls);
+            tls_destroy(tls);
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
             return false;
         }
@@ -2116,7 +2494,7 @@ static bool s3UploadFile(const char* name) {
 
         char etag[64] = "";
         std::string putResp = httpReadResponse(tls, etag, sizeof(etag));
-        esp_tls_conn_destroy(tls);
+        tls_destroy(tls);
 
         if (!etag[0]) {
             cdc_printf("S3: no ETag for part %u, resp(%d): %.300s",
@@ -2133,6 +2511,7 @@ static bool s3UploadFile(const char* name) {
                 char etagKey[12]; snprintf(etagKey, sizeof(etagKey), "etag%u", partNum);
                 nvs_set_str(h, etagKey, etag);
                 nvs_set_u32(h, "part", partNum + 1);
+                nvs_set_u32(h, "retries", 0);
                 nvs_commit(h);
                 nvs_close(h);
             }
@@ -2655,101 +3034,56 @@ static void modemTask(void* param) {
         static uint32_t lastPppRxMs = 0;
         if (len > 0) lastPppRxMs = millis();
 
-        // ── Periodic RSSI refresh: escape PPP → AT+CSQ → resume PPP ─────
-        // 15s when idle, 60s during uploads (the +++ escape pauses PPP ~3s)
-        static uint32_t lastCsqMs = 0;
-        bool uploading = (g_filesQueued > 0 || g_uploadingMb > 0);
-        uint32_t csqInterval = uploading ? 60000 : 15000;
-        if (g_pppConnected && (millis() - lastCsqMs) > csqInterval) {
-            lastCsqMs = millis();
+        // Periodic +++ RSSI refresh removed — it disrupts PPP/TLS.
+        // RSSI is read during modem init. modemRssiCheck() available for safe gaps.
 
-            // Send +++ with 1s guard time to enter command mode
+        // ── Detect PPP connection loss and reconnect ─────────────────────
+        if (g_pppConnected && lastPppRxMs > 0 &&
+            (millis() - lastPppRxMs) > 60000) {
+            cdc_printf("Modem: no PPP data for 60s — reconnecting\r\n");
+            log_write("Modem: PPP stale — reconnecting");
+            g_pppConnected = false;
+            g_modemRssi = 0;
+
+            // Tear down PPP and redial
+            if (g_ppp_netif) {
+                esp_netif_action_disconnected(g_ppp_netif, nullptr, 0, nullptr);
+                vTaskDelay(pdMS_TO_TICKS(2000));
+            }
+
+            // Send +++ to exit data mode, then hangup and redial
             vTaskDelay(pdMS_TO_TICKS(1100));
             uart_write_bytes(UART_NUM_1, "+++", 3);
             vTaskDelay(pdMS_TO_TICKS(1100));
+            uart_flush(UART_NUM_1);
 
-            // Drain response (should be "OK")
-            char csqResp[128];
-            int drained = uart_read_bytes(UART_NUM_1, (uint8_t*)csqResp,
-                            sizeof(csqResp) - 1, pdMS_TO_TICKS(1000));
+            char resp[128];
+            modem_at_cmd("ATH", resp, sizeof(resp), 2000);  // hangup
+            vTaskDelay(pdMS_TO_TICKS(1000));
 
-            bool inCmdMode = false;
-            if (drained > 0) {
-                csqResp[drained] = '\0';
-                inCmdMode = (strstr(csqResp, "OK") != nullptr);
-            }
-
-            if (inCmdMode) {
-                // Retry time sync if we don't have it yet
-                if (g_bootEpoch == 0) {
-                    int clen = modem_at_cmd("AT+CCLK?", csqResp, sizeof(csqResp), 2000);
-                    if (clen > 0) {
-                        char* cq = strchr(csqResp, '"');
-                        if (cq) {
-                            int yy=0,mo=0,dd=0,hh=0,mi=0,ss=0;
-                            char tzs='+'; int tzv=0;
-                            sscanf(cq+1, "%d/%d/%d,%d:%d:%d", &yy,&mo,&dd,&hh,&mi,&ss);
-                            char* cq2 = strchr(cq+1, '"');
-                            if (cq2) sscanf(cq2+1, "%c%d", &tzs, &tzv);
-                            if (yy >= 24 && yy <= 50 && mo >= 1 && mo <= 12) {
-                                struct tm ctm = {};
-                                ctm.tm_year = yy+100; ctm.tm_mon = mo-1; ctm.tm_mday = dd;
-                                ctm.tm_hour = hh; ctm.tm_min = mi; ctm.tm_sec = ss;
-                                time_t ep = mktime(&ctm);
-                                int tzoff = tzv * 15 * 60;
-                                if (tzs == '-') tzoff = -tzoff;
-                                ep -= tzoff;
-                                g_bootEpoch = (uint32_t)ep;
-                                g_bootMs = millis();
-                                struct tm utc; gmtime_r(&ep, &utc);
-                                snprintf(g_logFileName, sizeof(g_logFileName),
-                                    "logs/%04lu_%04d%02d%02d_%02d%02d%02d.log",
-                                    (unsigned long)g_bootCount,
-                                    utc.tm_year+1900, utc.tm_mon+1, utc.tm_mday,
-                                    utc.tm_hour, utc.tm_min, utc.tm_sec);
-                                log_write("Time synced: 20%02d-%02d-%02d %02d:%02d:%02d", yy,mo,dd,hh,mi,ss);
-                                cdc_printf("Modem: time synced 20%02d-%02d-%02d\r\n", yy,mo,dd);
-                            }
-                        }
+            // Check registration
+            modem_at_cmd("AT+CREG?", resp, sizeof(resp), 2000);
+            if (strstr(resp, ",1") || strstr(resp, ",5")) {
+                // Registered — redial
+                cdc_printf("Modem: redialing PPP...\r\n");
+                uart_write_bytes(UART_NUM_1, "ATD*99#\r", 8);
+                int rd = uart_read_bytes(UART_NUM_1, (uint8_t*)resp,
+                            sizeof(resp) - 1, pdMS_TO_TICKS(10000));
+                if (rd > 0) {
+                    resp[rd] = '\0';
+                    if (strstr(resp, "CONNECT")) {
+                        lastPppRxMs = millis();
+                        cdc_printf("Modem: PPP reconnected\r\n");
+                        log_write("Modem: PPP reconnected");
+                    } else {
+                        cdc_printf("Modem: redial failed: %s\r\n", resp);
+                        log_write("Modem: redial failed");
                     }
-                }
-
-                int len2 = modem_at_cmd("AT+CSQ", csqResp, sizeof(csqResp), 2000);
-                if (len2 > 0) {
-                    char* p = strstr(csqResp, "+CSQ:");
-                    if (p) {
-                        int rssi = 99, ber = 99;
-                        sscanf(p, "+CSQ: %d,%d", &rssi, &ber);
-                        // Only log when RSSI changes
-                        if (rssi != g_modemRssi) {
-                            log_write("RSSI: %d -> %d", g_modemRssi, rssi);
-                        }
-                        g_modemRssi = rssi;
-                    }
-                }
-                // Return to data mode — verify CONNECT response
-                int ato_len = modem_at_cmd("ATO", csqResp, sizeof(csqResp), 3000);
-                if (ato_len <= 0 || !strstr(csqResp, "CONNECT")) {
-                    log_write("Modem: ATO failed — PPP may be broken: %s", csqResp);
-                    cdc_printf("Modem: ATO failed: %s\r\n", csqResp);
                 }
             } else {
-                log_write("Modem: +++ escape failed (no OK)");
-                cdc_printf("Modem: +++ escape failed\r\n");
-                // Don't set RSSI=0 here — the modem might still be in data mode
+                cdc_printf("Modem: not registered, will retry in 30s\r\n");
+                vTaskDelay(pdMS_TO_TICKS(30000));
             }
-            // Reset stale timer since we just paused the data pump intentionally
-            lastPppRxMs = millis();
-        }
-
-        // ── Detect PPP connection loss ───────────────────────────────────
-        // If no UART data for 3 minutes, consider connection lost.
-        if (g_pppConnected && lastPppRxMs > 0 &&
-            (millis() - lastPppRxMs) > 60000) {
-            cdc_printf("Modem: no PPP data for 60s — marking disconnected\r\n");
-            log_write("Modem: PPP stale — no data for 60s");
-            g_pppConnected = false;
-            g_modemRssi = 0;
         }
 
         // ── Opportunistic log upload via cellular ─────────────────────────
@@ -2761,6 +3095,7 @@ static void modemTask(void* param) {
         static uint32_t pppConnectMs = 0;
         if (g_pppConnected && pppConnectMs == 0) pppConnectMs = millis();
 
+        bool uploading = (g_filesQueued > 0 || g_uploadingMb > 0);
         uint32_t logInterval = uploading ? 0 : 60000;  // skip during uploads
         uint32_t sinceConnect = pppConnectMs ? (millis() - pppConnectMs) : 0;
         bool firstUpload = (lastLogUploadMs == 0 && sinceConnect > 30000);
@@ -2812,7 +3147,7 @@ static void modemTask(void* param) {
                 bool ok = tls_write_all(tls, hdr, hlen) &&
                           tls_write_all(tls, logSnap, snapLen);
                 if (ok) httpReadResponse(tls);
-                esp_tls_conn_destroy(tls);
+                tls_destroy(tls);
                 logUpRunning = false;
                 vTaskDelete(nullptr);
             }, "log_up", 8192, nullptr, 2, nullptr, 1);
@@ -2820,13 +3155,86 @@ static void modemTask(void* param) {
     }
 }
 
+// ── Modem RSSI check (callable from upload task between files) ──────────────
+// Escapes PPP → reads CSQ → returns to data mode. Takes ~3s. Safe to call
+// only when no TLS connection is active.
+static void modemRssiCheck() {
+    if (!g_pppConnected || g_tlsActive) return;
+
+    vTaskDelay(pdMS_TO_TICKS(1100));
+    uart_write_bytes(UART_NUM_1, "+++", 3);
+    vTaskDelay(pdMS_TO_TICKS(1100));
+
+    char resp[128];
+    int drained = uart_read_bytes(UART_NUM_1, (uint8_t*)resp,
+                    sizeof(resp) - 1, pdMS_TO_TICKS(1000));
+    bool inCmd = false;
+    if (drained > 0) { resp[drained] = '\0'; inCmd = (strstr(resp, "OK") != nullptr); }
+
+    if (inCmd) {
+        int len = modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000);
+        if (len > 0) {
+            char* p = strstr(resp, "+CSQ:");
+            if (p) {
+                int rssi = 99, ber = 99;
+                sscanf(p, "+CSQ: %d,%d", &rssi, &ber);
+                if (rssi != g_modemRssi) log_write("RSSI: %d -> %d", g_modemRssi, rssi);
+                g_modemRssi = rssi;
+            }
+        }
+        int ato_len = modem_at_cmd("ATO", resp, sizeof(resp), 3000);
+        if (ato_len <= 0 || !strstr(resp, "CONNECT")) {
+            log_write("Modem: ATO failed — PPP may be broken: %s", resp);
+            cdc_printf("Modem: ATO failed: %s\r\n", resp);
+        }
+    } else {
+        cdc_printf("Modem: +++ escape failed\r\n");
+    }
+}
+
 // ── Upload task ─────────────────────────────────────────────────────────────
 static void uploadTask(void* param) {
     (void)param;
-    // Wait for USB CDC to be ready so speed logs are visible
-    vTaskDelay(pdMS_TO_TICKS(8000));
+    static bool otaDone = false;
+
+    // Wait for network (up to 90s), then 2s settle for DNS/routing
+    for (int i = 0; i < 90 && !g_netConnected && !g_pppConnected; i++)
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // ── OTA check first (highest priority after network) ────────────
+    if (!otaDone && (g_netConnected || g_pppConnected)) {
+        otaDone = true;
+        bool staged = otaCheck();  // downloads firmware if available
+        g_tlsActive = false;
+
+        if (staged) {
+            // OTA downloaded — wait for host to finish writing to USB
+            // before rebooting to apply the update
+            log_write("OTA: waiting for host writes to settle before reboot");
+            cdc_printf("OTA: waiting for USB idle before reboot...\r\n");
+            disp("OTA Ready", "Wait for USB...");
+
+            // Wait until no USB writes for QUIET_WINDOW_MS, or max 5 min
+            uint32_t waitStart = millis();
+            while (millis() - waitStart < 300000) {
+                uint32_t lastWr = g_lastWriteMs;
+                if (lastWr == 0 || (millis() - lastWr) >= QUIET_WINDOW_MS) {
+                    break;  // no recent writes — safe to reboot
+                }
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+
+            log_write("OTA: rebooting to apply update");
+            disp("OTA Complete", "Rebooting...");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            esp_restart();
+        }
+    }
+
+    // ── Upload loop ─────────────────────────────────────────────────
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(15000));  // wake on notify or every 15s
 
         for (;;) {
             if (g_harvesting) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
@@ -2891,6 +3299,7 @@ static void uploadTask(void* param) {
             g_uploadingMb = 0.0f;
             g_uploadBaseMb = 0.0f;
             bool uploaded = s3UploadFile(name);
+            g_tlsActive = false;  // re-enable +++ after upload
             g_uploadingMb = 0.0f;
             g_uploadBaseMb = 0.0f;
             if (!uploaded) {
@@ -2911,6 +3320,8 @@ static void uploadTask(void* param) {
             g_filesUploaded++;
             g_mbUploaded += fileMb;
             if (g_mbQueued >= fileMb) g_mbQueued -= fileMb; else g_mbQueued = 0.0f;
+
+            // RSSI check removed — +++ disrupts PPP even between files
         }
         ESP_LOGI(TAG, "Upload idle — %u uploaded", g_filesUploaded);
     }
@@ -3168,6 +3579,9 @@ static void processCLI(const char* cmd) {
             cdc_printf("CLI: s3 api_host=%s device=%s\r\n", apiHost, devId);
             nvs_close(h);
         }
+        cdc_printf("CLI: fw=%s usb=%s\r\n", FW_VERSION, g_msc_only ? "MSC-only" : "CDC+MSC");
+        const esp_partition_t* running = esp_ota_get_running_partition();
+        if (running) cdc_printf("CLI: ota partition=%s\r\n", running->label);
 
     } else if (strcmp(cmd, "RESETBOOT") == 0) {
         nvs_handle_t h;
@@ -3274,6 +3688,41 @@ static void processCLI(const char* cmd) {
         g_harvesting = false;
         g_msc_ejected = false;
 
+    } else if (strncmp(cmd, "SETMODE", 7) == 0) {
+        const char* mode = cmd + 7;
+        while (*mode == ' ') mode++;
+        if (!mode[0]) {
+            cdc_printf("CLI: current=%s  usage: SETMODE CDC | SETMODE MSC\r\n",
+                       g_msc_only ? "MSC" : "CDC");
+        } else {
+            uint8_t val = 1;
+            if (strcasecmp(mode, "CDC") == 0) val = 0;
+            else if (strcasecmp(mode, "MSC") == 0) val = 1;
+            else { cdc_printf("CLI: unknown mode '%s' — use CDC or MSC\r\n", mode); return; }
+            nvs_handle_t h;
+            if (nvs_open("usb", NVS_READWRITE, &h) == ESP_OK) {
+                nvs_set_u8(h, "msc_only", val);
+                nvs_commit(h);
+                nvs_close(h);
+            }
+            cdc_printf("CLI: USB mode set to %s — reboot to apply\r\n", val ? "MSC-only" : "CDC+MSC");
+        }
+
+    } else if (strcmp(cmd, "OTA") == 0) {
+        cdc_printf("CLI: checking for firmware update (current=%s)...\r\n", FW_VERSION);
+        xTaskCreatePinnedToCore([](void*) {
+            bool ok = otaCheck();
+            g_tlsActive = false;
+            if (ok) {
+                cdc_printf("OTA: downloaded — rebooting in 3s\r\n");
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                esp_restart();
+            } else {
+                cdc_printf("OTA: no update available or check failed\r\n");
+            }
+            vTaskDelete(nullptr);
+        }, "ota", 16384, nullptr, 2, nullptr, 1);
+
     } else if (strcmp(cmd, "REBOOT") == 0) {
         cdc_printf("CLI: rebooting...\r\n");
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -3372,7 +3821,7 @@ static void main_loop_task(void* param) {
         }
 
         uint32_t now = millis();
-        if (g_sd_ready && !g_splashActive && now - g_lastDisplayMs >= DISPLAY_INTERVAL_MS) {
+        if (g_sd_ready && !g_splashActive && !g_otaActive && now - g_lastDisplayMs >= DISPLAY_INTERVAL_MS) {
             g_lastDisplayMs = now;
 
             // ── Compute live speeds from deltas ──────────────────────────
@@ -3452,9 +3901,28 @@ extern "C" void app_main(void) {
 
             if (boots > 5 && reason != ESP_RST_POWERON) {
                 ESP_LOGW(TAG, "CRASH LOOP DETECTED — pausing 30s for debug");
-                // Init display early for crash message
                 oled_init();
                 disp("CRASH LOOP", "Paused 30s");
+
+                // OTA rollback: if last OTA is pending, revert to previous partition
+                nvs_handle_t hota;
+                if (nvs_open("ota", NVS_READWRITE, &hota) == ESP_OK) {
+                    char status[16] = "";
+                    size_t slen = sizeof(status);
+                    if (nvs_get_str(hota, "ota_status", status, &slen) == ESP_OK
+                        && strcmp(status, "pending") == 0) {
+                        ESP_LOGW(TAG, "OTA rollback: reverting to previous partition");
+                        disp("CRASH LOOP", "OTA rollback...");
+                        const esp_partition_t* prev = esp_ota_get_next_update_partition(NULL);
+                        if (prev) {
+                            esp_ota_set_boot_partition(prev);
+                            nvs_set_str(hota, "ota_status", "rolled_back");
+                            nvs_commit(hota);
+                        }
+                    }
+                    nvs_close(hota);
+                }
+
                 vTaskDelay(pdMS_TO_TICKS(30000));
                 nvs_handle_t h2;
                 if (nvs_open("dbg", NVS_READWRITE, &h2) == ESP_OK) {
@@ -3462,8 +3930,37 @@ extern "C" void app_main(void) {
                     nvs_commit(h2);
                     nvs_close(h2);
                 }
+            } else {
+                // Normal boot — confirm OTA success + reset counter
+                nvs_handle_t h2;
+                if (nvs_open("dbg", NVS_READWRITE, &h2) == ESP_OK) {
+                    nvs_set_u32(h2, "boots", 0);
+                    nvs_commit(h2);
+                    nvs_close(h2);
+                }
+                nvs_handle_t hota;
+                if (nvs_open("ota", NVS_READWRITE, &hota) == ESP_OK) {
+                    nvs_set_str(hota, "fw_ver", FW_VERSION);
+                    nvs_set_str(hota, "ota_status", "ok");
+                    nvs_commit(hota);
+                    nvs_close(hota);
+                }
             }
         }
+    }
+
+    // ── MSC-only mode selection (NVS-based) ────────────────────────────
+    {
+        nvs_handle_t h;
+        if (nvs_open("usb", NVS_READWRITE, &h) == ESP_OK) {
+            uint8_t mode = 0;  // default: CDC+MSC (forced for debug) until SETMODE MSC is run
+            nvs_get_u8(h, "msc_only", &mode);
+            g_msc_only = (mode != 0);
+            // Force CDC for development — remove when switching to MSC-only
+            if (g_msc_only) { g_msc_only = false; nvs_set_u8(h, "msc_only", 0); nvs_commit(h); }
+            nvs_close(h);
+        }
+        ESP_LOGI(TAG, "USB mode: %s", g_msc_only ? "MSC-only" : "CDC+MSC");
     }
 
     // ── OLED init ───────────────────────────────────────────────────────
@@ -3537,26 +4034,61 @@ extern "C" void app_main(void) {
 
     // FATFS already mounted by sd_init() — no separate mount needed
 
-    // ── TinyUSB init (CDC + MSC) ────────────────────────────────────────
+    // ── TinyUSB init ────────────────────────────────────────────────────
     {
-        const tinyusb_config_t tusb_cfg = {
-            .device_descriptor = nullptr,       // use default
-            .string_descriptor = nullptr,       // use default
-            .string_descriptor_count = 0,
-            .external_phy = false,
-            .configuration_descriptor = nullptr, // use default
-            .self_powered = false,
-            .vbus_monitor_io = -1,
+        // MSC-only descriptors: pure mass storage device (no CDC/IAD)
+        // Uses different PID (0x0002) so OS doesn't load cached composite driver
+        static const tusb_desc_device_t msc_only_dev_desc = {
+            .bLength            = sizeof(tusb_desc_device_t),
+            .bDescriptorType    = TUSB_DESC_DEVICE,
+            .bcdUSB             = 0x0200,
+            .bDeviceClass       = 0x00,
+            .bDeviceSubClass    = 0x00,
+            .bDeviceProtocol    = 0x00,
+            .bMaxPacketSize0    = 64,
+            .idVendor           = 0x1209,
+            .idProduct          = 0x0002,
+            .bcdDevice          = 0x0100,
+            .iManufacturer      = 0x01,
+            .iProduct           = 0x02,
+            .iSerialNumber      = 0x03,
+            .bNumConfigurations = 0x01,
         };
+        #define MSC_ONLY_CFG_LEN (TUD_CONFIG_DESC_LEN + TUD_MSC_DESC_LEN)
+        static const uint8_t msc_only_cfg_desc[] = {
+            TUD_CONFIG_DESCRIPTOR(1, 1, 0, MSC_ONLY_CFG_LEN,
+                                  TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+            TUD_MSC_DESCRIPTOR(0, 4, 0x01, 0x81, 64),
+        };
+        static const char msc_only_langid[] = {0x09, 0x04};
+        static const char* msc_only_str_desc[] = {
+            msc_only_langid,       // 0: English
+            "AirBridge",           // 1: Manufacturer
+            "USB Storage",         // 2: Product
+            "AB0001",              // 3: Serial
+            "Mass Storage",        // 4: MSC Interface
+        };
+
+        tinyusb_config_t tusb_cfg = {};
+        tusb_cfg.external_phy = false;
+        tusb_cfg.self_powered = false;
+        tusb_cfg.vbus_monitor_io = -1;
+        if (g_msc_only) {
+            tusb_cfg.device_descriptor        = &msc_only_dev_desc;
+            tusb_cfg.configuration_descriptor = msc_only_cfg_desc;
+            tusb_cfg.string_descriptor        = msc_only_str_desc;
+            tusb_cfg.string_descriptor_count  = 5;
+        }
         ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
 
-        // CDC ACM init
-        tinyusb_config_cdcacm_t cdc_cfg = {};
-        cdc_cfg.usb_dev = TINYUSB_USBDEV_0;
-        cdc_cfg.cdc_port = TINYUSB_CDC_ACM_0;
-        cdc_cfg.callback_rx = cdc_rx_callback;
-        cdc_cfg.callback_line_coding_changed = cdc_line_coding_callback;
-        ESP_ERROR_CHECK(tusb_cdc_acm_init(&cdc_cfg));
+        if (!g_msc_only) {
+            tinyusb_config_cdcacm_t cdc_cfg = {};
+            cdc_cfg.usb_dev = TINYUSB_USBDEV_0;
+            cdc_cfg.cdc_port = TINYUSB_CDC_ACM_0;
+            cdc_cfg.callback_rx = cdc_rx_callback;
+            cdc_cfg.callback_line_coding_changed = cdc_line_coding_callback;
+            ESP_ERROR_CHECK(tusb_cdc_acm_init(&cdc_cfg));
+        }
 
         if (g_card_sectors > 0) {
             g_sd_ready = true;
@@ -3608,6 +4140,36 @@ extern "C" void app_main(void) {
         }
     }
 
+    // ── Scan SD root for unharvested files (from previous session) ─────
+    if (g_sd_ready && g_fatfs_mounted && g_filesQueued == 0) {
+        DIR* rootDir = opendir(SD_MOUNT);
+        if (rootDir) {
+            bool found = false;
+            struct dirent* ent;
+            while ((ent = readdir(rootDir)) != nullptr) {
+                if (ent->d_type == DT_DIR) continue;
+                if (ent->d_name[0] == '.') continue;
+                if (strcmp(ent->d_name, "airbridge.log") == 0) continue;
+                // Check if already uploaded (.done marker exists)
+                char donePath[192];
+                snprintf(donePath, sizeof(donePath), "%s/harvested/.done__%s",
+                         SD_MOUNT, ent->d_name);
+                struct stat ds;
+                if (stat(donePath, &ds) == 0) continue;  // already uploaded
+                found = true;
+                ESP_LOGI(TAG, "Boot: unharvested file in root: %s", ent->d_name);
+                break;
+            }
+            closedir(rootDir);
+            if (found) {
+                ESP_LOGI(TAG, "Boot: triggering harvest for unharvested root files");
+                g_writeDetected = true;
+                g_hostWasConnected = true;
+                g_lastWriteMs = millis();
+            }
+        }
+    }
+
     // ── Boot splash (10s) ──────────────────────────────────────────────
     if (g_oled_ok) {
         // Load device ID for display
@@ -3621,7 +4183,8 @@ extern "C" void app_main(void) {
         char sdLine[22];
         char usedStr[10], totalStr[10];
         _fmtSize(usedStr, sizeof(usedStr), g_sdUsedMb);
-        _fmtSize(totalStr, sizeof(totalStr), g_sdTotalMb);
+        float visMb = msc_visible_sectors() * 512.0f / 1e6f;
+        _fmtSize(totalStr, sizeof(totalStr), visMb);
         snprintf(sdLine, sizeof(sdLine), "SD %s / %s", usedStr, totalStr);
         int sdW = strlen(sdLine) * 6;
         oled_text((128 - sdW) / 2, 22, sdLine);
@@ -3641,7 +4204,16 @@ extern "C" void app_main(void) {
             char idLine[22];
             snprintf(idLine, sizeof(idLine), "ID:%s", g_deviceId);
             int idW = strlen(idLine) * 6;
-            oled_text((128 - idW) / 2, 48, idLine);
+            oled_text((128 - idW) / 2, 46, idLine);
+        }
+
+        // USB mode + firmware version
+        {
+            char modeLine[28];
+            snprintf(modeLine, sizeof(modeLine), "%s v%s",
+                     g_msc_only ? "MSC" : "CDC+MSC", FW_VERSION);
+            int mW = strlen(modeLine) * 6;
+            oled_text((128 - mW) / 2, 56, modeLine);
         }
 
         oled_flush();
