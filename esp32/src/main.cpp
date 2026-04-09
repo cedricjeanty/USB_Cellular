@@ -2817,7 +2817,7 @@ static void modemTask(void* param) {
     // ── Increase baud rate ──────────────────────────────────────────────
     {
         // Try baud rates from highest to lowest (no flow control first)
-        const int bauds[] = { 3000000, 2000000, 1500000, 921600, 460800 };
+        const int bauds[] = { 921600, 460800 };
         bool upgraded = false;
         for (int i = 0; i < 5 && !upgraded; i++) {
             cdc_printf("Modem: trying %d baud...\r\n", bauds[i]);
@@ -2961,7 +2961,7 @@ static void modemTask(void* param) {
     cdc_printf("Modem: APN set: %s", resp);
 
     // ── Activate PDP context before dialing ──────────────────────────────
-    modem_at_cmd("AT+CGACT=1,1", resp, sizeof(resp), 10000);
+    // AT+CGACT removed — let ATD*99# handle PDP activation
 
     // ── Dial PPP (with retry) ────────────────────────────────────────────
     bool connected = false;
@@ -3207,7 +3207,7 @@ static void modemTask(void* param) {
             bool redialOk = false;
             for (int attempt = 0; attempt < 3 && !redialOk; attempt++) {
                 cdc_printf("Modem: dialing PPP (attempt %d)...\r\n", attempt + 1);
-                modem_at_cmd("AT+CGACT=1,1", resp, sizeof(resp), 10000);
+                // AT+CGACT removed — let ATD*99# handle PDP activation
                 uart_write_bytes(UART_NUM_1, "ATD*99#\r", 8);
                 int rd = uart_read_bytes(UART_NUM_1, (uint8_t*)resp,
                             sizeof(resp) - 1, pdMS_TO_TICKS(15000));
