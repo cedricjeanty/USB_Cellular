@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "3.3.0"
+#define FW_VERSION "3.5.0"
 
 #include <cstring>
 #include <ctime>
@@ -427,6 +427,7 @@ static uint32_t g_bootCount      = 0;   // persistent boot counter from NVS
 static esp_netif_t      *g_ppp_netif    = nullptr;
 static TaskHandle_t      g_modem_task   = nullptr;
 static volatile bool     g_pppConnected = false;
+static volatile bool     g_pppNeedsReconnect = false;
 static volatile bool     g_modemReady   = false;
 static char              g_modemOp[32]  = "";
 static int               g_modemRssi    = 99;
@@ -2635,6 +2636,7 @@ static void modem_ip_event_handler(void* arg, esp_event_base_t event_base,
         cdc_printf("Modem: PPP lost IP\r\n");
         log_write("PPP lost IP");
         g_pppConnected = false;
+        g_pppNeedsReconnect = true;
         g_modemRssi = 0;
     }
 }
@@ -2916,46 +2918,89 @@ static void modemTask(void* param) {
         }
     }
 
-    // ── Check registration ───────────────────────────────────────────────
-    if (modem_at_cmd("AT+CREG?", resp, sizeof(resp), 2000) > 0) {
-        cdc_printf("Modem: REG: %s", resp);
+    // ── Enable URCs for network status ─────────────────────────────────
+    modem_at_cmd("AT+CREG=1", resp, sizeof(resp), 2000);
+    modem_at_cmd("AT+AUTOCSQ=1,1", resp, sizeof(resp), 2000);
+
+    // ── Wait for network registration (up to 60s) ───────────────────────
+    // CREG stat: 0=not searching, 1=home, 2=searching, 3=denied, 5=roaming
+    {
+        bool registered = false;
+        for (int i = 0; i < 30; i++) {
+            modem_at_cmd("AT+CREG?", resp, sizeof(resp), 2000);
+            if (strstr(resp, ",1") || strstr(resp, ",5")) {
+                registered = true;
+                cdc_printf("Modem: registered (%s)\r\n",
+                           strstr(resp, ",5") ? "roaming" : "home");
+                break;
+            }
+            cdc_printf("Modem: waiting for registration... (%ds)\r\n", i * 2);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+        if (!registered) {
+            cdc_printf("Modem: registration timeout — dialing anyway\r\n");
+            log_write("Modem: CREG timeout — dialing unregistered");
+        }
+    }
+
+    // ── Verify signal strength before dialing ───────────────────────────
+    modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000);
+    {
+        char* p = strstr(resp, "+CSQ:");
+        if (p) {
+            int rssi = 99;
+            sscanf(p, "+CSQ: %d", &rssi);
+            g_modemRssi = rssi;
+            log_write("Modem: RSSI=%d (pre-dial)", rssi);
+            cdc_printf("Modem: RSSI=%d\r\n", rssi);
+        }
     }
 
     // ── Set APN ──────────────────────────────────────────────────────────
     modem_at_cmd("AT+CGDCONT=1,\"IP\",\"hologram\"", resp, sizeof(resp), 5000);
     cdc_printf("Modem: APN set: %s", resp);
 
-    // ── Dial PPP ─────────────────────────────────────────────────────────
-    cdc_printf("Modem: dialing PPP (ATD*99#)...\r\n");
-    uart_write_bytes(UART_NUM_1, "ATD*99#\r", 8);
+    // ── Activate PDP context before dialing ──────────────────────────────
+    modem_at_cmd("AT+CGACT=1,1", resp, sizeof(resp), 10000);
 
-    // Wait for CONNECT
+    // ── Dial PPP (with retry) ────────────────────────────────────────────
     bool connected = false;
-    t0 = millis();
-    char connbuf[256] = "";
-    int connlen = 0;
-    while (millis() - t0 < 30000) {
-        int len = uart_read_bytes(UART_NUM_1, (uint8_t*)connbuf + connlen,
-                                  sizeof(connbuf) - 1 - connlen, pdMS_TO_TICKS(500));
-        if (len > 0) {
-            connlen += len;
-            connbuf[connlen] = '\0';
-            if (strstr(connbuf, "CONNECT")) {
-                connected = true;
-                cdc_printf("Modem: CONNECT received!\r\n");
-                log_write("Modem: PPP CONNECT");
-                break;
-            }
-            if (strstr(connbuf, "ERROR") || strstr(connbuf, "NO CARRIER")) {
-                cdc_printf("Modem: dial failed: %s\r\n", connbuf);
-                log_write("Modem: dial failed");
-                break;
+    for (int dialAttempt = 0; dialAttempt < 3 && !connected; dialAttempt++) {
+        if (dialAttempt > 0) {
+            cdc_printf("Modem: redial attempt %d...\r\n", dialAttempt + 1);
+            modem_at_cmd("ATH", resp, sizeof(resp), 2000);
+            vTaskDelay(pdMS_TO_TICKS(3000));
+        }
+        cdc_printf("Modem: dialing PPP (ATD*99#)...\r\n");
+        uart_write_bytes(UART_NUM_1, "ATD*99#\r", 8);
+
+        // Wait for CONNECT
+        t0 = millis();
+        char connbuf[256] = "";
+        int connlen = 0;
+        while (millis() - t0 < 30000) {
+            int len = uart_read_bytes(UART_NUM_1, (uint8_t*)connbuf + connlen,
+                                      sizeof(connbuf) - 1 - connlen, pdMS_TO_TICKS(500));
+            if (len > 0) {
+                connlen += len;
+                connbuf[connlen] = '\0';
+                if (strstr(connbuf, "CONNECT")) {
+                    connected = true;
+                    cdc_printf("Modem: CONNECT received!\r\n");
+                    log_write("Modem: PPP CONNECT");
+                    break;
+                }
+                if (strstr(connbuf, "ERROR") || strstr(connbuf, "NO CARRIER")) {
+                    cdc_printf("Modem: dial failed: %s\r\n", connbuf);
+                    break;
+                }
             }
         }
     }
 
     if (!connected) {
-        cdc_printf("Modem: PPP dial failed, task exiting\r\n");
+        cdc_printf("Modem: PPP dial failed after 3 attempts\r\n");
+        log_write("Modem: PPP dial failed");
         uart_driver_delete(UART_NUM_1);
         g_modem_task = nullptr;
         vTaskDelete(nullptr);
@@ -3000,12 +3045,73 @@ static void modemTask(void* param) {
 
     // ── PPP data pump: UART ↔ PPPoS ──────────────────────────────────────
     // This loop MUST run continuously — all TCP/IP over cellular depends on it.
-    // Any blocking call (connect, send, recv) must happen in a DIFFERENT task.
+    // URCs from the modem (e.g., +CSQ, +CREG) appear as ASCII text between PPP frames.
     bool test_launched = false;
+    static char urcBuf[128];
+    static int urcLen = 0;
+
     while (true) {
         uint8_t buf[1024];
         int len = uart_read_bytes(UART_NUM_1, buf, sizeof(buf), pdMS_TO_TICKS(20));
         if (len > 0) {
+            // Scan for URCs in the data stream
+            // PPP frames start with 0x7E; ASCII text outside frames = URCs
+            for (int i = 0; i < len; i++) {
+                if (buf[i] == 0x7E || buf[i] == '\0') {
+                    // PPP frame boundary — process any accumulated URC
+                    if (urcLen > 2) {
+                        urcBuf[urcLen] = '\0';
+                        // Parse +CSQ URC (auto RSSI report)
+                        char* csq = strstr(urcBuf, "+CSQ:");
+                        if (csq) {
+                            int rssi = 99, ber = 99;
+                            sscanf(csq, "+CSQ: %d,%d", &rssi, &ber);
+                            if (rssi != g_modemRssi && rssi != 99) {
+                                log_write("RSSI: %d -> %d", g_modemRssi, rssi);
+                                g_modemRssi = rssi;
+                            }
+                        }
+                        // Parse +CREG URC (registration change)
+                        char* creg = strstr(urcBuf, "+CREG:");
+                        if (creg) {
+                            int stat = 0;
+                            sscanf(creg, "+CREG: %d", &stat);
+                            if (stat != 1 && stat != 5) {  // not registered
+                                log_write("Modem: registration lost (stat=%d)", stat);
+                                cdc_printf("Modem: registration lost (%d)\r\n", stat);
+                            }
+                        }
+                    }
+                    urcLen = 0;
+                } else if (buf[i] >= 0x20 && buf[i] < 0x7F && urcLen < (int)sizeof(urcBuf) - 1) {
+                    // Accumulate printable ASCII (potential URC text)
+                    urcBuf[urcLen++] = buf[i];
+                } else if (buf[i] == '\r' || buf[i] == '\n') {
+                    // Line ending in URC — treat like frame boundary
+                    if (urcLen > 2) {
+                        urcBuf[urcLen] = '\0';
+                        char* csq = strstr(urcBuf, "+CSQ:");
+                        if (csq) {
+                            int rssi = 99, ber = 99;
+                            sscanf(csq, "+CSQ: %d,%d", &rssi, &ber);
+                            if (rssi != g_modemRssi && rssi != 99) {
+                                log_write("RSSI: %d -> %d", g_modemRssi, rssi);
+                                g_modemRssi = rssi;
+                            }
+                        }
+                        char* creg = strstr(urcBuf, "+CREG:");
+                        if (creg) {
+                            int stat = 0;
+                            sscanf(creg, "+CREG: %d", &stat);
+                            if (stat != 1 && stat != 5) {
+                                log_write("Modem: registration lost (stat=%d)", stat);
+                                cdc_printf("Modem: registration lost (%d)\r\n", stat);
+                            }
+                        }
+                    }
+                    urcLen = 0;
+                }
+            }
             esp_netif_receive(g_ppp_netif, buf, len, nullptr);
         }
 
@@ -3038,51 +3144,100 @@ static void modemTask(void* param) {
         // RSSI is read during modem init. modemRssiCheck() available for safe gaps.
 
         // ── Detect PPP connection loss and reconnect ─────────────────────
-        if (g_pppConnected && lastPppRxMs > 0 &&
-            (millis() - lastPppRxMs) > 60000) {
-            cdc_printf("Modem: no PPP data for 60s — reconnecting\r\n");
-            log_write("Modem: PPP stale — reconnecting");
+        bool pppStale = g_pppConnected && lastPppRxMs > 0 &&
+                        (millis() - lastPppRxMs) > 30000;
+        if (pppStale || g_pppNeedsReconnect) {
+            if (pppStale) {
+                cdc_printf("Modem: no PPP data for 30s — reconnecting\r\n");
+                log_write("Modem: PPP stale — reconnecting");
+            } else {
+                cdc_printf("Modem: PPP lost — reconnecting\r\n");
+                log_write("Modem: PPP lost — reconnecting");
+                vTaskDelay(pdMS_TO_TICKS(5000));  // pause before retry
+            }
+            g_pppNeedsReconnect = false;
+            static uint32_t lastReconnectMs = 0;
+            if (lastReconnectMs > 0 && (millis() - lastReconnectMs) < 30000) {
+                cdc_printf("Modem: reconnect backoff — waiting 30s\r\n");
+                vTaskDelay(pdMS_TO_TICKS(30000));
+            }
+            lastReconnectMs = millis();
             g_pppConnected = false;
             g_modemRssi = 0;
 
-            // Tear down PPP and redial
+            // Disconnect PPP cleanly
             if (g_ppp_netif) {
                 esp_netif_action_disconnected(g_ppp_netif, nullptr, 0, nullptr);
-                vTaskDelay(pdMS_TO_TICKS(2000));
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                esp_netif_action_stop(g_ppp_netif, nullptr, 0, nullptr);
+                vTaskDelay(pdMS_TO_TICKS(1000));
             }
 
-            // Send +++ to exit data mode, then hangup and redial
+            // Exit data mode → hangup → redial
             vTaskDelay(pdMS_TO_TICKS(1100));
             uart_write_bytes(UART_NUM_1, "+++", 3);
             vTaskDelay(pdMS_TO_TICKS(1100));
             uart_flush(UART_NUM_1);
 
             char resp[128];
-            modem_at_cmd("ATH", resp, sizeof(resp), 2000);  // hangup
+            modem_at_cmd("ATH", resp, sizeof(resp), 2000);
             vTaskDelay(pdMS_TO_TICKS(1000));
 
-            // Check registration
-            modem_at_cmd("AT+CREG?", resp, sizeof(resp), 2000);
-            if (strstr(resp, ",1") || strstr(resp, ",5")) {
-                // Registered — redial
-                cdc_printf("Modem: redialing PPP...\r\n");
+            // Retry up to 3 times
+            bool redialOk = false;
+            for (int attempt = 0; attempt < 3 && !redialOk; attempt++) {
+                // Check registration
+                modem_at_cmd("AT+CREG?", resp, sizeof(resp), 2000);
+                if (!strstr(resp, ",1") && !strstr(resp, ",5")) {
+                    cdc_printf("Modem: not registered (attempt %d), waiting 15s\r\n", attempt + 1);
+                    log_write("Modem: not registered, retry %d", attempt + 1);
+                    vTaskDelay(pdMS_TO_TICKS(15000));
+                    continue;
+                }
+
+                // Re-read RSSI while in command mode
+                modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000);
+                char* p = strstr(resp, "+CSQ:");
+                if (p) {
+                    int rssi = 99;
+                    sscanf(p, "+CSQ: %d", &rssi);
+                    if (rssi != 99) {
+                        g_modemRssi = rssi;
+                        log_write("RSSI: %d (reconnect)", rssi);
+                    }
+                }
+
+                // Redial
+                cdc_printf("Modem: redialing PPP (attempt %d)...\r\n", attempt + 1);
                 uart_write_bytes(UART_NUM_1, "ATD*99#\r", 8);
                 int rd = uart_read_bytes(UART_NUM_1, (uint8_t*)resp,
-                            sizeof(resp) - 1, pdMS_TO_TICKS(10000));
+                            sizeof(resp) - 1, pdMS_TO_TICKS(15000));
                 if (rd > 0) {
                     resp[rd] = '\0';
                     if (strstr(resp, "CONNECT")) {
+                        // Restart PPP on existing netif
+                        esp_netif_action_start(g_ppp_netif, nullptr, 0, nullptr);
+                        esp_netif_action_connected(g_ppp_netif, nullptr, 0, nullptr);
                         lastPppRxMs = millis();
+                        test_launched = false;  // re-set default route when IP arrives
+                        redialOk = true;
                         cdc_printf("Modem: PPP reconnected\r\n");
                         log_write("Modem: PPP reconnected");
                     } else {
-                        cdc_printf("Modem: redial failed: %s\r\n", resp);
-                        log_write("Modem: redial failed");
+                        cdc_printf("Modem: redial failed: %.60s\r\n", resp);
+                        modem_at_cmd("ATH", resp, sizeof(resp), 2000);
+                        vTaskDelay(pdMS_TO_TICKS(5000));
                     }
+                } else {
+                    cdc_printf("Modem: redial timeout\r\n");
+                    vTaskDelay(pdMS_TO_TICKS(5000));
                 }
-            } else {
-                cdc_printf("Modem: not registered, will retry in 30s\r\n");
-                vTaskDelay(pdMS_TO_TICKS(30000));
+            }
+            if (!redialOk) {
+                log_write("Modem: reconnection failed after 3 attempts — waiting 60s");
+                cdc_printf("Modem: reconnection failed, retry in 60s\r\n");
+                vTaskDelay(pdMS_TO_TICKS(60000));
+                g_pppNeedsReconnect = true;  // try again
             }
         }
 

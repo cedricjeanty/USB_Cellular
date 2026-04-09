@@ -1,0 +1,292 @@
+//Gps date(yyyymmdd) and time(HHmmss) : 20260329 232424
+
+// Source           Name     Serial#          Version           crc
+Left                 ACS    0x000002f6               V_5.6.04   0x99085c5a
+Right                ACS    0x00000323               V_5.6.04   0x99085c5a
+Left             FADEC_A    0x07001567               V0406      0x30303030
+Right            FADEC_A    0x07001005               V0406      0x30303030
+Left             FADEC_B    0x07001066               V0406      0x30303030
+Right            FADEC_B    0x07001611               V0406      0x30303030
+Left                EDCU    0x30303030               --------   0x30303030
+Right               EDCU    0x30303030               --------   0x30303030
+Left                 DSU    0x000000b4             DSU_3.0.64   0x00007ec4
+Right                DSU    0x000000b4             DSU_3.0.64   0x00007ec4
+Left             ACS_LDR    0x000002f6               V_4.0.00   0xf942772f
+Right            ACS_LDR    0x00000323               V_4.0.00   0xf942772f
+Left                 PFD    0x30303030               *-------   0x30303030
+Right                PFD    0x30303030               *-------   0x30303030
+Left             PFD_VHF    0x30303030               --------   0x30303030
+Right            PFD_VHF    0x30303030               --------   0x30303030
+Left                 MFD    0x30303030               *-------   0x30303030
+Right                MFD    0x30303030               *-------   0x30303030
+Left                 WXR    0x30303030               --------   0x30303030
+Right                WXR    0x30303030               --------   0x30303030
+Left                 CSP    0x00000bbf               BIO_6.0    0x82462036
+Right                CSP    0x00000bbf               BIO_6.0    0x82462036
+Left                 ACP    0x000000fe               BIO_6.0    0x82462036
+Right                ACP    0x000000fe               BIO_6.0    0x82462036
+Left                 KBD    0x0000021a               BIO_6.0    0x82462036
+Right                KBD    0x0000018f               BIO_6.0    0x82462036
+Left              YAW_AP    0x30303030               07150015   0x2d0ef042
+Right             YAW_AP    0x30303030               07150015   0x2d0ef042
+Left            PITCH_AP    0x30303030               07150015   0x02a48514
+Right           PITCH_AP    0x30303030               07150015   0x02a48514
+Left             ROLL_AP    0x30303030               07150015   0xc769996d
+Right            ROLL_AP    0x30303030               07150015   0xc769996d
+Left                 GPS    0x30303030               --------   0x30303030
+Right                GPS    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left            AHRS_PIP    0x72167a00                0193-16   0x00000000
+Right           AHRS_PIP    0x8be46a00                0193-16   0x00000000
+Left           AHRS_IOUP    0x72167a00                0080-13   0x00000000
+Right          AHRS_IOUP    0x8be46a00                0080-13   0x00000000
+Left            AHRS_DUP    0x72167a00               0191-15_   0x00000000
+Right           AHRS_DUP    0x8be46a00               0191-15_   0x00000000
+Left       AHRS_CRM(MAD)    0x7e4ebe2f               0140-14    0x00000000
+Right      AHRS_CRM(MAD)    0xe391d223               0140-14    0x00000000
+Left                 ADC    0x000bda6f                  4.1.1   0xd1baf958
+Right                ADC    0x000bda69                  4.1.1   0xd1baf958
+Left           PITOT_AOA    0x00000000                      *   0x00000000
+Right          PITOT_AOA    0xf5c70b00                  4.1.7   0x1af1386d
+Left        VOTING_PITOT    0x000bae0f                  4.1.7   0x175c3be1
+Right       VOTING_PITOT    0x000bae34                  4.1.7   0x175c3be1
+Left           THRD_AHRS    0x30303030               --------   0x30303030
+Right          THRD_AHRS    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left            FLAPS_LO    0x0000050d               DFS2_A08   0x0e99397d
+Right           FLAPS_LO    0x0000050d               DFS2_A08   0x0e99397d
+Left            FLAPS_LI    0x00000407               DFS2_A08   0x0e99397d
+Right           FLAPS_LI    0x00000407               DFS2_A08   0x0e99397d
+Left            FLAPS_RO    0x0000053f               DFS2_A08   0x0e99397d
+Right           FLAPS_RO    0x0000053f               DFS2_A08   0x0e99397d
+Left            FLAPS_RI    0x00000513               DFS2_A08   0x0e99397d
+Right           FLAPS_RI    0x00000513               DFS2_A08   0x0e99397d
+Left           GEAR_LEFT    0x0000023e               DLG-2.08   0x3630e469
+Right          GEAR_LEFT    0x0000023e               DLG-2.08   0x3630e469
+Left          GEAR_RIGHT    0x00000258               DLG-2.08   0x3630e469
+Right         GEAR_RIGHT    0x00000258               DLG-2.08   0x3630e469
+Left           GEAR_NOSE    0x00000214               DLG-2.08   0x3630e469
+Right          GEAR_NOSE    0x00000214               DLG-2.08   0x3630e469
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left              ECBU_1    0x000002af                   6.01   0xb1507b6d
+Right             ECBU_1    0x000002af                   6.01   0xb1507b6d
+Left              ECBU_2    0x000002b5                   6.01   0xb1507b6d
+Right             ECBU_2    0x000002b5                   6.01   0xb1507b6d
+Left              ECBU_3    0x00000123                   6.01   0xb1507b6d
+Right             ECBU_3    0x00000123                   6.01   0xb1507b6d
+Left              ECBU_4    0x00000107                   6.01   0xb1507b6d
+Right             ECBU_4    0x00000107                   6.01   0xb1507b6d
+Left              ECBU_5    0x00000107                   6.01   0xb1507b6d
+Right             ECBU_5    0x00000107                   6.01   0xb1507b6d
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left               spare    0x30303030               --------   0x30303030
+Right              spare    0x30303030               --------   0x30303030
+Left           AC_Serial    0x000000f3                 EA500.   0x00000000
+Right          AC_Serial    0x000000f3                 EA500.   0x00000000
+Left             LEngine    0x00000000                 LA0511   0x00000000
+Right            LEngine    0x00000000                 LA0511   0x00000000
+Left             REngine    0x00000000                 LA0504   0x00000000
+Right            REngine    0x00000000                 LA0504   0x00000000
+Left        ACS_Conf_Opt    0x00000000             2497206934   0x00000000
+Right       ACS_Conf_Opt    0x00000000                      *   0x00000000
+Left           LFaultIso    0x00000000                          0x00000000
+Right          LFaultIso    0x00000000                          0x00000000
+Left          Fuel_Probe    0x00000000                      *   0x00000000
+Right         Fuel_Probe    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+Left               spare    0x00000000                      *   0x00000000
+Right              spare    0x00000000                      *   0x00000000
+
+Fuel Probe Data
+Left WS70      :  0xee8a2842
+Left WS75      :  0xa2e30e42
+Left WS125     :  0x60651442
+Left WS161     :  0x80b50742
+Left WS197     :  0x1996c041
+Left WS Tip    :  0x4d945342
+Left Dens WS31 :  0xb6202b42
+Left Sump Temp :  0xb544ee41
+Right WS70     :  0xb2432842
+Right WS75     :  0x7c0c1242
+Right WS125    :  0x6b291342
+Right WS161    :  0x88560642
+Right WS197    :  0xc027be41
+Right WS Tip   :  0xa5976842
+Right Dens WS31:  0xb0892d42
+Right Sump Temp:  0x4df6ea41
+
+ACS Options
+  FOOTWELL_LIGHT_INSTALLED
+  115_VAC_POWER_INSTALLED
+  ELECTRONIC_FLIGHT_BAG_INSTALLED
+  RIGHT_KEYBOARD_INSTALLED
+  ECLIPSE_WEATHER_RADAR_INSTALLED
+  SKYWATCH_INSTALLED
+  TAWS_INSTALLED
+  SPARE
+  SPARE
+  SPARE
+  SPARE
+  SPARE
+  SPARE
+  TIP_TANK
+  ADS_B_INSTALLED
