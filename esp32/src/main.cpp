@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "4.1.0"
+#define FW_VERSION "3.2.0"
 
 #include <cstring>
 #include <ctime>
@@ -2811,6 +2811,17 @@ static void modemTask(void* param) {
     }
 
     g_modemReady = true;
+
+    // ── Reset modem radio to clear stale PPP/PDP state from previous session ─
+    // Without this, the modem may still be in data mode from the last boot,
+    // causing PPP to fail silently on subsequent connections.
+    cdc_printf("Modem: resetting radio (AT+CFUN=0/1)...\r\n");
+    modem_at_cmd("AT+CFUN=0", resp, sizeof(resp), 5000);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    modem_at_cmd("AT+CFUN=1", resp, sizeof(resp), 5000);
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    // Re-verify AT after radio reset
+    modem_at_cmd("AT", resp, sizeof(resp), 2000);
 
     // ── Disable echo and net LED ────────────────────────────────────────
     modem_at_cmd("ATE0", resp, sizeof(resp), 1000);
