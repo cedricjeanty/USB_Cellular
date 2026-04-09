@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "3.0.0"
+#define FW_VERSION "4.1.0"
 
 #include <cstring>
 #include <ctime>
@@ -48,6 +48,7 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "esp_http_server.h"
+#include "esp_http_client.h"
 #include "dhcpserver/dhcpserver.h"
 #include "driver/uart.h"
 #include "esp_netif.h"
@@ -1553,7 +1554,11 @@ static void updateDisplay() {
             // PPP up but signal lost
             strlcpy(label, "No Signal", sizeof(label));
         } else if (g_modemReady) {
-            strlcpy(label, "Connecting...", sizeof(label));
+            if (g_modemOp[0]) {
+                snprintf(label, sizeof(label), "%s...", g_modemOp);
+            } else {
+                strlcpy(label, "Connecting...", sizeof(label));
+            }
         } else {
             strlcpy(label, "No Network", sizeof(label));
         }
@@ -1766,6 +1771,7 @@ static esp_tls_t* tls_connect(const char* host) {
     cfg.use_global_ca_store = false;
     cfg.crt_bundle_attach = nullptr;
     cfg.timeout_ms = 30000;
+    // cfg.non_block intentionally NOT set — let TLS block normally
 
     esp_tls_t *tls = esp_tls_init();
     if (!tls) return nullptr;
@@ -1992,6 +1998,99 @@ static void otaDisplayProgress(int pct, uint32_t received, uint32_t total) {
 }
 
 static bool otaDownloadAndFlash(const char* host, const char* path, uint32_t expectedSize) {
+    // Use esp_http_client which properly handles TLS record reassembly,
+    // TCP flow control, and timeouts over slow PPP links.
+    char url[2048];
+    snprintf(url, sizeof(url), "https://%s%s", host, path);
+
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.timeout_ms = 120000;
+    config.buffer_size = 2048;
+    config.buffer_size_tx = 2048;
+    config.skip_cert_common_name_check = true;
+    config.transport_type = HTTP_TRANSPORT_OVER_SSL;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) { log_write("OTA: http_client init failed heap=%lu", (unsigned long)esp_get_free_heap_size()); return false; }
+
+    g_tlsActive = true;
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        log_write("OTA: http open failed: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        g_tlsActive = false;
+        return false;
+    }
+
+    int content_length = esp_http_client_fetch_headers(client);
+    if (content_length <= 0) content_length = expectedSize;
+    int status = esp_http_client_get_status_code(client);
+    log_write("OTA: HTTP %d, %d bytes", status, content_length);
+
+    if (status != 200) {
+        log_write("OTA: HTTP error %d", status);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        g_tlsActive = false;
+        return false;
+    }
+
+    // Prepare OTA partition
+    const esp_partition_t* update_part = esp_ota_get_next_update_partition(NULL);
+    if (!update_part) { log_write("OTA: no partition"); esp_http_client_cleanup(client); g_tlsActive = false; return false; }
+
+    esp_ota_handle_t ota_handle;
+    err = esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
+    if (err != ESP_OK) { log_write("OTA: begin failed"); esp_http_client_cleanup(client); g_tlsActive = false; return false; }
+
+    // Stream body to flash
+    char buf[1024];
+    uint32_t received = 0;
+    while (received < (uint32_t)content_length) {
+        int len = esp_http_client_read(client, buf, sizeof(buf));
+        if (len > 0) {
+            err = esp_ota_write(ota_handle, buf, len);
+            if (err != ESP_OK) {
+                log_write("OTA: flash write failed at %lu", (unsigned long)received);
+                esp_ota_abort(ota_handle);
+                esp_http_client_cleanup(client);
+                g_tlsActive = false;
+                return false;
+            }
+            received += len;
+            if ((received % 16384) < (uint32_t)len)
+                otaDisplayProgress((received * 100) / content_length, received, content_length);
+        } else if (len == 0) {
+            break;  // done
+        } else {
+            log_write("OTA: read error at %lu", (unsigned long)received);
+            break;
+        }
+    }
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    g_tlsActive = false;
+
+    if (received < (uint32_t)content_length) {
+        log_write("OTA: incomplete %lu/%d", (unsigned long)received, content_length);
+        esp_ota_abort(ota_handle);
+        return false;
+    }
+
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) { log_write("OTA: end failed: %s", esp_err_to_name(err)); return false; }
+    err = esp_ota_set_boot_partition(update_part);
+    if (err != ESP_OK) { log_write("OTA: set_boot failed"); return false; }
+
+    log_write("OTA: success — %lu bytes", (unsigned long)received);
+    otaDisplayProgress(100, received, content_length);
+    return true;
+}
+
+static bool otaDownloadAndFlash_UNUSED(const char* host, const char* path, uint32_t expectedSize) {
+    // OLD implementation kept for reference
     // Prepare OTA partition first (flash erase is slow)
     const esp_partition_t* update_part = esp_ota_get_next_update_partition(NULL);
     if (!update_part) { log_write("OTA: no update partition"); return false; }
@@ -2591,7 +2690,7 @@ static void modem_ip_event_handler(void* arg, esp_event_base_t event_base,
         log_write("PPP lost IP");
         g_pppConnected = false;
         g_pppNeedsReconnect = true;
-        g_modemRssi = 0;
+        // Don't reset RSSI — it's still valid from modem init or last reconnect
     }
 }
 
@@ -2768,12 +2867,10 @@ static void modemTask(void* param) {
         }
     }
 
-    // ── Increase baud rate — DISABLED ──────────────────────────────────
-    // All bauds above 115200 lose PPP data on large downloads (modem → ESP).
-    // 115200 is sufficient — cellular throughput is ~14-40 KB/s.
-    if (false) {
-        // Stay at 115200 — matches cellular throughput (~40 KB/s).
-        const int bauds[] = { 460800 };
+    // ── Increase baud rate ──────────────────────────────────────────────
+    // OTA downloads now use esp_http_client which handles TLS properly.
+    {
+        const int bauds[] = { 921600 };
         bool upgraded = false;
         for (int i = 0; i < 5 && !upgraded; i++) {
             cdc_printf("Modem: trying %d baud...\r\n", bauds[i]);
