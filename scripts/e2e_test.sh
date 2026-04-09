@@ -124,13 +124,40 @@ log "  AirBridge E2E Test Suite — $(date)"
 log "═══════════════════════════════════════════════════════════════"
 log ""
 
+# Use epoch-based version numbers to avoid stale version conflicts
+# Format: major.HHMM.SS — always increases between test runs
+BASE_VER="10.$(date +%H%M)"
+V1="${BASE_VER}.1"
+V2="${BASE_VER}.2"
+V3="${BASE_VER}.3"
+V4="${BASE_VER}.4"
+V5="${BASE_VER}.5"
+VBASE="${BASE_VER}.0"
+log "Base version: $VBASE, OTA targets: $V1 → $V5"
+
+# Flash device with base version
+sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$VBASE\"/" "$FW_DIR/src/main.cpp"
+(cd "$FW_DIR" && ~/.local/bin/pio run 2>&1 | tail -1)
+python3 -c "import serial; s=serial.Serial('/dev/ttyACM0', 1200); s.close()" 2>/dev/null
+sleep 3
+(cd "$FW_DIR" && ~/.local/bin/pio run -t upload --upload-port /dev/ttyACM0 2>&1 | tail -1)
+
+# Clean all test done markers from SD
+power_cycle 5
+sleep 8
+if [ -b /dev/sda1 ]; then
+    sudo mount -o noatime /dev/sda1 /mnt 2>/dev/null
+    sudo rm -f /mnt/harvested/.done__test_* 2>/dev/null
+    sudo rm -f /mnt/test_*.bin /mnt/harvested/test_*.bin 2>/dev/null
+    sudo umount /mnt 2>/dev/null
+fi
+
 # ── TEST 1: Normal OTA ─────────────────────────────────────────
 log "TEST 1: Normal OTA update"
-log "  Deploy v3.1.0 to S3, power cycle, verify version"
+log "  Deploy v$V1 to S3, power cycle, verify version"
 cleanup
-deploy_ota "3.1.0"
-# Set source back to 3.0.0 (the flashed version)
-sed -i 's/#define FW_VERSION "[^"]*"/#define FW_VERSION "3.0.0"/' "$FW_DIR/src/main.cpp"
+deploy_ota "$V1"
+sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$VBASE\"/" "$FW_DIR/src/main.cpp"
 
 power_cycle 30  # long off for modem drain
 sleep 5
@@ -148,21 +175,21 @@ for i in $(seq 1 30); do
         wait_for_usb
     fi
     V=$(get_fw_version)
-    if [ "$V" = "3.1.0" ]; then break; fi
+    if [ "$V" = "$V1" ]; then break; fi
 done
 
-if [ "$V" = "3.1.0" ]; then
-    pass "OTA: v3.0.0 → v3.1.0"
+if [ "$V" = "$V1" ]; then
+    pass "OTA: v3.0.0 → v$V1"
 else
-    fail "OTA: expected v3.1.0, got '$V'"
+    fail "OTA: expected v$V1, got '$V'"
 fi
 
 # ── TEST 2: OTA with power cut ─────────────────────────────────
 log ""
 log "TEST 2: OTA with power cut mid-download"
-log "  Deploy v3.2.0, power cycle, cut power at ~30s, power back on"
-deploy_ota "3.2.0"
-sed -i 's/#define FW_VERSION "[^"]*"/#define FW_VERSION "3.1.0"/' "$FW_DIR/src/main.cpp"
+log "  Deploy v$V2, power cycle, cut power at ~30s, power back on"
+deploy_ota "$V2"
+sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$V1\"/" "$FW_DIR/src/main.cpp"
 
 power_cycle 30
 sleep 5
@@ -194,13 +221,13 @@ for i in $(seq 1 24); do
         wait_for_usb
     fi
     V=$(get_fw_version)
-    if [ "$V" = "3.2.0" ]; then break; fi
+    if [ "$V" = "$V2" ]; then break; fi
 done
 
-if [ "$V" = "3.2.0" ]; then
-    pass "OTA interrupted + resumed: v3.1.0 → v3.2.0"
+if [ "$V" = "$V2" ]; then
+    pass "OTA interrupted + resumed: v$V1 → v$V2"
 else
-    fail "OTA interrupted: expected v3.2.0, got '$V'"
+    fail "OTA interrupted: expected v$V2, got '$V'"
 fi
 
 # ── TEST 3: Normal file upload ──────────────────────────────────
@@ -209,8 +236,8 @@ log "TEST 3: Normal 10MB file upload"
 cleanup
 aws s3 rm "s3://$BUCKET/$DEVICE/test_upload.bin" 2>/dev/null
 # Set S3 version to match device so OTA doesn't interfere
-deploy_ota "3.2.0"
-sed -i 's/#define FW_VERSION "[^"]*"/#define FW_VERSION "3.2.0"/' "$FW_DIR/src/main.cpp"
+deploy_ota "$V2"
+sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$V2\"/" "$FW_DIR/src/main.cpp"
 
 write_test_file "test_upload.bin" 10
 power_cycle 30
@@ -282,8 +309,8 @@ log ""
 log "TEST 5: Simultaneous OTA + file upload"
 cleanup
 aws s3 rm "s3://$BUCKET/$DEVICE/test_combo.bin" 2>/dev/null
-deploy_ota "3.3.0"
-sed -i 's/#define FW_VERSION "[^"]*"/#define FW_VERSION "3.2.0"/' "$FW_DIR/src/main.cpp"
+deploy_ota "$V3"
+sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$V2\"/" "$FW_DIR/src/main.cpp"
 
 write_test_file "test_combo.bin" 10
 power_cycle 30
@@ -304,8 +331,8 @@ for i in $(seq 1 120); do
             wait_for_usb
         fi
         V=$(get_fw_version)
-        if [ "$V" = "3.3.0" ]; then
-            log "  OTA complete: v3.3.0"
+        if [ "$V" = "$V3" ]; then
+            log "  OTA complete: v$V3"
             OTA_OK=true
         fi
     fi
@@ -322,7 +349,7 @@ for i in $(seq 1 120); do
     if $OTA_OK && $UPLOAD_OK; then break; fi
 done
 
-if $OTA_OK; then pass "Combined: OTA v3.2.0 → v3.3.0"
+if $OTA_OK; then pass "Combined: OTA v$V2 → v$V3"
 else fail "Combined: OTA failed (got $(get_fw_version))"; fi
 
 if $UPLOAD_OK; then pass "Combined: 10MB upload"
@@ -333,8 +360,8 @@ log ""
 log "TEST 6: OTA + upload with power cut"
 cleanup
 aws s3 rm "s3://$BUCKET/$DEVICE/test_chaos.bin" 2>/dev/null
-deploy_ota "3.4.0"
-sed -i 's/#define FW_VERSION "[^"]*"/#define FW_VERSION "3.3.0"/' "$FW_DIR/src/main.cpp"
+deploy_ota "$V4"
+sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$V3\"/" "$FW_DIR/src/main.cpp"
 
 write_test_file "test_chaos.bin" 10
 power_cycle 30
@@ -363,7 +390,7 @@ for i in $(seq 1 120); do
             sleep 10; wait_for_usb
         fi
         V=$(get_fw_version)
-        if [ "$V" = "3.4.0" ]; then OTA_OK=true; log "  OTA recovered: v3.4.0"; fi
+        if [ "$V" = "$V4" ]; then OTA_OK=true; log "  OTA recovered: v$V4"; fi
     fi
 
     if ! $UPLOAD_OK; then
@@ -384,8 +411,8 @@ else fail "Chaos: upload not recovered"; fi
 log ""
 log "TEST 7: OTA download while host is writing (should wait for idle)"
 cleanup
-deploy_ota "3.5.0"
-sed -i 's/#define FW_VERSION "[^"]*"/#define FW_VERSION "3.4.0"/' "$FW_DIR/src/main.cpp"
+deploy_ota "$V5"
+sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$V4\"/" "$FW_DIR/src/main.cpp"
 
 power_cycle 30
 sleep 5
@@ -420,13 +447,13 @@ for i in $(seq 1 30); do
         wait_for_usb
     fi
     V=$(get_fw_version)
-    if [ "$V" = "3.5.0" ]; then break; fi
+    if [ "$V" = "$V5" ]; then break; fi
 done
 
-if [ "$V" = "3.5.0" ]; then
-    pass "OTA waited for host writes: v3.4.0 → v3.5.0"
+if [ "$V" = "$V5" ]; then
+    pass "OTA waited for host writes: v$V4 → v$V5"
 else
-    fail "OTA+write: expected v3.5.0, got '$V'"
+    fail "OTA+write: expected v$V5, got '$V'"
 fi
 
 # ═══════════════════════════════════════════════════════════════
@@ -437,4 +464,4 @@ log "  Log: $LOG"
 log "═══════════════════════════════════════════════════════════════"
 
 # Reset source version
-sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"3.4.0\"/" "$FW_DIR/src/main.cpp"
+sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$V4\"/" "$FW_DIR/src/main.cpp"
