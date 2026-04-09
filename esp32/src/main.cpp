@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "10.1502.4"
+#define FW_VERSION "4.9.0"
 
 #include <cstring>
 #include <ctime>
@@ -2306,7 +2306,7 @@ static bool otaCheck() {
     if (!otaDownloadAndFlash(s3Host, s3Path, fwSize)) {
         log_write("OTA: download/flash failed");
         disp("OTA FAILED", "");
-        vTaskDelay(pdMS_TO_TICKS(3000));
+        vTaskDelay(pdMS_TO_TICKS(10000));
         g_otaActive = false;
         return false;
     }
@@ -2696,7 +2696,7 @@ static void modem_ip_event_handler(void* arg, esp_event_base_t event_base,
 
 static void modemTask(void* param) {
     (void)param;
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    vTaskDelay(pdMS_TO_TICKS(500));  // brief settle for UART pins
 
     // ── Init UART ────────────────────────────────────────────────────────
     cdc_printf("Modem: init UART1 TX=%d RX=%d...\r\n", PIN_MODEM_TX, PIN_MODEM_RX);
@@ -2759,13 +2759,8 @@ static void modemTask(void* param) {
             vTaskDelay(pdMS_TO_TICKS(100));
             uart_flush(UART_NUM_1);
 
-            // Try +++ escape first (modem may be in PPP data mode from previous session).
-            // The +++ needs 1s silence before and after — don't send AT before it.
-            vTaskDelay(pdMS_TO_TICKS(1200));
-            uart_write_bytes(UART_NUM_1, "+++", 3);
-            vTaskDelay(pdMS_TO_TICKS(1200));
-            uart_read_bytes(UART_NUM_1, (uint8_t*)resp, sizeof(resp) - 1, pdMS_TO_TICKS(500));
-            // Now try AT (modem should be in command mode, either from +++ or was already)
+            // Skip +++ escape — AT+CFUN=0/1 reset (done after sync) clears data mode.
+            // Just try AT directly.
             int len = modem_at_cmd("AT", resp, sizeof(resp), 500);
             if (len > 0 && strstr(resp, "OK")) {
                 cdc_printf("Modem: found at %d (fc)\r\n", tryBauds[b]);
@@ -2815,12 +2810,11 @@ static void modemTask(void* param) {
     // ── Reset modem radio to clear stale PPP/PDP state from previous session ─
     // Without this, the modem may still be in data mode from the last boot,
     // causing PPP to fail silently on subsequent connections.
-    cdc_printf("Modem: resetting radio (AT+CFUN=0/1)...\r\n");
+    cdc_printf("Modem: resetting radio...\r\n");
     modem_at_cmd("AT+CFUN=0", resp, sizeof(resp), 5000);
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    vTaskDelay(pdMS_TO_TICKS(1000));
     modem_at_cmd("AT+CFUN=1", resp, sizeof(resp), 5000);
-    vTaskDelay(pdMS_TO_TICKS(5000));
-    // Re-verify AT after radio reset
+    vTaskDelay(pdMS_TO_TICKS(2000));
     modem_at_cmd("AT", resp, sizeof(resp), 2000);
 
     // ── Disable echo and net LED ────────────────────────────────────────
@@ -3033,7 +3027,7 @@ static void modemTask(void* param) {
         if (dialAttempt > 0) {
             cdc_printf("Modem: redial attempt %d...\r\n", dialAttempt + 1);
             modem_at_cmd("ATH", resp, sizeof(resp), 2000);
-            vTaskDelay(pdMS_TO_TICKS(3000));
+            vTaskDelay(pdMS_TO_TICKS(10000));
         }
         cdc_printf("Modem: dialing PPP (ATD*99#)...\r\n");
         uart_write_bytes(UART_NUM_1, "ATD*99#\r", 8);
@@ -3235,7 +3229,7 @@ static void modemTask(void* param) {
             cdc_printf("Modem: resetting radio...\r\n");
             modem_at_cmd("ATH", resp, sizeof(resp), 2000);
             modem_at_cmd("AT+CFUN=0", resp, sizeof(resp), 5000);
-            vTaskDelay(pdMS_TO_TICKS(3000));
+            vTaskDelay(pdMS_TO_TICKS(10000));
             modem_at_cmd("AT+CFUN=1", resp, sizeof(resp), 5000);
             vTaskDelay(pdMS_TO_TICKS(5000));
 
@@ -3413,10 +3407,9 @@ static void uploadTask(void* param) {
     (void)param;
     static bool otaDone = false;
 
-    // Wait for network (up to 90s), then 2s settle for DNS/routing
+    // Wait for network (up to 90s)
     for (int i = 0; i < 90 && !g_netConnected && !g_pppConnected; i++)
         vTaskDelay(pdMS_TO_TICKS(1000));
-    vTaskDelay(pdMS_TO_TICKS(2000));
 
     // ── OTA check first (highest priority after network) ────────────
     if (!otaDone && (g_netConnected || g_pppConnected)) {
@@ -3450,7 +3443,7 @@ static void uploadTask(void* param) {
 
     // ── Upload loop ─────────────────────────────────────────────────
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(15000));  // wake on notify or every 15s
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));  // wake on notify or every 15s
 
         for (;;) {
             if (g_harvesting) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
@@ -3931,7 +3924,7 @@ static void processCLI(const char* cmd) {
             g_tlsActive = false;
             if (ok) {
                 cdc_printf("OTA: downloaded — rebooting in 3s\r\n");
-                vTaskDelay(pdMS_TO_TICKS(3000));
+                vTaskDelay(pdMS_TO_TICKS(10000));
                 esp_restart();
             } else {
                 cdc_printf("OTA: no update available or check failed\r\n");
