@@ -1,0 +1,6 @@
+USBCellularNotes.md
+aircraft_data/
+flightHistory__*
+scripts/__pycache__/
+src/airbridge/__pycache__/
+tests/__pycache__/
