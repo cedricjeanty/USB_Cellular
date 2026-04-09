@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "3.5.0"
+#define FW_VERSION "3.3.0"
 
 #include <cstring>
 #include <ctime>
@@ -3156,88 +3156,85 @@ static void modemTask(void* param) {
                 vTaskDelay(pdMS_TO_TICKS(5000));  // pause before retry
             }
             g_pppNeedsReconnect = false;
-            static uint32_t lastReconnectMs = 0;
-            if (lastReconnectMs > 0 && (millis() - lastReconnectMs) < 30000) {
-                cdc_printf("Modem: reconnect backoff — waiting 30s\r\n");
-                vTaskDelay(pdMS_TO_TICKS(30000));
-            }
-            lastReconnectMs = millis();
             g_pppConnected = false;
             g_modemRssi = 0;
 
-            // Disconnect PPP cleanly
-            if (g_ppp_netif) {
-                esp_netif_action_disconnected(g_ppp_netif, nullptr, 0, nullptr);
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                esp_netif_action_stop(g_ppp_netif, nullptr, 0, nullptr);
-                vTaskDelay(pdMS_TO_TICKS(1000));
-            }
-
-            // Exit data mode → hangup → redial
+            // 1. Exit modem data mode (don't touch esp_netif — it crashes)
             vTaskDelay(pdMS_TO_TICKS(1100));
             uart_write_bytes(UART_NUM_1, "+++", 3);
             vTaskDelay(pdMS_TO_TICKS(1100));
             uart_flush(UART_NUM_1);
 
             char resp[128];
-            modem_at_cmd("ATH", resp, sizeof(resp), 2000);
-            vTaskDelay(pdMS_TO_TICKS(1000));
 
-            // Retry up to 3 times
+            // 3. Reset modem radio (AT+CFUN=0 off, then AT+CFUN=1 on)
+            cdc_printf("Modem: resetting radio...\r\n");
+            modem_at_cmd("ATH", resp, sizeof(resp), 2000);
+            modem_at_cmd("AT+CFUN=0", resp, sizeof(resp), 5000);
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            modem_at_cmd("AT+CFUN=1", resp, sizeof(resp), 5000);
+            vTaskDelay(pdMS_TO_TICKS(5000));
+
+            // 4. Wait for registration (up to 60s)
+            bool registered = false;
+            for (int w = 0; w < 30; w++) {
+                modem_at_cmd("AT+CREG?", resp, sizeof(resp), 2000);
+                if (strstr(resp, ",1") || strstr(resp, ",5")) {
+                    registered = true;
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(2000));
+            }
+            if (!registered) {
+                cdc_printf("Modem: registration timeout — retry in 60s\r\n");
+                log_write("Modem: reconnect reg timeout");
+                vTaskDelay(pdMS_TO_TICKS(60000));
+                g_pppNeedsReconnect = true;
+                continue;  // back to data pump loop
+            }
+
+            // 5. Read RSSI
+            modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000);
+            char* p = strstr(resp, "+CSQ:");
+            if (p) {
+                int rssi = 99;
+                sscanf(p, "+CSQ: %d", &rssi);
+                if (rssi != 99) g_modemRssi = rssi;
+                log_write("RSSI: %d (reconnect)", g_modemRssi);
+            }
+
+            // 6. Redial PPP (up to 3 attempts)
             bool redialOk = false;
             for (int attempt = 0; attempt < 3 && !redialOk; attempt++) {
-                // Check registration
-                modem_at_cmd("AT+CREG?", resp, sizeof(resp), 2000);
-                if (!strstr(resp, ",1") && !strstr(resp, ",5")) {
-                    cdc_printf("Modem: not registered (attempt %d), waiting 15s\r\n", attempt + 1);
-                    log_write("Modem: not registered, retry %d", attempt + 1);
-                    vTaskDelay(pdMS_TO_TICKS(15000));
-                    continue;
-                }
-
-                // Re-read RSSI while in command mode
-                modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000);
-                char* p = strstr(resp, "+CSQ:");
-                if (p) {
-                    int rssi = 99;
-                    sscanf(p, "+CSQ: %d", &rssi);
-                    if (rssi != 99) {
-                        g_modemRssi = rssi;
-                        log_write("RSSI: %d (reconnect)", rssi);
-                    }
-                }
-
-                // Redial
-                cdc_printf("Modem: redialing PPP (attempt %d)...\r\n", attempt + 1);
+                cdc_printf("Modem: dialing PPP (attempt %d)...\r\n", attempt + 1);
+                modem_at_cmd("AT+CGACT=1,1", resp, sizeof(resp), 10000);
                 uart_write_bytes(UART_NUM_1, "ATD*99#\r", 8);
                 int rd = uart_read_bytes(UART_NUM_1, (uint8_t*)resp,
                             sizeof(resp) - 1, pdMS_TO_TICKS(15000));
                 if (rd > 0) {
                     resp[rd] = '\0';
                     if (strstr(resp, "CONNECT")) {
-                        // Restart PPP on existing netif
-                        esp_netif_action_start(g_ppp_netif, nullptr, 0, nullptr);
-                        esp_netif_action_connected(g_ppp_netif, nullptr, 0, nullptr);
+                        // PPP data pump will feed new modem data to esp_netif
                         lastPppRxMs = millis();
-                        test_launched = false;  // re-set default route when IP arrives
+                        test_launched = false;
                         redialOk = true;
                         cdc_printf("Modem: PPP reconnected\r\n");
                         log_write("Modem: PPP reconnected");
                     } else {
-                        cdc_printf("Modem: redial failed: %.60s\r\n", resp);
+                        cdc_printf("Modem: dial failed: %.60s\r\n", resp);
                         modem_at_cmd("ATH", resp, sizeof(resp), 2000);
                         vTaskDelay(pdMS_TO_TICKS(5000));
                     }
                 } else {
-                    cdc_printf("Modem: redial timeout\r\n");
+                    cdc_printf("Modem: dial timeout\r\n");
                     vTaskDelay(pdMS_TO_TICKS(5000));
                 }
             }
             if (!redialOk) {
-                log_write("Modem: reconnection failed after 3 attempts — waiting 60s");
-                cdc_printf("Modem: reconnection failed, retry in 60s\r\n");
+                log_write("Modem: reconnect failed — retry in 60s");
+                cdc_printf("Modem: reconnect failed, retry in 60s\r\n");
                 vTaskDelay(pdMS_TO_TICKS(60000));
-                g_pppNeedsReconnect = true;  // try again
+                g_pppNeedsReconnect = true;
             }
         }
 

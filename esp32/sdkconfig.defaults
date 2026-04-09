@@ -68,6 +68,12 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
 CONFIG_LWIP_PPP_SUPPORT=y
 CONFIG_LWIP_PPP_PAP_SUPPORT=y
 CONFIG_LWIP_PPP_NOTIFY_PHASE_SUPPORT=y
+# Disable IPv6 over PPP — many carriers reject IPv6CP, causing PPP termination
+CONFIG_LWIP_PPP_ENABLE_IPV6=n
+# Enable LCP echo keepalives (detect dead links faster)
+CONFIG_LWIP_ENABLE_LCP_ECHO=y
+CONFIG_LWIP_LCP_ECHOINTERVAL=30
+CONFIG_LWIP_LCP_MAXECHOFAILS=3
 
 # Redirect console from UART0 (GPIO 43/44) to USB Serial JTAG
 # so UART pins are free for SIM7600 modem
