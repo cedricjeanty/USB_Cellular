@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "3.2.0"
+#define FW_VERSION "3.7.0"
 
 #include <cstring>
 #include <ctime>
@@ -2004,14 +2004,15 @@ static bool otaDownloadAndFlash(const char* host, const char* path, uint32_t exp
         return false;
     }
 
-    // Read HTTP headers
-    char hdr_buf[2048];
+    // Read HTTP headers (use larger reads to avoid falling behind S3's send rate)
+    char hdr_buf[4096];
     int hdr_len = 0;
     uint32_t contentLength = 0;
     bool header_done = false;
     uint32_t t0 = millis();
     while (!header_done && millis() - t0 < 15000 && hdr_len < (int)sizeof(hdr_buf) - 1) {
-        int r = esp_tls_conn_read(tls, hdr_buf + hdr_len, 1);
+        int space = sizeof(hdr_buf) - 1 - hdr_len;
+        int r = esp_tls_conn_read(tls, hdr_buf + hdr_len, space > 512 ? 512 : space);
         if (r > 0) {
             hdr_len += r;
             hdr_buf[hdr_len] = '\0';
@@ -2092,7 +2093,7 @@ static bool otaDownloadAndFlash(const char* host, const char* path, uint32_t exp
                 otaDisplayProgress(pct, received, contentLength);
                 lastDispMs = millis();
             }
-        } else if (r == 0) break;
+        } else if (r == 0 || r == -28928 /* PEER_CLOSE_NOTIFY */) break;  // S3 closed connection
         else if (r == ESP_TLS_ERR_SSL_WANT_READ || r == ESP_TLS_ERR_SSL_WANT_WRITE) {
             vTaskDelay(pdMS_TO_TICKS(10));
             if (millis() - t0 > 120000) { log_write("OTA: read timeout at %lu", (unsigned long)received); break; }
@@ -2817,7 +2818,10 @@ static void modemTask(void* param) {
     // ── Increase baud rate ──────────────────────────────────────────────
     {
         // Try baud rates from highest to lowest (no flow control first)
-        const int bauds[] = { 921600, 460800 };
+        // Baud rates above 115200 cause PPP data loss on receive (modem → ESP).
+        // HW flow control doesn't work reliably on this board.
+        // Stay at 115200 — matches cellular throughput (~40 KB/s).
+        const int bauds[] = { 460800 };
         bool upgraded = false;
         for (int i = 0; i < 5 && !upgraded; i++) {
             cdc_printf("Modem: trying %d baud...\r\n", bauds[i]);
