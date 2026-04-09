@@ -87,14 +87,16 @@ deploy_ota() {
 write_test_file() {
     local name=$1
     local size_mb=$2
-    # Clean done marker + any leftover copies
-    sudo mount -o noatime /dev/sda1 /mnt 2>/dev/null
-    sudo rm -f "/mnt/harvested/.done__$name" "/mnt/harvested/$name" "/mnt/$name" 2>/dev/null
-    # Also clean all test-related done markers
-    sudo rm -f /mnt/harvested/.done__test_* 2>/dev/null
+    # Wait for block device
+    for w in $(seq 1 10); do [ -b /dev/sda1 ] && break; sleep 1; done
+    if ! [ -b /dev/sda1 ]; then log "  WARN: /dev/sda1 not found"; return 1; fi
+    # Mount, clean everything, write fresh file
+    sudo mount -o noatime /dev/sda1 /mnt 2>/dev/null || { log "  WARN: mount failed"; return 1; }
+    sudo rm -f /mnt/harvested/.done__test_* /mnt/harvested/test_*.bin /mnt/test_*.bin 2>/dev/null
     sudo dd if=/dev/urandom of="/mnt/$name" bs=1M count="$size_mb" 2>/dev/null
     sync
     sudo umount /mnt 2>/dev/null
+    log "  Wrote $name (${size_mb}MB) to SD"
 }
 
 wait_for_upload() {
@@ -163,25 +165,31 @@ power_cycle 30  # long off for modem drain
 sleep 5
 wait_for_usb || { fail "USB not enumerated"; }
 
-# Wait for OTA + auto-reboot (up to 3 min)
+# Wait for OTA download + auto-reboot
+# Timeline: boot(10s) + CFUN reset(7s) + PPP(5s) + OTA check(3s) + download(~20s) + USB wait(15s) + reboot
+# Total: ~60s. Then second boot: another ~25s. Check for up to 5 min.
 log "  Waiting for OTA download + auto-reboot..."
 V=""
-for i in $(seq 1 30); do
-    sleep 10
-    # Check if device rebooted (USB reconnect)
+REBOOTED=false
+for i in $(seq 1 60); do
+    sleep 5
     if ! lsusb 2>/dev/null | grep -q "1209:000"; then
-        log "  Device rebooting at $((i*10))s..."
-        sleep 10
+        if ! $REBOOTED; then
+            log "  Device rebooting at $((i*5))s..."
+            REBOOTED=true
+        fi
+        sleep 5
         wait_for_usb
+        sleep 10  # let CDC/serial settle after reboot
     fi
     V=$(get_fw_version)
     if [ "$V" = "$V1" ]; then break; fi
 done
 
 if [ "$V" = "$V1" ]; then
-    pass "OTA: v3.0.0 → v$V1"
+    pass "OTA: $VBASE → $V1"
 else
-    fail "OTA: expected v$V1, got '$V'"
+    fail "OTA: expected $V1, got '$V'"
 fi
 
 # ── TEST 2: OTA with power cut ─────────────────────────────────
@@ -257,6 +265,9 @@ log ""
 log "TEST 4: Upload with power cut mid-transfer"
 cleanup
 aws s3 rm "s3://$BUCKET/$DEVICE/test_resume.bin" 2>/dev/null
+# Set S3 version to match device so OTA doesn't interfere
+CUR_V=$(get_fw_version)
+deploy_ota "${CUR_V:-$V2}"
 
 write_test_file "test_resume.bin" 10
 power_cycle 30
@@ -323,12 +334,13 @@ UPLOAD_OK=false
 for i in $(seq 1 120); do
     sleep 10
 
-    # Check OTA (device reboots)
+    # Check OTA (device reboots after download)
     if ! $OTA_OK; then
         if ! lsusb 2>/dev/null | grep -q "1209:000"; then
             log "  $((i*10))s: Device rebooting (OTA applied)..."
-            sleep 10
+            sleep 15
             wait_for_usb
+            sleep 10  # let serial settle
         fi
         V=$(get_fw_version)
         if [ "$V" = "$V3" ]; then
