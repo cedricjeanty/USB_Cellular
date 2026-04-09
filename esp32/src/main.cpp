@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "3.7.0"
+#define FW_VERSION "3.0.0"
 
 #include <cstring>
 #include <ctime>
@@ -1992,135 +1992,88 @@ static void otaDisplayProgress(int pct, uint32_t received, uint32_t total) {
 }
 
 static bool otaDownloadAndFlash(const char* host, const char* path, uint32_t expectedSize) {
+    // Prepare OTA partition first (flash erase is slow)
+    const esp_partition_t* update_part = esp_ota_get_next_update_partition(NULL);
+    if (!update_part) { log_write("OTA: no update partition"); return false; }
+
+    esp_ota_handle_t ota_handle;
+    esp_err_t err = esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
+    if (err != ESP_OK) { log_write("OTA: begin failed: %s", esp_err_to_name(err)); return false; }
+
+    // Connect and send request
     esp_tls_t* tls = tls_connect(host);
-    if (!tls) { log_write("OTA: TLS connect failed to %s", host); return false; }
+    if (!tls) { log_write("OTA: TLS connect failed"); esp_ota_abort(ota_handle); return false; }
 
     static char req[3072];
     int rlen = snprintf(req, sizeof(req),
         "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
         path, host);
-    if (!tls_write_all(tls, req, rlen)) {
-        tls_destroy(tls);
-        return false;
-    }
+    if (!tls_write_all(tls, req, rlen)) { tls_destroy(tls); esp_ota_abort(ota_handle); return false; }
 
-    // Read HTTP headers (use larger reads to avoid falling behind S3's send rate)
-    char hdr_buf[4096];
-    int hdr_len = 0;
-    uint32_t contentLength = 0;
-    bool header_done = false;
-    uint32_t t0 = millis();
-    while (!header_done && millis() - t0 < 15000 && hdr_len < (int)sizeof(hdr_buf) - 1) {
-        int space = sizeof(hdr_buf) - 1 - hdr_len;
-        int r = esp_tls_conn_read(tls, hdr_buf + hdr_len, space > 512 ? 512 : space);
-        if (r > 0) {
-            hdr_len += r;
-            hdr_buf[hdr_len] = '\0';
-            if (strstr(hdr_buf, "\r\n\r\n")) header_done = true;
-            t0 = millis();
-        } else if (r == ESP_TLS_ERR_SSL_WANT_READ) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        } else break;
+    // Read headers line-by-line (same approach as httpReadResponse, which works over PPP)
+    uint32_t contentLength = expectedSize;
+    {
+        char linebuf[256];
+        int pos = 0;
+        uint32_t t0 = millis();
+        while (millis() - t0 < 15000) {
+            int r = esp_tls_conn_read(tls, linebuf + pos, 1);
+            if (r == 1) {
+                t0 = millis();
+                pos++;
+                if (pos >= 2 && linebuf[pos-2] == '\r' && linebuf[pos-1] == '\n') {
+                    linebuf[pos] = '\0';
+                    if (strncasecmp(linebuf, "content-length:", 15) == 0)
+                        contentLength = strtoul(linebuf + 15, nullptr, 10);
+                    if (pos <= 2) break;  // empty line = end of headers
+                    pos = 0;
+                }
+                if (pos >= (int)sizeof(linebuf) - 1) pos = 0;  // overflow protection
+            } else if (r == ESP_TLS_ERR_SSL_WANT_READ) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            } else break;
+        }
     }
-    if (!header_done) {
-        log_write("OTA: header read timeout");
-        tls_destroy(tls);
-        return false;
-    }
-
-    // Check for HTTP 200
-    if (!strstr(hdr_buf, "200")) {
-        log_write("OTA: HTTP error: %.80s", hdr_buf);
-        tls_destroy(tls);
-        return false;
-    }
-
-    // Extract Content-Length
-    const char* cl = strcasestr(hdr_buf, "content-length:");
-    if (cl) contentLength = strtoul(cl + 15, nullptr, 10);
-    if (contentLength == 0) contentLength = expectedSize;
     log_write("OTA: downloading %lu bytes", (unsigned long)contentLength);
 
-    // Check if any body bytes were read past the header boundary
-    const char* body_start = strstr(hdr_buf, "\r\n\r\n") + 4;
-    int leftover = hdr_len - (body_start - hdr_buf);
-
-    // Find next OTA partition
-    const esp_partition_t* update_part = esp_ota_get_next_update_partition(NULL);
-    if (!update_part) {
-        log_write("OTA: no update partition found");
-        tls_destroy(tls);
-        return false;
-    }
-    log_write("OTA: target partition '%s' offset=0x%lx size=0x%lx",
-              update_part->label, (unsigned long)update_part->address,
-              (unsigned long)update_part->size);
-
-    esp_ota_handle_t ota_handle;
-    esp_err_t err = esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
-    if (err != ESP_OK) {
-        log_write("OTA: esp_ota_begin failed: %s", esp_err_to_name(err));
-        tls_destroy(tls);
-        return false;
-    }
-
-    // Write any leftover body bytes from header read
+    // Stream body to flash (1KB reads, same as httpReadResponse)
     uint32_t received = 0;
-    if (leftover > 0) {
-        err = esp_ota_write(ota_handle, body_start, leftover);
-        if (err != ESP_OK) { esp_ota_abort(ota_handle); tls_destroy(tls); return false; }
-        received = leftover;
-    }
-
-    // Stream remaining body
-    uint8_t buf[4096];
-    uint32_t lastDispMs = 0;
-    t0 = millis();
+    char buf[1024];
+    uint32_t t0 = millis();
     while (received < contentLength) {
         int r = esp_tls_conn_read(tls, buf, sizeof(buf));
         if (r > 0) {
             err = esp_ota_write(ota_handle, buf, r);
             if (err != ESP_OK) {
-                log_write("OTA: write failed at %lu: %s", (unsigned long)received, esp_err_to_name(err));
-                esp_ota_abort(ota_handle);
-                tls_destroy(tls);
-                return false;
+                log_write("OTA: flash write failed at %lu", (unsigned long)received);
+                esp_ota_abort(ota_handle); tls_destroy(tls); return false;
             }
             received += r;
             t0 = millis();
-            if (millis() - lastDispMs > 500) {
-                int pct = (received * 100) / contentLength;
-                otaDisplayProgress(pct, received, contentLength);
-                lastDispMs = millis();
-            }
-        } else if (r == 0 || r == -28928 /* PEER_CLOSE_NOTIFY */) break;  // S3 closed connection
+            if ((received % 16384) < (uint32_t)r)  // update display every ~16KB
+                otaDisplayProgress((received * 100) / contentLength, received, contentLength);
+        } else if (r == 0) break;
         else if (r == ESP_TLS_ERR_SSL_WANT_READ || r == ESP_TLS_ERR_SSL_WANT_WRITE) {
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(50));
             if (millis() - t0 > 120000) { log_write("OTA: read timeout at %lu", (unsigned long)received); break; }
+        } else {
+            // Treat any error (including PEER_CLOSE_NOTIFY) as end of data
+            break;
         }
-        else { log_write("OTA: read error %d at %lu", r, (unsigned long)received); break; }
     }
     tls_destroy(tls);
 
     if (received < contentLength) {
-        log_write("OTA: incomplete download %lu/%lu", (unsigned long)received, (unsigned long)contentLength);
-        esp_ota_abort(ota_handle);
-        return false;
+        log_write("OTA: incomplete %lu/%lu", (unsigned long)received, (unsigned long)contentLength);
+        esp_ota_abort(ota_handle); return false;
     }
 
     err = esp_ota_end(ota_handle);
-    if (err != ESP_OK) {
-        log_write("OTA: esp_ota_end failed: %s", esp_err_to_name(err));
-        return false;
-    }
-
+    if (err != ESP_OK) { log_write("OTA: end failed: %s", esp_err_to_name(err)); return false; }
     err = esp_ota_set_boot_partition(update_part);
-    if (err != ESP_OK) {
-        log_write("OTA: set_boot_partition failed: %s", esp_err_to_name(err));
-        return false;
-    }
+    if (err != ESP_OK) { log_write("OTA: set_boot failed: %s", esp_err_to_name(err)); return false; }
 
-    log_write("OTA: success — %lu bytes flashed to %s", (unsigned long)received, update_part->label);
+    log_write("OTA: success — %lu bytes", (unsigned long)received);
     otaDisplayProgress(100, received, contentLength);
     return true;
 }
@@ -2657,7 +2610,7 @@ static void modemTask(void* param) {
     uart_cfg.source_clk = UART_SCLK_DEFAULT;
 
     uart_driver_delete(UART_NUM_1);  // clean up any prior install
-    esp_err_t err = uart_driver_install(UART_NUM_1, 4096, 0, 0, nullptr, 0);
+    esp_err_t err = uart_driver_install(UART_NUM_1, 32768, 0, 0, nullptr, 0);
     if (err != ESP_OK) {
         cdc_printf("Modem: uart_driver_install failed: %s\r\n", esp_err_to_name(err));
         g_modem_task = nullptr;
@@ -2815,11 +2768,10 @@ static void modemTask(void* param) {
         }
     }
 
-    // ── Increase baud rate ──────────────────────────────────────────────
-    {
-        // Try baud rates from highest to lowest (no flow control first)
-        // Baud rates above 115200 cause PPP data loss on receive (modem → ESP).
-        // HW flow control doesn't work reliably on this board.
+    // ── Increase baud rate — DISABLED ──────────────────────────────────
+    // All bauds above 115200 lose PPP data on large downloads (modem → ESP).
+    // 115200 is sufficient — cellular throughput is ~14-40 KB/s.
+    if (false) {
         // Stay at 115200 — matches cellular throughput (~40 KB/s).
         const int bauds[] = { 460800 };
         bool upgraded = false;
@@ -4269,7 +4221,7 @@ extern "C" void app_main(void) {
     // ── Create tasks ────────────────────────────────────────────────────
     xTaskCreatePinnedToCore(uploadTask,    "upload",    16384, nullptr, 1, &g_upload_task,  1);
     xTaskCreatePinnedToCore(harvestTask,   "harvest",   16384, nullptr, 1, &g_harvest_task, 1);
-    xTaskCreatePinnedToCore(modemTask,     "modem",      8192, nullptr, 1, &g_modem_task,   1);
+    xTaskCreatePinnedToCore(modemTask,     "modem",      8192, nullptr, 2, &g_modem_task,   0);  // core 0, higher priority for PPP pump
     xTaskCreatePinnedToCore(main_loop_task, "main_loop", 4096, nullptr, 1, nullptr,         0);
 
     // ── Scan /harvested/ for leftover files from before last reboot ─────
