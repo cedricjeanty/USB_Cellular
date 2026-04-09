@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "4.9.0"
+#define FW_VERSION "5.1.0"
 
 #include <cstring>
 #include <ctime>
@@ -3418,25 +3418,19 @@ static void uploadTask(void* param) {
         g_tlsActive = false;
 
         if (staged) {
-            // OTA downloaded — wait for host to finish writing to USB
-            // before rebooting to apply the update
-            log_write("OTA: waiting for host writes to settle before reboot");
-            cdc_printf("OTA: waiting for USB idle before reboot...\r\n");
-            disp("OTA Ready", "Wait for USB...");
-
-            // Wait until no USB writes for QUIET_WINDOW_MS, or max 5 min
-            uint32_t waitStart = millis();
-            while (millis() - waitStart < 300000) {
-                uint32_t lastWr = g_lastWriteMs;
-                if (lastWr == 0 || (millis() - lastWr) >= QUIET_WINDOW_MS) {
-                    break;  // no recent writes — safe to reboot
+            // OTA downloaded — reboot immediately unless host is actively writing
+            uint32_t lastWr = g_lastWriteMs;
+            if (lastWr != 0 && (millis() - lastWr) < QUIET_WINDOW_MS) {
+                // Host is writing — wait for idle
+                log_write("OTA: waiting for host writes to settle");
+                disp("OTA Ready", "Wait for USB...");
+                while (millis() - g_lastWriteMs < QUIET_WINDOW_MS) {
+                    vTaskDelay(pdMS_TO_TICKS(1000));
                 }
-                vTaskDelay(pdMS_TO_TICKS(1000));
             }
-
             log_write("OTA: rebooting to apply update");
             disp("OTA Complete", "Rebooting...");
-            vTaskDelay(pdMS_TO_TICKS(2000));
+            vTaskDelay(pdMS_TO_TICKS(1000));
             esp_restart();
         }
     }
