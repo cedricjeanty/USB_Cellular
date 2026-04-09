@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "3.3.0"
+#define FW_VERSION "3.2.0"
 
 #include <cstring>
 #include <ctime>
@@ -4256,13 +4256,15 @@ extern "C" void app_main(void) {
 
     g_lastDisplayMs = millis();
 
-    // ── WiFi init ───────────────────────────────────────────────────────
-    wifi_init();
+    // ── WiFi disabled — cellular only ────────────────────────────────────
+    // wifi_init();
+    // Initialize event loop + netif (needed for PPP even without WiFi)
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     // ── Create tasks ────────────────────────────────────────────────────
     xTaskCreatePinnedToCore(uploadTask,    "upload",    16384, nullptr, 1, &g_upload_task,  1);
     xTaskCreatePinnedToCore(harvestTask,   "harvest",   16384, nullptr, 1, &g_harvest_task, 1);
-    xTaskCreatePinnedToCore(wifiTask,      "wifi",       8192, nullptr, 1, &g_wifi_task,    1);
     xTaskCreatePinnedToCore(modemTask,     "modem",      8192, nullptr, 1, &g_modem_task,   1);
     xTaskCreatePinnedToCore(main_loop_task, "main_loop", 4096, nullptr, 1, nullptr,         0);
 
