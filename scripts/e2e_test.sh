@@ -70,12 +70,12 @@ wait_for_ota() {
     while [ $t -lt $timeout ]; do
         sleep 5; t=$((t + 5))
         if ! lsusb 2>/dev/null | grep -q "1209:000"; then
-            log "  ${t}s: device rebooting..."
+            log "  ${t}s: device rebooting..." >&2
             sleep 10; t=$((t + 10)); wait_for_usb; sleep 5; t=$((t + 5))
         fi
         local v=$(get_fw_version)
         [ "$v" = "$expected" ] && { echo "$v"; return 0; }
-        [ $((t % 30)) -eq 0 ] && log "  ${t}s: fw=$v (waiting for $expected)"
+        [ $((t % 30)) -eq 0 ] && log "  ${t}s: fw=$v (waiting for $expected)" >&2
     done
     echo "$(get_fw_version)"; return 1
 }
@@ -88,16 +88,15 @@ wait_for_s3_file() {
         sleep 10; t=$((t + 10))
         local found=$(aws s3 ls "s3://$BUCKET/$DEVICE/$key" 2>&1 | grep "2026-")
         if [ -n "$found" ]; then echo "$found"; return 0; fi
-        # Check multipart progress
         local mp=$(aws s3api list-multipart-uploads --bucket $BUCKET \
             --query "Uploads[?contains(Key,'$key')].UploadId" --output text 2>&1)
         if [ -n "$mp" ] && [ "$mp" != "None" ]; then
             local parts=$(aws s3api list-parts --bucket $BUCKET \
                 --key "$DEVICE/$key" --upload-id "$mp" \
                 --query "length(Parts || \`[]\`)" --output text 2>&1)
-            log "  ${t}s: uploading $key — $parts part(s)"
+            log "  ${t}s: uploading $key — $parts part(s)" >&2
         else
-            [ $((t % 30)) -eq 0 ] && log "  ${t}s: waiting for $key..."
+            [ $((t % 30)) -eq 0 ] && log "  ${t}s: waiting for $key..." >&2
         fi
     done
     return 1
