@@ -64,20 +64,24 @@ write_test_file() {
 }
 
 # Wait for OTA reboot: polls version every 5s, detects USB disconnect/reconnect
+# Sets OTA_RESULT global (avoids stdout capture issues with log())
+OTA_RESULT=""
 wait_for_ota() {
     local expected=$1 timeout=${2:-180}
     local t=0
+    OTA_RESULT=""
     while [ $t -lt $timeout ]; do
         sleep 5; t=$((t + 5))
         if ! lsusb 2>/dev/null | grep -q "1209:000"; then
-            log "  ${t}s: device rebooting..." >&2
+            log "  ${t}s: device rebooting..."
             sleep 10; t=$((t + 10)); wait_for_usb; sleep 5; t=$((t + 5))
         fi
-        local v=$(get_fw_version | tr -d '[:space:]')
-        [ "$v" = "$expected" ] && { echo "$v"; return 0; }
-        [ $((t % 30)) -eq 0 ] && [ -n "$v" ] && log "  ${t}s: fw=$v (waiting for $expected)" >&2
+        OTA_RESULT=$(get_fw_version | tr -d '[:space:]')
+        [ "$OTA_RESULT" = "$expected" ] && return 0
+        [ $((t % 30)) -eq 0 ] && log "  ${t}s: fw=$OTA_RESULT (waiting for $expected)"
     done
-    get_fw_version | tr -d '[:space:]'; return 1
+    OTA_RESULT=$(get_fw_version | tr -d '[:space:]')
+    return 1
 }
 
 # Wait for file to appear on S3
@@ -94,9 +98,9 @@ wait_for_s3_file() {
             local parts=$(aws s3api list-parts --bucket $BUCKET \
                 --key "$DEVICE/$key" --upload-id "$mp" \
                 --query "length(Parts || \`[]\`)" --output text 2>&1)
-            log "  ${t}s: uploading $key — $parts part(s)" >&2
+            log "  ${t}s: uploading $key — $parts part(s)"
         else
-            [ $((t % 30)) -eq 0 ] && log "  ${t}s: waiting for $key..." >&2
+            [ $((t % 30)) -eq 0 ] && log "  ${t}s: waiting for $key..."
         fi
     done
     return 1
@@ -144,8 +148,8 @@ log "TEST 1: Normal OTA update ($VBASE → $V1)"
 cleanup; deploy_ota "$V1"
 sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$VBASE\"/" "$FW_DIR/src/main.cpp"
 power_cycle 5; sleep 5; wait_for_usb
-V=$(wait_for_ota "$V1" 180)
-[ "$V" = "$V1" ] && pass "OTA: $VBASE → $V1" || fail "OTA: expected $V1, got '$V'"
+wait_for_ota "$V1" 180
+[ "$OTA_RESULT" = "$V1" ] && pass "OTA: $VBASE → $V1" || fail "OTA: expected $V1, got '$OTA_RESULT'"
 
 # ── TEST 2: OTA with power cut ─────────────────────────────────
 log ""
@@ -157,8 +161,8 @@ log "  Cutting power at 30s..."
 sleep 30; $COOLGEAR off >/dev/null 2>&1; sleep 10
 log "  Powering back on..."
 $COOLGEAR on >/dev/null 2>&1; sleep 5; wait_for_usb
-V=$(wait_for_ota "$V2" 180)
-[ "$V" = "$V2" ] && pass "OTA interrupted + resumed: $V1 → $V2" || fail "OTA interrupted: expected $V2, got '$V'"
+wait_for_ota "$V2" 180
+[ "$OTA_RESULT" = "$V2" ] && pass "OTA interrupted + resumed: $V1 → $V2" || fail "OTA interrupted: expected $V2, got '$OTA_RESULT'"
 
 # ── TEST 3: Normal 10MB upload ──────────────────────────────────
 log ""
@@ -168,8 +172,8 @@ CUR=$(get_fw_version); deploy_ota "${CUR:-$V2}"
 sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"${CUR:-$V2}\"/" "$FW_DIR/src/main.cpp"
 write_test_file "test_upload.bin" 10
 power_cycle 5; sleep 5; wait_for_usb
-RESULT=$(wait_for_s3_file "test_upload.bin" 300)
-[ -n "$RESULT" ] && pass "Upload: $RESULT" || fail "Upload: not found after 5 min"
+S3_RESULT=$(wait_for_s3_file "test_upload.bin" 300)
+[ -n "$S3_RESULT" ] && pass "Upload: $S3_RESULT" || fail "Upload: not found after 5 min"
 
 # ── TEST 4: Upload with power cut ───────────────────────────────
 log ""
@@ -286,8 +290,8 @@ if [ -b /dev/sda1 ]; then
     sudo umount /mnt 2>/dev/null
     log "  Writes done. OTA should reboot in ~15s..."
 fi
-V=$(wait_for_ota "$V5" 180)
-[ "$V" = "$V5" ] && pass "OTA waited for writes: $V4 → $V5" || fail "OTA+write: expected $V5, got '$V'"
+wait_for_ota "$V5" 180
+[ "$OTA_RESULT" = "$V5" ] && pass "OTA waited for writes: $V4 → $V5" || fail "OTA+write: expected $V5, got '$OTA_RESULT'"
 
 # ═══════════════════════════════════════════════════════════════
 log ""
