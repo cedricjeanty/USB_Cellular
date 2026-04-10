@@ -362,6 +362,7 @@ static float    g_sdTotalMb      = 0.0f;
 static float    g_sdUsedMb       = 0.0f; // updated periodically for display
 static volatile bool g_splashActive = true; // hold splash screen on boot
 static volatile bool g_otaActive    = false; // suppress display during OTA download
+static bool          g_s3CookieActive = false; // S3 cookie overrides harvest cookie this session
 static float    g_uploadingMb    = 0.0f; // live progress of current file upload
 static volatile bool g_tlsActive = false; // suppress +++ escape during TLS
 static float    g_uploadBaseMb   = 0.0f; // base offset for multipart (completed parts)
@@ -3399,6 +3400,51 @@ static void uploadTask(void* param) {
         }
     }
 
+    // ── Check S3 for custom DSU cookie override ─────────────────────
+    if ((g_netConnected || g_pppConnected) && s3LoadCreds()) {
+        g_tlsActive = true;
+        esp_tls_t* tls = tls_connect(g_apiHost);
+        if (tls) {
+            char req[512];
+            int rlen = snprintf(req, sizeof(req),
+                "GET /prod/firmware/cookie HTTP/1.1\r\n"
+                "Host: %s\r\nx-api-key: %s\r\nConnection: close\r\n\r\n",
+                g_apiHost, g_apiKey);
+            if (tls_write_all(tls, req, rlen)) {
+                std::string resp = httpReadResponse(tls);
+                // Response is JSON: {"cookie":"<hex>","size":78} or {"error":"..."}
+                std::string hexStr = jsonStr(resp, "cookie");
+                if (hexStr.size() == 156) {  // 78 bytes × 2 hex chars
+                    // Decode hex to binary
+                    uint8_t cookie[78];
+                    for (int i = 0; i < 78; i++) {
+                        char h[3] = { hexStr[i*2], hexStr[i*2+1], 0 };
+                        cookie[i] = (uint8_t)strtoul(h, nullptr, 16);
+                    }
+                    // Verify magic
+                    if (cookie[0] == 0xEA && cookie[1] == 0x1E) {
+                        xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                        char cookiePath[64];
+                        snprintf(cookiePath, sizeof(cookiePath), "%s/dsuCookie.easdf", SD_MOUNT);
+                        FILE* cf = fopen(cookiePath, "wb");
+                        if (cf) {
+                            fwrite(cookie, 1, 78, cf);
+                            fclose(cf);
+                            g_s3CookieActive = true;
+                            log_write("S3 cookie applied (overrides harvest cookie)");
+                            cdc_printf("S3 cookie: applied\r\n");
+                        }
+                        xSemaphoreGive(g_sd_mutex);
+                    }
+                } else {
+                    cdc_printf("S3 cookie: none\r\n");
+                }
+            }
+            tls_destroy(tls);
+        }
+        g_tlsActive = false;
+    }
+
     // ── Upload loop ─────────────────────────────────────────────────
     for (;;) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));  // wake on notify or every 15s
@@ -3667,10 +3713,11 @@ static void doHarvest() {
     log_flush_to_sd();
 
     // ── Write DSU cookie (.easdf) after successful harvest ──────────────
+    // Skip if an S3 cookie override is active this session.
     // Parse the highest flight number from harvested .eaofh filenames,
     // then write dsuCookie.easdf so the DSU knows where to resume.
     // Filename format: EA500.000243_01218_20260406.eaofh
-    if (count > 0) {
+    if (count > 0 && !g_s3CookieActive) {
         uint32_t maxFlight = 0;
         char dsuSerial[44] = "";
         char harvestDir[64];

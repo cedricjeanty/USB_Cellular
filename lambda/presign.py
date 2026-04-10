@@ -102,6 +102,18 @@ def handler(event, context):
                 return respond(404, {"error": "no firmware available"})
             return respond(500, {"error": err})
 
+    elif path == "/firmware/cookie" and method == "GET":
+        # Return DSU cookie as hex-encoded JSON (78 bytes → 156 hex chars)
+        try:
+            obj = s3.get_object(Bucket=BUCKET, Key="firmware/dsuCookie.easdf")
+            data = obj["Body"].read()
+            return respond(200, {"cookie": data.hex(), "size": len(data)})
+        except Exception as e:
+            err = str(e)
+            if "NoSuchKey" in err or "404" in err or "AccessDenied" in err:
+                return respond(404, {"error": "no cookie"})
+            return respond(500, {"error": err})
+
     elif path == "/firmware/download" and method == "GET":
         # Return pre-signed GET URL for firmware binary
         try:
