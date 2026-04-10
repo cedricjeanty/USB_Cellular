@@ -3666,6 +3666,84 @@ static void doHarvest() {
     // Flush log buffer to SD while we have exclusive FATFS access
     log_flush_to_sd();
 
+    // ── Write DSU cookie (.easdf) after successful harvest ──────────────
+    // Parse the highest flight number from harvested .eaofh filenames,
+    // then write dsuCookie.easdf so the DSU knows where to resume.
+    // Filename format: EA500.000243_01218_20260406.eaofh
+    if (count > 0) {
+        uint32_t maxFlight = 0;
+        char dsuSerial[44] = "";
+        char harvestDir[64];
+        snprintf(harvestDir, sizeof(harvestDir), "%s/harvested", SD_MOUNT);
+        DIR* hdir = opendir(harvestDir);
+        if (hdir) {
+            struct dirent* ent;
+            while ((ent = readdir(hdir)) != nullptr) {
+                const char* ext = strrchr(ent->d_name, '.');
+                if (!ext || strcmp(ext, ".eaofh") != 0) continue;
+                // Parse: flightHistory__EA500.000243_01218_20260406.eaofh
+                // or: EA500.000243_01218_20260406.eaofh
+                const char* p = strstr(ent->d_name, "EA");
+                if (!p) continue;
+                // Extract serial (up to first _NNNNN)
+                char serial[44] = "";
+                const char* us = strchr(p, '_');
+                if (us && (us - p) < 43) {
+                    memcpy(serial, p, us - p);
+                    serial[us - p] = '\0';
+                    // Extract flight number after serial_
+                    uint32_t fnum = strtoul(us + 1, nullptr, 10);
+                    if (fnum > maxFlight) {
+                        maxFlight = fnum;
+                        strlcpy(dsuSerial, serial, sizeof(dsuSerial));
+                    }
+                }
+            }
+            closedir(hdir);
+        }
+
+        if (maxFlight > 0 && dsuSerial[0]) {
+            // Build 78-byte cookie (flight-number mode)
+            uint8_t cookie[78] = {};
+            cookie[0] = 0xEA;  // magic
+            cookie[1] = 0x1E;  // file type
+            cookie[2] = 0x00; cookie[3] = 78;  // length BE u16
+            cookie[4] = 0xD1;  // DSU hardware ID
+            // Serial at offset 9 (43 bytes, null-padded)
+            strlcpy((char*)&cookie[9], dsuSerial, 43);
+            // Mode flag
+            cookie[60] = 0x01;
+            // Flight number at offset 62 (BE u32)
+            cookie[62] = (maxFlight >> 24) & 0xFF;
+            cookie[63] = (maxFlight >> 16) & 0xFF;
+            cookie[64] = (maxFlight >> 8) & 0xFF;
+            cookie[65] = maxFlight & 0xFF;
+            // CRC-16 (poly 0x8005, init 0xFFFF) over bytes 0-75
+            uint16_t crc = 0xFFFF;
+            for (int i = 0; i < 76; i++) {
+                crc ^= (uint16_t)cookie[i] << 8;
+                for (int b = 0; b < 8; b++) {
+                    if (crc & 0x8000) crc = (crc << 1) ^ 0x8005;
+                    else crc <<= 1;
+                    crc &= 0xFFFF;
+                }
+            }
+            cookie[76] = (crc >> 8) & 0xFF;
+            cookie[77] = crc & 0xFF;
+
+            // Write to SD root
+            char cookiePath[64];
+            snprintf(cookiePath, sizeof(cookiePath), "%s/dsuCookie.easdf", SD_MOUNT);
+            FILE* cf = fopen(cookiePath, "wb");
+            if (cf) {
+                fwrite(cookie, 1, 78, cf);
+                fclose(cf);
+                log_write("Cookie: %s flight %lu", dsuSerial, (unsigned long)maxFlight);
+                cdc_printf("Cookie: %s flight %lu\r\n", dsuSerial, (unsigned long)maxFlight);
+            }
+        }
+    }
+
     g_writeDetected = false; g_lastWriteMs = 0;
     g_hostWasConnected = false; g_hostConnected = false;
     // Note: g_hostWrittenMb NOT reset — it's a session-cumulative display metric
@@ -3980,7 +4058,18 @@ static void processCLI(const char* cmd) {
 static void main_loop_task(void* param) {
     (void)param;
 
+    // Delayed USB presentation — aircraft DSU needs device to appear after boot
+    #define USB_PRESENT_DELAY_MS 60000
+    uint32_t usbPresentMs = millis();
+
     for (;;) {
+        // Enable USB MSC after delay (card sectors must be valid)
+        if (!g_sd_ready && g_card_sectors > 0 && (millis() - usbPresentMs) >= USB_PRESENT_DELAY_MS) {
+            g_sd_ready = true;
+            log_write("USB: drive presented to host (after %ds delay)", USB_PRESENT_DELAY_MS / 1000);
+            cdc_printf("USB: drive ready\r\n");
+        }
+
         // Print buffered harvest log
         if (g_harvest_log[0]) {
             ESP_LOGI(TAG, "%s", g_harvest_log);
@@ -4258,7 +4347,10 @@ extern "C" void app_main(void) {
         }
 
         if (g_card_sectors > 0) {
-            g_sd_ready = true;
+            // Delay USB presentation to host by 60s — aircraft DSU needs
+            // the device to appear after boot, not during boot.
+            // g_sd_ready stays false; a timer in main_loop_task enables it.
+            g_sd_ready = false;
             uint32_t vis = msc_visible_sectors();
             ESP_LOGI(TAG, "MSC ready: %lu visible sectors (%.0f MB), card=%lu sectors (%.0f MB)",
                      (unsigned long)vis, vis * 512.0f / 1e6f,
