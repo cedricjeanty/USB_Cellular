@@ -2720,75 +2720,54 @@ static void modemTask(void* param) {
     uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
-    // ── Wait for modem boot + sync ───────────────────────────────────────
-    cdc_printf("Modem: waiting for SIM7600 boot...\r\n");
-
-    // Drain any boot messages for up to 15s, look for RDY
+    // ── Sync with modem ────────────────────────────────────────────────────
+    // Modem needs ~15-20s to boot after cold power-on.
+    // Try +++ (exit data mode) then AT repeatedly until it responds.
     bool ready = false;
-    uint32_t t0 = millis();
-    while (millis() - t0 < 15000) {
-        char buf[256];
-        int len = uart_read_bytes(UART_NUM_1, (uint8_t*)buf, sizeof(buf) - 1,
-                                  pdMS_TO_TICKS(500));
-        if (len > 0) {
-            buf[len] = '\0';
-            cdc_printf("Modem: boot> %s", buf);
-            if (strstr(buf, "SMS DONE") || strstr(buf, "PB DONE")) {
-                ready = true;
-                break;
-            }
+    uart_flush(UART_NUM_1);
+
+    char resp[512];
+
+    // +++ escape (modem may be in PPP data mode from previous ESP32 boot)
+    vTaskDelay(pdMS_TO_TICKS(1100));
+    uart_write_bytes(UART_NUM_1, "+++", 3);
+    vTaskDelay(pdMS_TO_TICKS(1100));
+    uart_flush(UART_NUM_1);
+
+    // Try AT at 115200, up to 20s (covers modem cold boot)
+    for (int i = 0; i < 40 && !ready; i++) {
+        int len = modem_at_cmd("AT", resp, sizeof(resp), 500);
+        if (len > 0 && strstr(resp, "OK")) {
+            ready = true;
+            cdc_printf("Modem: found at 115200 (%ds)\r\n", i / 2);
+            break;
         }
     }
 
-    // Flush + sync with AT.
-    // Modem may be at non-default baud/flow-control from previous session
-    // (AT+IPR and AT+IFC persist in SIM7600 NVRAM across power cycles).
-    uart_flush(UART_NUM_1);
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    char resp[512];
-    {
-        // Enable HW flow control (modem may have AT+IFC=2,2 persisted)
+    // Fallback: try other bauds with flow control
+    if (!ready) {
         uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
                      PIN_MODEM_RTS, PIN_MODEM_CTS);
         uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_CTS_RTS, 122);
-
-        const int tryBauds[] = { 115200, 3000000, 921600, 460800 };
-        for (int b = 0; b < 4 && !ready; b++) {
+        const int tryBauds[] = { 921600, 460800, 3000000 };
+        for (int b = 0; b < 3 && !ready; b++) {
             uart_set_baudrate(UART_NUM_1, tryBauds[b]);
             vTaskDelay(pdMS_TO_TICKS(100));
             uart_flush(UART_NUM_1);
-
-            // Skip +++ escape — AT+CFUN=0/1 reset (done after sync) clears data mode.
-            // Just try AT directly.
             int len = modem_at_cmd("AT", resp, sizeof(resp), 500);
             if (len > 0 && strstr(resp, "OK")) {
-                cdc_printf("Modem: found at %d (fc)\r\n", tryBauds[b]);
+                cdc_printf("Modem: found at %d\r\n", tryBauds[b]);
                 modem_at_cmd("AT+IFC=0,0", resp, sizeof(resp), 1000);
-                if (tryBauds[b] != 115200)
-                    modem_at_cmd("AT+IPR=115200", resp, sizeof(resp), 1000);
+                modem_at_cmd("AT+IPR=115200", resp, sizeof(resp), 1000);
                 vTaskDelay(pdMS_TO_TICKS(200));
                 ready = true;
             }
         }
-
-        // Reset ESP32 UART to 115200, no flow control for clean start
         uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_DISABLE, 0);
         uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
         uart_set_baudrate(UART_NUM_1, 115200);
-        vTaskDelay(pdMS_TO_TICKS(200));
         uart_flush(UART_NUM_1);
-
-        // Final fallback: try 115200 without flow control
-        if (!ready) {
-            for (int i = 0; i < 5 && !ready; i++) {
-                if (modem_at_cmd("AT", resp, sizeof(resp), 2000) > 0 && strstr(resp, "OK")) {
-                    ready = true;
-                }
-                cdc_printf("Modem: AT sync attempt %d\r\n", i + 1);
-            }
-        }
     }
 
     if (ready) {
@@ -2811,18 +2790,17 @@ static void modemTask(void* param) {
     // Without this, the modem may still be in data mode from the last boot,
     // causing PPP to fail silently on subsequent connections.
     cdc_printf("Modem: resetting radio...\r\n");
-    modem_at_cmd("AT+CFUN=0", resp, sizeof(resp), 5000);
+    modem_at_cmd("AT+CFUN=0", resp, sizeof(resp), 3000);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    modem_at_cmd("AT+CFUN=1", resp, sizeof(resp), 3000);
     vTaskDelay(pdMS_TO_TICKS(1000));
-    modem_at_cmd("AT+CFUN=1", resp, sizeof(resp), 5000);
-    vTaskDelay(pdMS_TO_TICKS(2000));
     modem_at_cmd("AT", resp, sizeof(resp), 2000);
 
-    // ── Disable echo and net LED ────────────────────────────────────────
+    // ── Disable echo ────────────────────────────────────────────────────
     modem_at_cmd("ATE0", resp, sizeof(resp), 1000);
-    modem_at_cmd("AT+CTZU=1", resp, sizeof(resp), 1000);  // enable auto time zone update (NITZ)
-    // Note: SIM7600 NET LED is hardwired — AT+CNETLIGHT/CSGS/CGFUNC all ERROR
+    modem_at_cmd("AT+CTZU=1", resp, sizeof(resp), 500);
 
-    // ── Sync time from cellular network ──────────────────────────────────
+    // ── Time sync (deferred if not available yet) ────────────────────────
     // AT+CCLK? returns: +CCLK: "YY/MM/DD,HH:MM:SS±TZ"
     if (modem_at_cmd("AT+CCLK?", resp, sizeof(resp), 2000) > 0) {
         cdc_printf("Modem: CCLK raw: %s", resp);
@@ -2944,13 +2922,16 @@ static void modemTask(void* param) {
         }
     }
 
-    // ── Read modem info ──────────────────────────────────────────────────
-    if (modem_at_cmd("AT+CIMI", resp, sizeof(resp), 2000) > 0) {
-        cdc_printf("Modem: IMSI: %s", resp);
-    }
+    // ── Quick pre-PPP setup (minimal — defer everything else) ──────────
+    modem_at_cmd("AT+CREG=1", resp, sizeof(resp), 1000);   // enable registration URCs
+    modem_at_cmd("AT+AUTOCSQ=1,1", resp, sizeof(resp), 1000); // auto RSSI
 
-    if (modem_at_cmd("AT+COPS?", resp, sizeof(resp), 5000) > 0) {
-        // Parse operator name from +COPS: 0,0,"OperatorName",7
+    // Quick RSSI + operator read (for display, non-blocking)
+    if (modem_at_cmd("AT+CSQ", resp, sizeof(resp), 1000) > 0) {
+        char* p = strstr(resp, "+CSQ:");
+        if (p) { int r = 99; sscanf(p, "+CSQ: %d", &r); g_modemRssi = r; }
+    }
+    if (modem_at_cmd("AT+COPS?", resp, sizeof(resp), 2000) > 0) {
         char* q1 = strchr(resp, '"');
         if (q1) {
             char* q2 = strchr(q1 + 1, '"');
@@ -2960,40 +2941,23 @@ static void modemTask(void* param) {
                 g_modemOp[olen] = '\0';
             }
         }
-        cdc_printf("Modem: Operator=%s\r\n", g_modemOp);
-        log_write("Modem: operator=%s", g_modemOp);
+        cdc_printf("Modem: %s RSSI=%d\r\n", g_modemOp, g_modemRssi);
+        log_write("Modem: operator=%s RSSI=%d", g_modemOp, g_modemRssi);
     }
 
-    if (modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000) > 0) {
-        // Parse +CSQ: rssi,ber
-        char* p = strstr(resp, "+CSQ:");
-        if (p) {
-            int rssi = 99, ber = 99;
-            sscanf(p, "+CSQ: %d,%d", &rssi, &ber);
-            g_modemRssi = rssi;
-            cdc_printf("Modem: RSSI=%d BER=%d\r\n", rssi, ber);
-            log_write("Modem: RSSI=%d", rssi);
-        }
-    }
-
-    // ── Enable URCs for network status ─────────────────────────────────
-    modem_at_cmd("AT+CREG=1", resp, sizeof(resp), 2000);
-    modem_at_cmd("AT+AUTOCSQ=1,1", resp, sizeof(resp), 2000);
-
-    // ── Wait for network registration (up to 60s) ───────────────────────
+    // ── Wait for network registration (up to 30s) ────────────────────────
     // CREG stat: 0=not searching, 1=home, 2=searching, 3=denied, 5=roaming
     {
         bool registered = false;
-        for (int i = 0; i < 30; i++) {
-            modem_at_cmd("AT+CREG?", resp, sizeof(resp), 2000);
+        for (int i = 0; i < 15; i++) {
+            modem_at_cmd("AT+CREG?", resp, sizeof(resp), 1000);
             if (strstr(resp, ",1") || strstr(resp, ",5")) {
                 registered = true;
                 cdc_printf("Modem: registered (%s)\r\n",
                            strstr(resp, ",5") ? "roaming" : "home");
                 break;
             }
-            cdc_printf("Modem: waiting for registration... (%ds)\r\n", i * 2);
-            vTaskDelay(pdMS_TO_TICKS(2000));
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
         if (!registered) {
             cdc_printf("Modem: registration timeout — dialing anyway\r\n");
@@ -3033,7 +2997,7 @@ static void modemTask(void* param) {
         uart_write_bytes(UART_NUM_1, "ATD*99#\r", 8);
 
         // Wait for CONNECT
-        t0 = millis();
+        uint32_t t0 = millis();
         char connbuf[256] = "";
         int connlen = 0;
         while (millis() - t0 < 30000) {
