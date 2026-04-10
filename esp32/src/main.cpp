@@ -3021,13 +3021,33 @@ static void modemTask(void* param) {
         }
     }
 
-    if (!connected) {
-        cdc_printf("Modem: PPP dial failed after 3 attempts\r\n");
-        log_write("Modem: PPP dial failed");
-        uart_driver_delete(UART_NUM_1);
-        g_modem_task = nullptr;
-        vTaskDelete(nullptr);
-        return;
+    // Retry indefinitely if initial PPP dial fails
+    while (!connected) {
+        cdc_printf("Modem: PPP dial failed — retrying in 30s\r\n");
+        log_write("Modem: PPP dial failed — retrying");
+        vTaskDelay(pdMS_TO_TICKS(30000));
+        // Re-reset radio and retry
+        modem_at_cmd("AT+CFUN=0", resp, sizeof(resp), 3000);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        modem_at_cmd("AT+CFUN=1", resp, sizeof(resp), 3000);
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        for (int dialAttempt = 0; dialAttempt < 3 && !connected; dialAttempt++) {
+            cdc_printf("Modem: dialing PPP (attempt %d)...\r\n", dialAttempt + 1);
+            uart_write_bytes(UART_NUM_1, "ATD*99#\r", 8);
+            uint32_t t0 = millis();
+            char connbuf[256] = "";
+            int connlen = 0;
+            while (millis() - t0 < 30000) {
+                int len = uart_read_bytes(UART_NUM_1, (uint8_t*)connbuf + connlen,
+                                          sizeof(connbuf) - 1 - connlen, pdMS_TO_TICKS(500));
+                if (len > 0) {
+                    connlen += len;
+                    connbuf[connlen] = '\0';
+                    if (strstr(connbuf, "CONNECT")) { connected = true; break; }
+                    if (strstr(connbuf, "ERROR") || strstr(connbuf, "NO CARRIER")) break;
+                }
+            }
+        }
     }
 
     // ── Create PPP netif and start PPPoS ─────────────────────────────────
