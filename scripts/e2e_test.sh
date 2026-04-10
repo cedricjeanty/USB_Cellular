@@ -55,9 +55,15 @@ deploy_ota() {
 write_test_file() {
     local name=$1 size_mb=$2
     # Wait up to 90s for USB drive (device has 60s USB presentation delay)
-    for w in $(seq 1 90); do [ -b /dev/sda1 ] && break; sleep 1; done
-    [ -b /dev/sda1 ] || { log "  WARN: /dev/sda1 not found after 90s"; return 1; }
-    sudo mount -o noatime /dev/sda1 /mnt 2>/dev/null || { log "  WARN: mount failed"; return 1; }
+    local sddev=""
+    for w in $(seq 1 90); do
+        for d in /dev/sda1 /dev/sdb1 /dev/sdc1; do
+            [ -b "$d" ] && { sddev="$d"; break 2; }
+        done
+        sleep 1
+    done
+    [ -n "$sddev" ] || { log "  WARN: no USB drive found after 90s"; return 1; }
+    sudo mount -o noatime "$sddev" /mnt 2>/dev/null || { log "  WARN: mount $sddev failed"; return 1; }
     sudo rm -f /mnt/harvested/.done__test_* /mnt/harvested/test_*.bin /mnt/test_*.bin 2>/dev/null
     sudo dd if=/dev/urandom of="/mnt/$name" bs=1M count="$size_mb" 2>/dev/null
     sync; sudo umount /mnt 2>/dev/null
@@ -140,9 +146,14 @@ sleep 3
 # Clean SD (wait for 60s USB delay)
 power_cycle 5
 log "Waiting for USB drive (60s delay)..."
-for w in $(seq 1 90); do [ -b /dev/sda1 ] && break; sleep 1; done
-if [ -b /dev/sda1 ]; then
-    sudo mount -o noatime /dev/sda1 /mnt 2>/dev/null
+SDDEV=""
+for w in $(seq 1 90); do
+    for d in /dev/sda1 /dev/sdb1 /dev/sdc1; do [ -b "$d" ] && { SDDEV="$d"; break 2; }; done
+    sleep 1
+done
+if [ -n "$SDDEV" ]; then
+    log "  Found $SDDEV"
+    sudo mount -o noatime "$SDDEV" /mnt 2>/dev/null
     sudo rm -f /mnt/harvested/.done__test_* /mnt/test_*.bin /mnt/harvested/test_*.bin 2>/dev/null
     sudo umount /mnt 2>/dev/null
 fi

@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "10.2034.0"
+#define FW_VERSION "10.2055.2"
 
 #include <cstring>
 #include <ctime>
@@ -4423,7 +4423,7 @@ extern "C" void app_main(void) {
     xTaskCreatePinnedToCore(main_loop_task, "main_loop", 4096, nullptr, 1, nullptr,         0);
 
     // ── Scan /harvested/ for leftover files from before last reboot ─────
-    if (g_sd_ready && g_fatfs_mounted) {
+    if (g_fatfs_mounted) {
         char dirpath[64];
         snprintf(dirpath, sizeof(dirpath), "%s/harvested", SD_MOUNT);
         DIR* dir = opendir(dirpath);
@@ -4449,7 +4449,8 @@ extern "C" void app_main(void) {
     }
 
     // ── Scan SD root for unharvested files (from previous session) ─────
-    if (g_sd_ready && g_fatfs_mounted && g_filesQueued == 0) {
+    // Use g_fatfs_mounted not g_sd_ready (USB delayed 60s, but SD is ready)
+    if (g_fatfs_mounted && g_filesQueued == 0) {
         DIR* rootDir = opendir(SD_MOUNT);
         if (rootDir) {
             bool found = false;
