@@ -4131,7 +4131,7 @@ static void main_loop_task(void* param) {
         }
 
         uint32_t now = millis();
-        if (g_sd_ready && !g_splashActive && !g_otaActive && now - g_lastDisplayMs >= DISPLAY_INTERVAL_MS) {
+        if (!g_splashActive && !g_otaActive && now - g_lastDisplayMs >= DISPLAY_INTERVAL_MS) {
             g_lastDisplayMs = now;
 
             // ── Compute live speeds from deltas ──────────────────────────
