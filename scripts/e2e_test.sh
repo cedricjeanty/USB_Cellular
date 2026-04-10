@@ -54,8 +54,9 @@ deploy_ota() {
 
 write_test_file() {
     local name=$1 size_mb=$2
-    for w in $(seq 1 10); do [ -b /dev/sda1 ] && break; sleep 1; done
-    [ -b /dev/sda1 ] || { log "  WARN: /dev/sda1 not found"; return 1; }
+    # Wait up to 90s for USB drive (device has 60s USB presentation delay)
+    for w in $(seq 1 90); do [ -b /dev/sda1 ] && break; sleep 1; done
+    [ -b /dev/sda1 ] || { log "  WARN: /dev/sda1 not found after 90s"; return 1; }
     sudo mount -o noatime /dev/sda1 /mnt 2>/dev/null || { log "  WARN: mount failed"; return 1; }
     sudo rm -f /mnt/harvested/.done__test_* /mnt/harvested/test_*.bin /mnt/test_*.bin 2>/dev/null
     sudo dd if=/dev/urandom of="/mnt/$name" bs=1M count="$size_mb" 2>/dev/null
@@ -134,8 +135,10 @@ python3 -c "import serial; s=serial.Serial('/dev/ttyACM0', 1200); s.close()" 2>/
 sleep 3
 (cd "$FW_DIR" && ~/.local/bin/pio run -t upload --upload-port /dev/ttyACM0 2>&1 | tail -1)
 
-# Clean SD
-power_cycle 5; sleep 8
+# Clean SD (wait for 60s USB delay)
+power_cycle 5
+log "Waiting for USB drive (60s delay)..."
+for w in $(seq 1 90); do [ -b /dev/sda1 ] && break; sleep 1; done
 if [ -b /dev/sda1 ]; then
     sudo mount -o noatime /dev/sda1 /mnt 2>/dev/null
     sudo rm -f /mnt/harvested/.done__test_* /mnt/test_*.bin /mnt/harvested/test_*.bin 2>/dev/null
