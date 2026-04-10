@@ -13,8 +13,8 @@ LOG="/tmp/e2e_results_$(date +%Y%m%d_%H%M%S).txt"
 PASS=0; FAIL=0; SKIP=0
 
 log() { echo "$(date +%H:%M:%S) $1" | tee -a "$LOG"; }
-pass() { log "  PASS: $1"; ((PASS++)); }
-fail() { log "  FAIL: $1"; ((FAIL++)); }
+pass() { log "  PASS: $1"; PASS=$((PASS + 1)); }
+fail() { log "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 
 power_cycle() {
     $COOLGEAR off >/dev/null 2>&1; sleep "${1:-5}"; $COOLGEAR on >/dev/null 2>&1
