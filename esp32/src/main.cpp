@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "10.0015.1"
+#define FW_VERSION "10.1320.3"
 
 #include <cstring>
 #include <ctime>
@@ -4137,6 +4137,16 @@ static void main_loop_task(void* param) {
     uint32_t usbPresentMs = millis();
 
     for (;;) {
+        // Watchdog: restart modem task if it died
+        if (g_modem_task == nullptr && g_modemReady) {
+            log_write("Modem: task died — restarting");
+            cdc_printf("Modem: restarting task...\r\n");
+            g_modemReady = false;
+            g_pppConnected = false;
+            xTaskCreatePinnedToCore(modemTask, "modem", 16384, nullptr, 2, &g_modem_task, 0);
+            vTaskDelay(pdMS_TO_TICKS(5000));  // give it time to init
+        }
+
         // Enable USB MSC after delay (card sectors must be valid)
         if (!g_sd_ready && g_card_sectors > 0 && (millis() - usbPresentMs) >= USB_PRESENT_DELAY_MS) {
             g_sd_ready = true;
@@ -4446,7 +4456,7 @@ extern "C" void app_main(void) {
     // ── Create tasks ────────────────────────────────────────────────────
     xTaskCreatePinnedToCore(uploadTask,    "upload",    16384, nullptr, 1, &g_upload_task,  1);
     xTaskCreatePinnedToCore(harvestTask,   "harvest",   16384, nullptr, 1, &g_harvest_task, 1);
-    xTaskCreatePinnedToCore(modemTask,     "modem",      8192, nullptr, 2, &g_modem_task,   0);  // core 0, higher priority for PPP pump
+    xTaskCreatePinnedToCore(modemTask,     "modem",     16384, nullptr, 2, &g_modem_task,   0);  // core 0, 16KB stack for reconnection
     xTaskCreatePinnedToCore(main_loop_task, "main_loop", 4096, nullptr, 1, nullptr,         0);
 
     // ── Scan /harvested/ for leftover files from before last reboot ─────
