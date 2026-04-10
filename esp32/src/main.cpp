@@ -3241,8 +3241,27 @@ static void modemTask(void* param) {
                         lastPppRxMs = millis();
                         test_launched = false;
                         redialOk = true;
-                        cdc_printf("Modem: PPP reconnected\r\n");
-                        log_write("Modem: PPP reconnected");
+                        cdc_printf("Modem: PPP CONNECT — waiting for IP...\r\n");
+                        log_write("Modem: PPP redial CONNECT");
+                        // Wait up to 30s for PPP IP
+                        bool gotIp = false;
+                        for (int w = 0; w < 30; w++) {
+                            vTaskDelay(pdMS_TO_TICKS(1000));
+                            // Pump UART data to PPP during wait
+                            uint8_t pumpBuf[512];
+                            int plen = uart_read_bytes(UART_NUM_1, pumpBuf, sizeof(pumpBuf), pdMS_TO_TICKS(50));
+                            if (plen > 0) esp_netif_receive(g_ppp_netif, pumpBuf, plen, nullptr);
+                            if (g_pppConnected) { gotIp = true; break; }
+                        }
+                        if (gotIp) {
+                            cdc_printf("Modem: PPP reconnected with IP\r\n");
+                            log_write("Modem: PPP reconnected OK");
+                        } else {
+                            cdc_printf("Modem: PPP no IP after 30s — will retry\r\n");
+                            log_write("Modem: PPP no IP — retry");
+                            g_pppNeedsReconnect = true;
+                            redialOk = false;
+                        }
                     } else {
                         cdc_printf("Modem: dial failed: %.60s\r\n", resp);
                         modem_at_cmd("ATH", resp, sizeof(resp), 2000);
