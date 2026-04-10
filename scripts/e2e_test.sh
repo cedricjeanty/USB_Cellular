@@ -85,14 +85,16 @@ wait_for_ota() {
     return 1
 }
 
-# Wait for file to appear on S3
+# Sets S3_RESULT global
+S3_RESULT=""
 wait_for_s3_file() {
     local key=$1 timeout=${2:-300}
     local t=0
+    S3_RESULT=""
     while [ $t -lt $timeout ]; do
         sleep 10; t=$((t + 10))
-        local found=$(aws s3 ls "s3://$BUCKET/$DEVICE/$key" 2>&1 | grep "2026-")
-        if [ -n "$found" ]; then echo "$found"; return 0; fi
+        S3_RESULT=$(aws s3 ls "s3://$BUCKET/$DEVICE/$key" 2>&1 | grep "2026-")
+        if [ -n "$S3_RESULT" ]; then return 0; fi
         local mp=$(aws s3api list-multipart-uploads --bucket $BUCKET \
             --query "Uploads[?contains(Key,'$key')].UploadId" --output text 2>&1)
         if [ -n "$mp" ] && [ "$mp" != "None" ]; then
@@ -151,7 +153,9 @@ log "TEST 1: Normal OTA update ($VBASE → $V1)"
 cleanup; deploy_ota "$V1"
 sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$VBASE\"/" "$FW_DIR/src/main.cpp"
 power_cycle 5; sleep 5; wait_for_usb
-wait_for_ota "$V1" 180
+# OTA timeline: 26s modem + 3s check + 20s download + 1s reboot + 26s second boot ≈ 80s
+# But version check only works after second boot, so allow 180s
+wait_for_ota "$V1" 240
 [ "$OTA_RESULT" = "$V1" ] && pass "OTA: $VBASE → $V1" || fail "OTA: expected $V1, got '$OTA_RESULT'"
 
 # ── TEST 2: OTA with power cut ─────────────────────────────────
@@ -160,11 +164,12 @@ log "TEST 2: OTA + power cut ($V1 → $V2)"
 deploy_ota "$V2"
 sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$V1\"/" "$FW_DIR/src/main.cpp"
 power_cycle 5; sleep 5; wait_for_usb
-log "  Cutting power at 30s..."
-sleep 30; $COOLGEAR off >/dev/null 2>&1; sleep 10
+log "  Cutting power at 40s (mid-download)..."
+sleep 40; $COOLGEAR off >/dev/null 2>&1; sleep 10
 log "  Powering back on..."
 $COOLGEAR on >/dev/null 2>&1; sleep 5; wait_for_usb
-wait_for_ota "$V2" 180
+# After power cut, device boots → OTA retries → downloads → reboots (double boot cycle)
+wait_for_ota "$V2" 300
 [ "$OTA_RESULT" = "$V2" ] && pass "OTA interrupted + resumed: $V1 → $V2" || fail "OTA interrupted: expected $V2, got '$OTA_RESULT'"
 
 # ── TEST 3: Normal 10MB upload ──────────────────────────────────
@@ -175,7 +180,7 @@ CUR=$(get_fw_version); deploy_ota "${CUR:-$V2}"
 sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"${CUR:-$V2}\"/" "$FW_DIR/src/main.cpp"
 write_test_file "test_upload.bin" 10
 power_cycle 5; sleep 5; wait_for_usb
-S3_RESULT=$(wait_for_s3_file "test_upload.bin" 300)
+wait_for_s3_file "test_upload.bin" 300
 [ -n "$S3_RESULT" ] && pass "Upload: $S3_RESULT" || fail "Upload: not found after 5 min"
 
 # ── TEST 4: Upload with power cut ───────────────────────────────
@@ -187,8 +192,9 @@ sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"${CUR:-$V2}\"/" "$F
 write_test_file "test_resume.bin" 10
 power_cycle 5; sleep 5; wait_for_usb
 # Wait for upload to start then cut power
+# Wait longer: 60s USB delay + 26s modem + 15s harvest + upload start
 MP_CUT=false
-for i in $(seq 1 20); do
+for i in $(seq 1 30); do
     sleep 10
     MP=$(aws s3api list-multipart-uploads --bucket $BUCKET \
         --query "Uploads[?contains(Key,'test_resume')].UploadId" --output text 2>&1)
@@ -209,8 +215,8 @@ for i in $(seq 1 20); do
     fi
 done
 if $MP_CUT; then
-    RESULT=$(wait_for_s3_file "test_resume.bin" 300)
-    [ -n "$RESULT" ] && pass "Upload resumed: $RESULT" || fail "Upload resume failed"
+    wait_for_s3_file "test_resume.bin" 300
+    [ -n "$S3_RESULT" ] && pass "Upload resumed: $S3_RESULT" || fail "Upload resume failed"
 else
     fail "Upload never started"
 fi
