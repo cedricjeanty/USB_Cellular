@@ -135,16 +135,38 @@ V1="${BASE_VER}.1"; V2="${BASE_VER}.2"; V3="${BASE_VER}.3"
 V4="${BASE_VER}.4"; V5="${BASE_VER}.5"; VBASE="${BASE_VER}.0"
 log "Versions: $VBASE → $V5"
 
-# Flash base version
+# Flash base version + set S3 to match (prevent OTA overwriting the flash)
 log "Flashing base firmware v$VBASE..."
 sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$VBASE\"/" "$FW_DIR/src/main.cpp"
 (cd "$FW_DIR" && ~/.local/bin/pio run 2>&1 | tail -1)
+deploy_ota "$VBASE"  # S3 matches base so OTA won't trigger on first boot
 python3 -c "import serial; s=serial.Serial('/dev/ttyACM0', 1200); s.close()" 2>/dev/null
 sleep 3
 (cd "$FW_DIR" && ~/.local/bin/pio run -t upload --upload-port /dev/ttyACM0 2>&1 | tail -1)
+sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$VBASE\"/" "$FW_DIR/src/main.cpp"
 
 # Clean SD (wait for 60s USB delay)
 power_cycle 5
+# Verify flash took effect
+sleep 12
+FLASH_V=$(get_fw_version | tr -d '[:space:]')
+if [ "$FLASH_V" = "$VBASE" ]; then
+    log "Flash verified: $FLASH_V"
+else
+    log "ERROR: Flash failed! Device has '$FLASH_V', expected '$VBASE'"
+    log "The OTA partition may have a newer version. Try holding BOOT and reflashing."
+    # Try to fix by deploying base version via OTA
+    log "Attempting OTA fix..."
+    deploy_ota "$VBASE"
+    wait_for_ota "$VBASE" 180
+    if [ "$OTA_RESULT" = "$VBASE" ]; then
+        log "OTA fix applied: $VBASE"
+    else
+        log "FATAL: Cannot set base version. Aborting."
+        exit 1
+    fi
+fi
+
 log "Waiting for USB drive (60s delay)..."
 SDDEV=""
 for w in $(seq 1 90); do
@@ -189,8 +211,8 @@ log "TEST 3: Normal 10MB upload"
 cleanup; aws s3 rm "s3://$BUCKET/$DEVICE/test_upload.bin" 2>/dev/null
 CUR=$(get_fw_version); deploy_ota "${CUR:-$V2}"
 sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"${CUR:-$V2}\"/" "$FW_DIR/src/main.cpp"
-write_test_file "test_upload.bin" 10
 power_cycle 5; sleep 5; wait_for_usb
+write_test_file "test_upload.bin" 10
 wait_for_s3_file "test_upload.bin" 300
 [ -n "$S3_RESULT" ] && pass "Upload: $S3_RESULT" || fail "Upload: not found after 5 min"
 
@@ -200,8 +222,8 @@ log "TEST 4: Upload + power cut"
 cleanup; aws s3 rm "s3://$BUCKET/$DEVICE/test_resume.bin" 2>/dev/null
 CUR=$(get_fw_version); deploy_ota "${CUR:-$V2}"
 sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"${CUR:-$V2}\"/" "$FW_DIR/src/main.cpp"
-write_test_file "test_resume.bin" 10
 power_cycle 5; sleep 5; wait_for_usb
+write_test_file "test_resume.bin" 10
 # Wait for upload to start then cut power
 # Wait longer: 60s USB delay + 26s modem + 15s harvest + upload start
 MP_CUT=false
@@ -238,8 +260,8 @@ log "TEST 5: OTA + upload ($V2 → $V3)"
 cleanup; aws s3 rm "s3://$BUCKET/$DEVICE/test_combo.bin" 2>/dev/null
 deploy_ota "$V3"
 sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$V2\"/" "$FW_DIR/src/main.cpp"
-write_test_file "test_combo.bin" 10
 power_cycle 5; sleep 5; wait_for_usb
+write_test_file "test_combo.bin" 10
 OTA_OK=false; UPLOAD_OK=false
 for i in $(seq 1 120); do
     sleep 10
@@ -267,8 +289,8 @@ log "TEST 6: Chaos test ($V3 → $V4)"
 cleanup; aws s3 rm "s3://$BUCKET/$DEVICE/test_chaos.bin" 2>/dev/null
 deploy_ota "$V4"
 sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$V3\"/" "$FW_DIR/src/main.cpp"
-write_test_file "test_chaos.bin" 10
 power_cycle 5; sleep 5; wait_for_usb
+write_test_file "test_chaos.bin" 10
 log "  Cutting power at 45s..."
 sleep 45; $COOLGEAR off >/dev/null 2>&1; sleep 10
 log "  Powering back on..."
