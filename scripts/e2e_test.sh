@@ -73,11 +73,11 @@ wait_for_ota() {
             log "  ${t}s: device rebooting..." >&2
             sleep 10; t=$((t + 10)); wait_for_usb; sleep 5; t=$((t + 5))
         fi
-        local v=$(get_fw_version)
+        local v=$(get_fw_version | tr -d '[:space:]')
         [ "$v" = "$expected" ] && { echo "$v"; return 0; }
-        [ $((t % 30)) -eq 0 ] && log "  ${t}s: fw=$v (waiting for $expected)" >&2
+        [ $((t % 30)) -eq 0 ] && [ -n "$v" ] && log "  ${t}s: fw=$v (waiting for $expected)" >&2
     done
-    echo "$(get_fw_version)"; return 1
+    get_fw_version | tr -d '[:space:]'; return 1
 }
 
 # Wait for file to appear on S3
