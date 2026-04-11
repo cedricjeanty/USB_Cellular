@@ -1,106 +1,11 @@
 #include <unity.h>
+#include "hal/test_impls.h"
 #include <cstring>
 #include <string>
-#include <map>
 #include "hal/hal.h"
 #include "airbridge_s3.h"
 
-// ── In-memory NVS ───────────────────────────────────────────────────────────
-
-class TestNvs : public INvs {
-public:
-    std::map<std::string, std::map<std::string, std::string>> store;
-    void clear_all() { store.clear(); }
-    bool get_str(const char* ns, const char* key, char* out, size_t sz) override {
-        auto nit = store.find(ns); if (nit == store.end()) { out[0]='\0'; return false; }
-        auto kit = nit->second.find(key); if (kit == nit->second.end()) { out[0]='\0'; return false; }
-        strlcpy(out, kit->second.c_str(), sz); return true;
-    }
-    bool set_str(const char* ns, const char* key, const char* val) override { store[ns][key]=val; return true; }
-    bool get_u8(const char*, const char*, uint8_t*) override { return false; }
-    bool set_u8(const char*, const char*, uint8_t) override { return true; }
-    bool get_i32(const char* ns, const char* key, int32_t* out) override {
-        auto nit = store.find(ns); if (nit == store.end()) return false;
-        auto kit = nit->second.find(key); if (kit == nit->second.end()) return false;
-        *out = (int32_t)std::stol(kit->second); return true;
-    }
-    bool set_i32(const char* ns, const char* key, int32_t val) override { store[ns][key]=std::to_string(val); return true; }
-    bool get_u32(const char* ns, const char* key, uint32_t* out) override {
-        auto nit = store.find(ns); if (nit == store.end()) return false;
-        auto kit = nit->second.find(key); if (kit == nit->second.end()) return false;
-        *out = (uint32_t)std::stoul(kit->second); return true;
-    }
-    bool set_u32(const char* ns, const char* key, uint32_t val) override { store[ns][key]=std::to_string(val); return true; }
-    void erase_key(const char* ns, const char* key) override {
-        auto nit = store.find(ns); if (nit != store.end()) nit->second.erase(key);
-    }
-};
-
-// Stubs and mocks
-class StubDisplay : public IDisplay {
-public: bool init() override { return true; } void flush() override {} bool ok() const override { return true; }
-};
-class TestClock : public IClock {
-public: uint32_t ms = 0; uint32_t millis() override { return ms; } void delay_ms(uint32_t d) override { ms += d; }
-};
-
-// In-memory filesystem for upload testing
-class MemFilesys : public IFilesys {
-public:
-    std::map<std::string, std::string> files;
-    struct MemHandle { std::string path; size_t pos; std::string wbuf; };
-
-    void add_file(const char* path, const std::string& content) { files[path] = content; }
-
-    void* open(const char* path, const char* mode) override {
-        if (mode[0] == 'r') { auto it = files.find(path); if (it == files.end()) return nullptr; }
-        return new MemHandle{path, 0, ""};
-    }
-    size_t read(void* f, void* buf, size_t len) override {
-        auto* h = (MemHandle*)f; auto it = files.find(h->path); if (it == files.end()) return 0;
-        size_t avail = it->second.size() - h->pos; size_t n = (len < avail) ? len : avail;
-        memcpy(buf, it->second.c_str() + h->pos, n); h->pos += n; return n;
-    }
-    size_t write(void* f, const void* buf, size_t len) override {
-        auto* h = (MemHandle*)f; h->wbuf.append((const char*)buf, len); return len;
-    }
-    bool seek(void* f, long off, int w) override { auto* h=(MemHandle*)f; if(w==0) h->pos=off; return true; }
-    long tell(void* f) override { return ((MemHandle*)f)->pos; }
-    void close(void* f) override { auto* h=(MemHandle*)f; if(!h->wbuf.empty()) files[h->path]=h->wbuf; delete h; }
-    void* opendir(const char*) override { return nullptr; }
-    bool readdir(void*, FsDirEntry*) override { return false; }
-    void closedir(void*) override {}
-    bool stat(const char* path, uint32_t* sz, bool* d) override {
-        auto it = files.find(path); if (it == files.end()) return false;
-        if (sz) *sz = it->second.size(); if (d) *d = false; return true;
-    }
-    bool mkdir(const char*) override { return true; }
-    bool remove(const char*) override { return true; }
-    bool exists(const char* path) override { return files.count(path) > 0; }
-};
-
-// Mock network that returns canned HTTP responses
-class MockNetwork : public INetwork {
-public:
-    struct MockConn { std::string resp; size_t pos; std::string captured; };
-    std::string next_response;
-    std::string last_request;
-    bool fail_connect = false;
-
-    TlsHandle connect(const char*) override {
-        if (fail_connect) return nullptr;
-        return new MockConn{next_response, 0, ""};
-    }
-    bool write(TlsHandle conn, const void* data, size_t len) override {
-        auto* c = (MockConn*)conn; c->captured.append((const char*)data, len); last_request = c->captured; return true;
-    }
-    int read(TlsHandle conn, void* buf, size_t len) override {
-        auto* c = (MockConn*)conn; size_t avail = c->resp.size() - c->pos;
-        if (avail == 0) return 0; size_t n = (len < avail) ? len : avail;
-        memcpy(buf, c->resp.c_str() + c->pos, n); c->pos += n; return (int)n;
-    }
-    void destroy(TlsHandle conn) override { delete (MockConn*)conn; }
-};
+// ── Test fixtures ──────────────────────────────────────────────────────────
 
 static StubDisplay s_display;
 static TestClock   s_clock;
@@ -113,11 +18,9 @@ HAL* g_hal = nullptr;
 void setUp(void) {
     g_hal = &s_hal;
     s_nvs.clear_all();
-    s_fs.files.clear();
-    s_net.next_response = "";
-    s_net.last_request = "";
-    s_net.fail_connect = false;
-    s_clock.ms = 1000;
+    s_fs.clear_all();
+    s_net.reset();
+    s_clock.now_ms = 1000;
 }
 void tearDown(void) {}
 
@@ -313,7 +216,7 @@ void test_load_creds_missing(void) {
 // ── halS3UploadFile tests ───────────────────────────────────────────────────
 
 void test_upload_no_creds(void) {
-    s_fs.add_file("/sd/harvested/test.txt", "data");
+    s_fs.add_file_str("/sd/harvested/test.txt", "data");
     UploadResult r = halS3UploadFile("/sd/harvested/test.txt", "test.txt");
     TEST_ASSERT_FALSE(r.success);
     TEST_ASSERT_TRUE(strstr(r.error, "credentials") != nullptr);
@@ -331,7 +234,7 @@ void test_upload_presign_fails(void) {
     s_nvs.set_str("s3", "api_host", "api.ex.com");
     s_nvs.set_str("s3", "api_key", "key");
     s_nvs.set_str("s3", "device_id", "D1");
-    s_fs.add_file("/sd/harvested/test.txt", "hello");
+    s_fs.add_file_str("/sd/harvested/test.txt", "hello");
     // Empty presign response
     s_net.next_response = "HTTP/1.1 500 Error\r\n\r\n{\"error\":\"fail\"}";
     UploadResult r = halS3UploadFile("/sd/harvested/test.txt", "test.txt");
@@ -343,7 +246,7 @@ void test_upload_success(void) {
     s_nvs.set_str("s3", "api_host", "api.ex.com");
     s_nvs.set_str("s3", "api_key", "key");
     s_nvs.set_str("s3", "device_id", "D1");
-    s_fs.add_file("/sd/harvested/test.txt", "hello world");
+    s_fs.add_file_str("/sd/harvested/test.txt", "hello world");
 
     // First connection: presign API → returns URL
     // Second connection: S3 PUT → returns 200
@@ -365,7 +268,7 @@ void test_upload_connect_fails(void) {
     s_nvs.set_str("s3", "api_host", "api.ex.com");
     s_nvs.set_str("s3", "api_key", "key");
     s_nvs.set_str("s3", "device_id", "D1");
-    s_fs.add_file("/sd/harvested/test.txt", "data");
+    s_fs.add_file_str("/sd/harvested/test.txt", "data");
     s_net.fail_connect = true;
     UploadResult r = halS3UploadFile("/sd/harvested/test.txt", "test.txt");
     TEST_ASSERT_FALSE(r.success);

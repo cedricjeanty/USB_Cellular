@@ -1,47 +1,11 @@
 #include <unity.h>
+#include "hal/test_impls.h"
 #include <cstring>
 #include <cstdarg>
 #include <cstdio>
-#include "hal/hal.h"
 #include "airbridge_display.h"
 
-// ── Test implementations ────────────────────────────────────────────────────
-
-class TestDisplay : public IDisplay {
-public:
-    bool init() override { ok_ = true; return true; }
-    void flush() override { flush_count++; }
-    bool ok() const override { return ok_; }
-
-    int flush_count = 0;
-
-    bool pixel_at(int x, int y) const {
-        if (x < 0 || x >= SCREEN_W || y < 0 || y >= SCREEN_H) return false;
-        return (framebuf[x + (y / 8) * SCREEN_W] & (1 << (y & 7))) != 0;
-    }
-
-    int pixel_count() const {
-        int count = 0;
-        for (int i = 0; i < FRAMEBUF_SIZE; i++)
-            for (int b = 0; b < 8; b++)
-                if (framebuf[i] & (1 << b)) count++;
-        return count;
-    }
-
-    void reset() {
-        clear();
-        flush_count = 0;
-    }
-private:
-    bool ok_ = false;
-};
-
-class TestClock : public IClock {
-public:
-    uint32_t millis() override { return now_ms; }
-    void delay_ms(uint32_t ms) override { now_ms += ms; }
-    uint32_t now_ms = 0;
-};
+// ── Test fixtures ──────────────────────────────────────────────────────────
 
 static TestDisplay s_display;
 static TestClock   s_clock;

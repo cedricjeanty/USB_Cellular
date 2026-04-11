@@ -1,105 +1,23 @@
 #include <unity.h>
+#include "hal/test_impls.h"
 #include <cstring>
 #include <string>
-#include <vector>
 #include "hal/hal.h"
 #include "airbridge_http.h"
 
-// ── Mock network: feeds canned HTTP responses ───────────────────────────────
-
-class TestNetwork : public INetwork {
-public:
-    struct MockConn {
-        std::string response_data;
-        size_t pos;
-        std::string captured_request;
-    };
-
-    std::string next_response;    // Pre-loaded full HTTP response (headers+body)
-    std::string last_host;
-    std::string last_request;
-    bool connect_fails = false;
-
-    TlsHandle connect(const char* host) override {
-        if (connect_fails) return nullptr;
-        last_host = host;
-        auto* c = new MockConn{next_response, 0, ""};
-        return (TlsHandle)c;
-    }
-
-    bool write(TlsHandle conn, const void* data, size_t len) override {
-        auto* c = (MockConn*)conn;
-        c->captured_request.append((const char*)data, len);
-        last_request = c->captured_request;
-        return true;
-    }
-
-    int read(TlsHandle conn, void* buf, size_t len) override {
-        auto* c = (MockConn*)conn;
-        size_t avail = c->response_data.size() - c->pos;
-        if (avail == 0) return 0;
-        size_t n = (len < avail) ? len : avail;
-        memcpy(buf, c->response_data.c_str() + c->pos, n);
-        c->pos += n;
-        return (int)n;
-    }
-
-    void destroy(TlsHandle conn) override {
-        delete (MockConn*)conn;
-    }
-};
-
-// ── Stubs ───────────────────────────────────────────────────────────────────
-
-class StubDisplay : public IDisplay {
-public: bool init() override { return true; } void flush() override {} bool ok() const override { return true; }
-};
-class StubClock : public IClock {
-public: uint32_t millis() override { return 0; } void delay_ms(uint32_t) override {}
-};
-class StubNvs : public INvs {
-public:
-    bool get_str(const char*, const char*, char* o, size_t) override { o[0]=0; return false; }
-    bool set_str(const char*, const char*, const char*) override { return true; }
-    bool get_u8(const char*, const char*, uint8_t*) override { return false; }
-    bool set_u8(const char*, const char*, uint8_t) override { return true; }
-    bool get_i32(const char*, const char*, int32_t*) override { return false; }
-    bool set_i32(const char*, const char*, int32_t) override { return true; }
-    bool get_u32(const char*, const char*, uint32_t*) override { return false; }
-    bool set_u32(const char*, const char*, uint32_t) override { return true; }
-    void erase_key(const char*, const char*) override {}
-};
-class StubFilesys : public IFilesys {
-public:
-    void* open(const char*, const char*) override { return nullptr; }
-    size_t read(void*, void*, size_t) override { return 0; }
-    size_t write(void*, const void*, size_t) override { return 0; }
-    bool seek(void*, long, int) override { return false; }
-    long tell(void*) override { return 0; }
-    void close(void*) override {}
-    void* opendir(const char*) override { return nullptr; }
-    bool readdir(void*, FsDirEntry*) override { return false; }
-    void closedir(void*) override {}
-    bool stat(const char*, uint32_t*, bool*) override { return false; }
-    bool mkdir(const char*) override { return false; }
-    bool remove(const char*) override { return false; }
-    bool exists(const char*) override { return false; }
-};
+// ── Test fixtures ──────────────────────────────────────────────────────────
 
 static StubDisplay  s_display;
 static StubClock    s_clock;
 static StubNvs      s_nvs;
 static StubFilesys  s_fs;
-static TestNetwork  s_net;
+static MockNetwork  s_net;
 static HAL          s_hal = { &s_display, &s_clock, &s_nvs, &s_fs, &s_net };
 HAL* g_hal = nullptr;
 
 void setUp(void) {
     g_hal = &s_hal;
-    s_net.next_response = "";
-    s_net.last_host = "";
-    s_net.last_request = "";
-    s_net.connect_fails = false;
+    s_net.reset();
 }
 void tearDown(void) {}
 
@@ -174,7 +92,7 @@ void test_s3ApiGet_success(void) {
 }
 
 void test_s3ApiGet_connect_failure(void) {
-    s_net.connect_fails = true;
+    s_net.fail_connect = true;
     std::string resp = s3ApiGetViaHal("api.example.com", "mykey", "action=presign");
     TEST_ASSERT_EQUAL_STRING("", resp.c_str());
 }

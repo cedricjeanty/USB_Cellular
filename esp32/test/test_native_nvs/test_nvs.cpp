@@ -1,87 +1,11 @@
 #include <unity.h>
+#include "hal/test_impls.h"
 #include <cstring>
 #include <string>
-#include <map>
 #include "hal/hal.h"
 #include "airbridge_wifi_creds.h"
 
-// ── In-memory NVS mock ──────────────────────────────────────────────────────
-
-class TestNvs : public INvs {
-public:
-    // Nested map: namespace → key → value (stored as string)
-    std::map<std::string, std::map<std::string, std::string>> store;
-
-    void clear_all() { store.clear(); }
-
-    bool get_str(const char* ns, const char* key, char* out, size_t sz) override {
-        auto nit = store.find(ns);
-        if (nit == store.end()) { out[0] = '\0'; return false; }
-        auto kit = nit->second.find(key);
-        if (kit == nit->second.end()) { out[0] = '\0'; return false; }
-        strlcpy(out, kit->second.c_str(), sz);
-        return true;
-    }
-    bool set_str(const char* ns, const char* key, const char* val) override {
-        store[ns][key] = val;
-        return true;
-    }
-    bool get_u8(const char* ns, const char* key, uint8_t* out) override {
-        auto nit = store.find(ns);
-        if (nit == store.end()) return false;
-        auto kit = nit->second.find(key);
-        if (kit == nit->second.end()) return false;
-        *out = (uint8_t)std::stoi(kit->second);
-        return true;
-    }
-    bool set_u8(const char* ns, const char* key, uint8_t val) override {
-        store[ns][key] = std::to_string(val);
-        return true;
-    }
-    bool get_i32(const char* ns, const char* key, int32_t* out) override {
-        auto nit = store.find(ns);
-        if (nit == store.end()) return false;
-        auto kit = nit->second.find(key);
-        if (kit == nit->second.end()) return false;
-        *out = (int32_t)std::stol(kit->second);
-        return true;
-    }
-    bool set_i32(const char* ns, const char* key, int32_t val) override {
-        store[ns][key] = std::to_string(val);
-        return true;
-    }
-    bool get_u32(const char* ns, const char* key, uint32_t* out) override {
-        auto nit = store.find(ns);
-        if (nit == store.end()) return false;
-        auto kit = nit->second.find(key);
-        if (kit == nit->second.end()) return false;
-        *out = (uint32_t)std::stoul(kit->second);
-        return true;
-    }
-    bool set_u32(const char* ns, const char* key, uint32_t val) override {
-        store[ns][key] = std::to_string(val);
-        return true;
-    }
-    void erase_key(const char* ns, const char* key) override {
-        auto nit = store.find(ns);
-        if (nit != store.end()) nit->second.erase(key);
-    }
-};
-
-// ── Minimal display/clock stubs (required by HAL but not used) ──────────────
-
-class StubDisplay : public IDisplay {
-public:
-    bool init() override { return true; }
-    void flush() override {}
-    bool ok() const override { return true; }
-};
-
-class StubClock : public IClock {
-public:
-    uint32_t millis() override { return 0; }
-    void delay_ms(uint32_t) override {}
-};
+// ── Test fixtures ──────────────────────────────────────────────────────────
 
 static StubDisplay s_display;
 static StubClock   s_clock;
