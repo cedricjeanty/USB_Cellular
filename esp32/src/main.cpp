@@ -16,6 +16,14 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
+#include "airbridge_utils.h"
+#include "airbridge_proto.h"
+#include "hal/hal.h"
+#include "airbridge_display.h"
+#include "airbridge_wifi_creds.h"
+#include "airbridge_harvest.h"
+#include "airbridge_http.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -59,6 +67,8 @@
 
 static const char *TAG = "airbridge";
 
+HAL* g_hal = nullptr;
+
 // ── MSC-only mode (no CDC) ──────────────────────────────────────────────────
 // Default: MSC-only for avionics compatibility. Set via CLI: SETMODE CDC / SETMODE MSC
 // Persists in NVS. CDC mode gives serial console for debugging + config.
@@ -66,6 +76,7 @@ static bool g_msc_only = false;  // default CDC+MSC until SETMODE MSC is run
 
 // ── Utility: millis() equivalent ─────────────────────────────────────────────
 static inline uint32_t millis() {
+    if (g_hal && g_hal->clock) return g_hal->clock->millis();
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
 }
 
@@ -84,246 +95,220 @@ static inline uint32_t millis() {
 #define PIN_MODEM_CTS   2
 
 // ── Display constants ────────────────────────────────────────────────────────
-#define SCREEN_W   128
-#define SCREEN_H    64
+// SCREEN_W, SCREEN_H defined in hal/display.h
 #define OLED_ADDR  0x3C
 
-// ── SSD1306 OLED driver (raw I2C) ───────────────────────────────────────────
-static i2c_master_bus_handle_t g_i2c_bus   = nullptr;
-static i2c_master_dev_handle_t g_oled_dev  = nullptr;
-static uint8_t g_framebuf[SCREEN_W * SCREEN_H / 8];  // 1024 bytes
-static bool g_oled_ok = false;
+// ── SSD1306 OLED driver (ESP32 HAL implementation) ──────────────────────────
+class Esp32Display : public IDisplay {
+public:
+    bool init() override {
+        i2c_master_bus_config_t bus_cfg = {};
+        bus_cfg.i2c_port = I2C_NUM_0;
+        bus_cfg.sda_io_num = (gpio_num_t)PIN_I2C_SDA;
+        bus_cfg.scl_io_num = (gpio_num_t)PIN_I2C_SCL;
+        bus_cfg.clk_source = I2C_CLK_SRC_DEFAULT;
+        bus_cfg.glitch_ignore_cnt = 7;
+        bus_cfg.flags.enable_internal_pullup = true;
 
-static void oled_cmd(uint8_t cmd) {
-    uint8_t buf[2] = {0x00, cmd};  // Co=0, D/C#=0 (command)
-    i2c_master_transmit(g_oled_dev, buf, 2, 100);
-}
+        if (i2c_new_master_bus(&bus_cfg, &bus_) != ESP_OK) {
+            ESP_LOGE(TAG, "I2C bus init failed");
+            return false;
+        }
 
-static void oled_init() {
-    i2c_master_bus_config_t bus_cfg = {};
-    bus_cfg.i2c_port = I2C_NUM_0;
-    bus_cfg.sda_io_num = (gpio_num_t)PIN_I2C_SDA;
-    bus_cfg.scl_io_num = (gpio_num_t)PIN_I2C_SCL;
-    bus_cfg.clk_source = I2C_CLK_SRC_DEFAULT;
-    bus_cfg.glitch_ignore_cnt = 7;
-    bus_cfg.flags.enable_internal_pullup = true;
+        i2c_device_config_t dev_cfg = {};
+        dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+        dev_cfg.device_address = OLED_ADDR;
+        dev_cfg.scl_speed_hz = 400000;
 
-    if (i2c_new_master_bus(&bus_cfg, &g_i2c_bus) != ESP_OK) {
-        ESP_LOGE(TAG, "I2C bus init failed");
-        return;
+        if (i2c_master_bus_add_device(bus_, &dev_cfg, &dev_) != ESP_OK) {
+            ESP_LOGE(TAG, "OLED device add failed");
+            return false;
+        }
+
+        static const uint8_t init_cmds[] = {
+            0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0x40,
+            0x8D, 0x14, 0x20, 0x00, 0xA1, 0xC8, 0xDA, 0x12,
+            0x81, 0xCF, 0xD9, 0xF1, 0xDB, 0x40, 0xA4, 0xA6, 0xAF,
+        };
+        for (size_t i = 0; i < sizeof(init_cmds); i++) cmd(init_cmds[i]);
+        clear();
+        ok_ = true;
+        return true;
     }
 
-    i2c_device_config_t dev_cfg = {};
-    dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-    dev_cfg.device_address = OLED_ADDR;
-    dev_cfg.scl_speed_hz = 400000;
-
-    if (i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &g_oled_dev) != ESP_OK) {
-        ESP_LOGE(TAG, "OLED device add failed");
-        return;
-    }
-
-    // SSD1306 init sequence
-    static const uint8_t init_cmds[] = {
-        0xAE,       // display off
-        0xD5, 0x80, // set clock div
-        0xA8, 0x3F, // multiplex 64
-        0xD3, 0x00, // display offset 0
-        0x40,       // start line 0
-        0x8D, 0x14, // charge pump enable
-        0x20, 0x00, // memory mode: horizontal
-        0xA1,       // segment remap
-        0xC8,       // COM scan dec
-        0xDA, 0x12, // COM pins
-        0x81, 0xCF, // contrast
-        0xD9, 0xF1, // precharge
-        0xDB, 0x40, // VCOMH deselect
-        0xA4,       // display from RAM
-        0xA6,       // normal (not inverted)
-        0xAF,       // display on
-    };
-    for (size_t i = 0; i < sizeof(init_cmds); i++) {
-        oled_cmd(init_cmds[i]);
-    }
-    memset(g_framebuf, 0, sizeof(g_framebuf));
-    g_oled_ok = true;
-}
-
-static void oled_flush() {
-    if (!g_oled_ok) return;
-    // Set column and page addresses to cover full screen
-    oled_cmd(0x21); oled_cmd(0); oled_cmd(127);  // column 0-127
-    oled_cmd(0x22); oled_cmd(0); oled_cmd(7);    // page 0-7
-
-    // Send framebuffer in chunks (I2C max transaction ~1024 + overhead)
-    // Each chunk: 0x40 prefix (data), then pixel bytes
-    for (int page = 0; page < 8; page++) {
-        uint8_t buf[SCREEN_W + 1];
-        buf[0] = 0x40;  // Co=0, D/C#=1 (data)
-        memcpy(buf + 1, &g_framebuf[page * SCREEN_W], SCREEN_W);
-        i2c_master_transmit(g_oled_dev, buf, SCREEN_W + 1, 100);
-    }
-}
-
-static void oled_clear() {
-    memset(g_framebuf, 0, sizeof(g_framebuf));
-}
-
-static void oled_pixel(int x, int y, bool on) {
-    if (x < 0 || x >= SCREEN_W || y < 0 || y >= SCREEN_H) return;
-    if (on) g_framebuf[x + (y / 8) * SCREEN_W] |=  (1 << (y & 7));
-    else    g_framebuf[x + (y / 8) * SCREEN_W] &= ~(1 << (y & 7));
-}
-
-static void oled_hline(int x0, int x1, int y) {
-    for (int x = x0; x <= x1; x++) oled_pixel(x, y, true);
-}
-
-static void oled_rect(int x, int y, int w, int h, bool fill) {
-    if (fill) {
-        for (int j = y; j < y + h; j++)
-            for (int i = x; i < x + w; i++)
-                oled_pixel(i, j, true);
-    } else {
-        oled_hline(x, x + w - 1, y);
-        oled_hline(x, x + w - 1, y + h - 1);
-        for (int j = y; j < y + h; j++) {
-            oled_pixel(x, j, true);
-            oled_pixel(x + w - 1, j, true);
+    void flush() override {
+        if (!ok_) return;
+        cmd(0x21); cmd(0); cmd(127);
+        cmd(0x22); cmd(0); cmd(7);
+        for (int page = 0; page < 8; page++) {
+            uint8_t buf[SCREEN_W + 1];
+            buf[0] = 0x40;
+            memcpy(buf + 1, &framebuf[page * SCREEN_W], SCREEN_W);
+            i2c_master_transmit(dev_, buf, SCREEN_W + 1, 100);
         }
     }
-}
 
-// 5x7 font (ASCII 32-126), stored as 5 columns per character
-// Standard Adafruit/GLCD font data
-static const uint8_t font5x7[] = {
-    0x00,0x00,0x00,0x00,0x00, // space
-    0x00,0x00,0x5F,0x00,0x00, // !
-    0x00,0x07,0x00,0x07,0x00, // "
-    0x14,0x7F,0x14,0x7F,0x14, // #
-    0x24,0x2A,0x7F,0x2A,0x12, // $
-    0x23,0x13,0x08,0x64,0x62, // %
-    0x36,0x49,0x55,0x22,0x50, // &
-    0x00,0x05,0x03,0x00,0x00, // '
-    0x00,0x1C,0x22,0x41,0x00, // (
-    0x00,0x41,0x22,0x1C,0x00, // )
-    0x08,0x2A,0x1C,0x2A,0x08, // *
-    0x08,0x08,0x3E,0x08,0x08, // +
-    0x00,0x50,0x30,0x00,0x00, // ,
-    0x08,0x08,0x08,0x08,0x08, // -
-    0x00,0x60,0x60,0x00,0x00, // .
-    0x20,0x10,0x08,0x04,0x02, // /
-    0x3E,0x51,0x49,0x45,0x3E, // 0
-    0x00,0x42,0x7F,0x40,0x00, // 1
-    0x42,0x61,0x51,0x49,0x46, // 2
-    0x21,0x41,0x45,0x4B,0x31, // 3
-    0x18,0x14,0x12,0x7F,0x10, // 4
-    0x27,0x45,0x45,0x45,0x39, // 5
-    0x3C,0x4A,0x49,0x49,0x30, // 6
-    0x01,0x71,0x09,0x05,0x03, // 7
-    0x36,0x49,0x49,0x49,0x36, // 8
-    0x06,0x49,0x49,0x29,0x1E, // 9
-    0x00,0x36,0x36,0x00,0x00, // :
-    0x00,0x56,0x36,0x00,0x00, // ;
-    0x00,0x08,0x14,0x22,0x41, // <
-    0x14,0x14,0x14,0x14,0x14, // =
-    0x41,0x22,0x14,0x08,0x00, // >
-    0x02,0x01,0x51,0x09,0x06, // ?
-    0x32,0x49,0x79,0x41,0x3E, // @
-    0x7E,0x11,0x11,0x11,0x7E, // A
-    0x7F,0x49,0x49,0x49,0x36, // B
-    0x3E,0x41,0x41,0x41,0x22, // C
-    0x7F,0x41,0x41,0x22,0x1C, // D
-    0x7F,0x49,0x49,0x49,0x41, // E
-    0x7F,0x09,0x09,0x01,0x01, // F
-    0x3E,0x41,0x41,0x51,0x32, // G
-    0x7F,0x08,0x08,0x08,0x7F, // H
-    0x00,0x41,0x7F,0x41,0x00, // I
-    0x20,0x40,0x41,0x3F,0x01, // J
-    0x7F,0x08,0x14,0x22,0x41, // K
-    0x7F,0x40,0x40,0x40,0x40, // L
-    0x7F,0x02,0x04,0x02,0x7F, // M
-    0x7F,0x04,0x08,0x10,0x7F, // N
-    0x3E,0x41,0x41,0x41,0x3E, // O
-    0x7F,0x09,0x09,0x09,0x06, // P
-    0x3E,0x41,0x51,0x21,0x5E, // Q
-    0x7F,0x09,0x19,0x29,0x46, // R
-    0x46,0x49,0x49,0x49,0x31, // S
-    0x01,0x01,0x7F,0x01,0x01, // T
-    0x3F,0x40,0x40,0x40,0x3F, // U
-    0x1F,0x20,0x40,0x20,0x1F, // V
-    0x3F,0x40,0x38,0x40,0x3F, // W
-    0x63,0x14,0x08,0x14,0x63, // X
-    0x07,0x08,0x70,0x08,0x07, // Y
-    0x61,0x51,0x49,0x45,0x43, // Z
-    0x00,0x00,0x7F,0x41,0x41, // [
-    0x02,0x04,0x08,0x10,0x20, // backslash
-    0x41,0x41,0x7F,0x00,0x00, // ]
-    0x04,0x02,0x01,0x02,0x04, // ^
-    0x40,0x40,0x40,0x40,0x40, // _
-    0x00,0x01,0x02,0x04,0x00, // `
-    0x20,0x54,0x54,0x54,0x78, // a
-    0x7F,0x48,0x44,0x44,0x38, // b
-    0x38,0x44,0x44,0x44,0x20, // c
-    0x38,0x44,0x44,0x48,0x7F, // d
-    0x38,0x54,0x54,0x54,0x18, // e
-    0x08,0x7E,0x09,0x01,0x02, // f
-    0x08,0x14,0x54,0x54,0x3C, // g
-    0x7F,0x08,0x04,0x04,0x78, // h
-    0x00,0x44,0x7D,0x40,0x00, // i
-    0x20,0x40,0x44,0x3D,0x00, // j
-    0x00,0x7F,0x10,0x28,0x44, // k
-    0x00,0x41,0x7F,0x40,0x00, // l
-    0x7C,0x04,0x18,0x04,0x78, // m
-    0x7C,0x08,0x04,0x04,0x78, // n
-    0x38,0x44,0x44,0x44,0x38, // o
-    0x7C,0x14,0x14,0x14,0x08, // p
-    0x08,0x14,0x14,0x18,0x7C, // q
-    0x7C,0x08,0x04,0x04,0x08, // r
-    0x48,0x54,0x54,0x54,0x20, // s
-    0x04,0x3F,0x44,0x40,0x20, // t
-    0x3C,0x40,0x40,0x20,0x7C, // u
-    0x1C,0x20,0x40,0x20,0x1C, // v
-    0x3C,0x40,0x30,0x40,0x3C, // w
-    0x44,0x28,0x10,0x28,0x44, // x
-    0x0C,0x50,0x50,0x50,0x3C, // y
-    0x44,0x64,0x54,0x4C,0x44, // z
-    0x00,0x08,0x36,0x41,0x00, // {
-    0x00,0x00,0x7F,0x00,0x00, // |
-    0x00,0x41,0x36,0x08,0x00, // }
-    0x10,0x08,0x08,0x10,0x08, // ~
+    bool ok() const override { return ok_; }
+
+private:
+    i2c_master_bus_handle_t bus_ = nullptr;
+    i2c_master_dev_handle_t dev_ = nullptr;
+    bool ok_ = false;
+
+    void cmd(uint8_t c) {
+        uint8_t buf[2] = {0x00, c};
+        i2c_master_transmit(dev_, buf, 2, 100);
+    }
 };
 
-static void oled_char(int x, int y, char c, int size) {
-    if (c < 32 || c > 126) c = '?';
-    const uint8_t* glyph = &font5x7[(c - 32) * 5];
-    for (int col = 0; col < 5; col++) {
-        uint8_t line = glyph[col];
-        for (int row = 0; row < 7; row++) {
-            if (line & (1 << row)) {
-                if (size == 1) {
-                    oled_pixel(x + col, y + row, true);
-                } else {
-                    oled_rect(x + col * size, y + row * size, size, size, true);
-                }
-            }
+class Esp32Clock : public IClock {
+public:
+    uint32_t millis() override {
+        return (uint32_t)(esp_timer_get_time() / 1000ULL);
+    }
+    void delay_ms(uint32_t ms) override {
+        vTaskDelay(pdMS_TO_TICKS(ms));
+    }
+};
+
+class Esp32Nvs : public INvs {
+public:
+    bool get_str(const char* ns, const char* key, char* out, size_t sz) override {
+        nvs_handle_t h;
+        if (nvs_open(ns, NVS_READONLY, &h) != ESP_OK) { out[0] = '\0'; return false; }
+        size_t len = sz;
+        bool ok = (nvs_get_str(h, key, out, &len) == ESP_OK);
+        if (!ok) out[0] = '\0';
+        nvs_close(h);
+        return ok;
+    }
+    bool set_str(const char* ns, const char* key, const char* val) override {
+        nvs_handle_t h;
+        if (nvs_open(ns, NVS_READWRITE, &h) != ESP_OK) return false;
+        bool ok = (nvs_set_str(h, key, val) == ESP_OK);
+        nvs_commit(h); nvs_close(h);
+        return ok;
+    }
+    bool get_u8(const char* ns, const char* key, uint8_t* out) override {
+        nvs_handle_t h;
+        if (nvs_open(ns, NVS_READONLY, &h) != ESP_OK) return false;
+        bool ok = (nvs_get_u8(h, key, out) == ESP_OK);
+        nvs_close(h);
+        return ok;
+    }
+    bool set_u8(const char* ns, const char* key, uint8_t val) override {
+        nvs_handle_t h;
+        if (nvs_open(ns, NVS_READWRITE, &h) != ESP_OK) return false;
+        nvs_set_u8(h, key, val); nvs_commit(h); nvs_close(h);
+        return true;
+    }
+    bool get_i32(const char* ns, const char* key, int32_t* out) override {
+        nvs_handle_t h;
+        if (nvs_open(ns, NVS_READONLY, &h) != ESP_OK) return false;
+        bool ok = (nvs_get_i32(h, key, out) == ESP_OK);
+        nvs_close(h);
+        return ok;
+    }
+    bool set_i32(const char* ns, const char* key, int32_t val) override {
+        nvs_handle_t h;
+        if (nvs_open(ns, NVS_READWRITE, &h) != ESP_OK) return false;
+        nvs_set_i32(h, key, val); nvs_commit(h); nvs_close(h);
+        return true;
+    }
+    bool get_u32(const char* ns, const char* key, uint32_t* out) override {
+        nvs_handle_t h;
+        if (nvs_open(ns, NVS_READONLY, &h) != ESP_OK) return false;
+        bool ok = (nvs_get_u32(h, key, out) == ESP_OK);
+        nvs_close(h);
+        return ok;
+    }
+    bool set_u32(const char* ns, const char* key, uint32_t val) override {
+        nvs_handle_t h;
+        if (nvs_open(ns, NVS_READWRITE, &h) != ESP_OK) return false;
+        nvs_set_u32(h, key, val); nvs_commit(h); nvs_close(h);
+        return true;
+    }
+    void erase_key(const char* ns, const char* key) override {
+        nvs_handle_t h;
+        if (nvs_open(ns, NVS_READWRITE, &h) != ESP_OK) return;
+        nvs_erase_key(h, key); nvs_commit(h); nvs_close(h);
+    }
+};
+
+class Esp32Filesys : public IFilesys {
+public:
+    void* open(const char* path, const char* mode) override { return (void*)fopen(path, mode); }
+    size_t read(void* f, void* buf, size_t len) override { return fread(buf, 1, len, (FILE*)f); }
+    size_t write(void* f, const void* buf, size_t len) override { return fwrite(buf, 1, len, (FILE*)f); }
+    bool seek(void* f, long offset, int whence) override { return fseek((FILE*)f, offset, whence) == 0; }
+    long tell(void* f) override { return ftell((FILE*)f); }
+    void close(void* f) override { fclose((FILE*)f); }
+    void* opendir(const char* path) override { return (void*)::opendir(path); }
+    bool readdir(void* d, FsDirEntry* entry) override {
+        struct dirent* ent = ::readdir((DIR*)d);
+        if (!ent) return false;
+        strlcpy(entry->name, ent->d_name, sizeof(entry->name));
+        // Need stat for size and type
+        return true;  // caller uses stat() for details
+    }
+    void closedir(void* d) override { ::closedir((DIR*)d); }
+    bool stat(const char* path, uint32_t* size_out, bool* is_dir_out) override {
+        struct ::stat st;
+        if (::stat(path, &st) != 0) return false;
+        if (size_out) *size_out = (uint32_t)st.st_size;
+        if (is_dir_out) *is_dir_out = S_ISDIR(st.st_mode);
+        return true;
+    }
+    bool mkdir(const char* path) override { return ::mkdir(path, 0755) == 0 || errno == EEXIST; }
+    bool remove(const char* path) override { return ::remove(path) == 0; }
+    bool exists(const char* path) override {
+        struct ::stat st;
+        return ::stat(path, &st) == 0;
+    }
+};
+
+class Esp32Network : public INetwork {
+public:
+    TlsHandle connect(const char* host) override {
+        esp_tls_t* tls = esp_tls_init();
+        if (!tls) return nullptr;
+        esp_tls_cfg_t cfg = {};
+        cfg.skip_common_name = true;
+        cfg.timeout_ms = 30000;
+        if (esp_tls_conn_new_sync(host, strlen(host), 443, &cfg, tls) != 1) {
+            esp_tls_conn_destroy(tls);
+            return nullptr;
         }
+        return (TlsHandle)tls;
     }
-}
-
-static void oled_text(int x, int y, const char* str, int size = 1) {
-    int cx = x;
-    while (*str) {
-        oled_char(cx, y, *str, size);
-        cx += 6 * size;  // 5 pixels + 1 space
-        str++;
+    bool write(TlsHandle conn, const void* data, size_t len) override {
+        esp_tls_t* tls = (esp_tls_t*)conn;
+        const char* p = (const char*)data;
+        size_t rem = len;
+        while (rem > 0) {
+            int w = esp_tls_conn_write(tls, p, rem);
+            if (w > 0) { p += w; rem -= w; }
+            else if (w == ESP_TLS_ERR_SSL_WANT_WRITE) { vTaskDelay(pdMS_TO_TICKS(5)); }
+            else return false;
+        }
+        return true;
     }
-}
+    int read(TlsHandle conn, void* buf, size_t len) override {
+        return esp_tls_conn_read((esp_tls_t*)conn, buf, len);
+    }
+    void destroy(TlsHandle conn) override {
+        esp_tls_conn_destroy((esp_tls_t*)conn);
+    }
+};
 
-static int oled_text_width(const char* str, int size = 1) {
-    int len = strlen(str);
-    return len > 0 ? len * 6 * size - size : 0;  // remove trailing space
-}
+// ── Thin wrappers for existing call sites ───────────────────────────────────
+static inline void oled_clear()                                    { g_hal->display->clear(); }
+static inline void oled_pixel(int x, int y, bool on)              { g_hal->display->pixel(x, y, on); }
+static inline void oled_hline(int x0, int x1, int y)              { g_hal->display->hline(x0, x1, y); }
+static inline void oled_rect(int x, int y, int w, int h, bool f)  { g_hal->display->rect(x, y, w, h, f); }
+static inline void oled_text(int x, int y, const char* s, int sz=1) { g_hal->display->text(x, y, s, sz); }
+static inline int  oled_text_width(const char* s, int sz=1)        { return g_hal->display->text_width(s, sz); }
+static inline void oled_flush()                                    { g_hal->display->flush(); }
 
 // ── SD card ─────────────────────────────────────────────────────────────────
 static sdmmc_card_t *g_card = nullptr;
@@ -391,7 +376,7 @@ static char g_sd_error[128] = "";  // persists SD init errors for STATUS display
 #define WIFI_CONNECT_TIMEOUT_MS  10000UL
 #define WIFI_GRACE_MS            60000UL
 #define AP_RETRY_MS             300000UL
-#define MAX_KNOWN_NETS                  5
+// MAX_KNOWN_NETS, NetCred, loadKnownNets, saveNetwork — moved to airbridge_wifi_creds.h
 
 static volatile bool g_netConnected    = false;
 static volatile bool g_apMode          = false;
@@ -441,7 +426,7 @@ static int  g_cli_len = 0;
 // ── Forward declarations ────────────────────────────────────────────────────
 static void processCLI(const char* cmd);
 static void log_write(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
-static void updateDisplay();
+static void doUpdateDisplay();
 static void disp(const char* line1, const char* line2 = nullptr);
 static bool sd_mount_fatfs();
 static void sd_unmount_fatfs();
@@ -878,55 +863,7 @@ static void nvs_get_string_dflt(const char* ns, const char* key, char* out, size
     }
 }
 
-// ── WiFi credential storage (NVS namespace "wifi") ──────────────────────────
-struct NetCred { char ssid[33]; char pass[65]; };
-
-static int loadKnownNets(NetCred* out) {
-    nvs_handle_t h;
-    if (nvs_open("wifi", NVS_READONLY, &h) != ESP_OK) return 0;
-    int32_t n = 0;
-    nvs_get_i32(h, "count", &n);
-    if (n > MAX_KNOWN_NETS) n = MAX_KNOWN_NETS;
-    for (int i = 0; i < n; i++) {
-        char ks[8], kp[8];
-        snprintf(ks, sizeof(ks), "ssid%d", i);
-        snprintf(kp, sizeof(kp), "pass%d", i);
-        nvs_get_string(h, ks, out[i].ssid, sizeof(out[i].ssid));
-        nvs_get_string(h, kp, out[i].pass, sizeof(out[i].pass));
-    }
-    nvs_close(h);
-    return (int)n;
-}
-
-static void saveNetwork(const char* ssid, const char* pass) {
-    NetCred nets[MAX_KNOWN_NETS];
-    int n = loadKnownNets(nets);
-    // Remove existing entry for this SSID
-    int j = 0;
-    for (int i = 0; i < n; i++)
-        if (strcmp(nets[i].ssid, ssid) != 0) nets[j++] = nets[i];
-    n = j;
-    // Prepend (MRU)
-    if (n >= MAX_KNOWN_NETS) n = MAX_KNOWN_NETS - 1;
-    memmove(&nets[1], &nets[0], sizeof(NetCred) * n);
-    strlcpy(nets[0].ssid, ssid, sizeof(nets[0].ssid));
-    strlcpy(nets[0].pass, pass, sizeof(nets[0].pass));
-    n++;
-
-    nvs_handle_t h;
-    if (nvs_open("wifi", NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_set_i32(h, "count", n);
-    for (int i = 0; i < n; i++) {
-        char ks[8], kp[8];
-        snprintf(ks, sizeof(ks), "ssid%d", i);
-        snprintf(kp, sizeof(kp), "pass%d", i);
-        nvs_set_str(h, ks, nets[i].ssid);
-        nvs_set_str(h, kp, nets[i].pass);
-    }
-    nvs_commit(h);
-    nvs_close(h);
-    ESP_LOGI(TAG, "WiFi: saved '%s' (%d stored)", ssid, n);
-}
+// NetCred, loadKnownNets(), saveNetwork() — moved to airbridge_wifi_creds.h
 
 // ── WiFi event handler ──────────────────────────────────────────────────────
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
@@ -992,13 +929,7 @@ static void wifi_start_deferred() {
 }
 
 // ── WiFi helpers ────────────────────────────────────────────────────────────
-static int8_t rssiToBars(int32_t rssi) {
-    if (rssi >= -55) return 4;
-    if (rssi >= -67) return 3;
-    if (rssi >= -80) return 2;
-    if (rssi >= -90) return 1;
-    return 0;
-}
+// rssiToBars() — moved to airbridge_utils.h
 
 static bool tryConnect(const char* ssid, const char* pass) {
     wifi_config_t wifi_cfg = {};
@@ -1169,34 +1100,7 @@ static std::string buildErrorHTML(const char* ssid) {
     return h;
 }
 
-// ── URL-decode helper for form POST data ────────────────────────────────────
-static std::string url_decode(const char* src, size_t len) {
-    std::string out;
-    out.reserve(len);
-    for (size_t i = 0; i < len; i++) {
-        if (src[i] == '%' && i + 2 < len) {
-            char hex[3] = {src[i+1], src[i+2], 0};
-            out += (char)strtol(hex, nullptr, 16);
-            i += 2;
-        } else if (src[i] == '+') {
-            out += ' ';
-        } else {
-            out += src[i];
-        }
-    }
-    return out;
-}
-
-// Extract a named field from URL-encoded form data
-static std::string form_field(const char* body, const char* name) {
-    std::string needle = std::string(name) + "=";
-    const char* start = strstr(body, needle.c_str());
-    if (!start) return "";
-    start += needle.length();
-    const char* end = strchr(start, '&');
-    size_t len = end ? (size_t)(end - start) : strlen(start);
-    return url_decode(start, len);
-}
+// url_decode(), form_field() — moved to airbridge_utils.h
 
 // ── Captive portal HTTP handlers ────────────────────────────────────────────
 static esp_err_t portal_get_handler(httpd_req_t *req) {
@@ -1517,159 +1421,31 @@ static void wifiTask(void* param) {
 }
 
 // ── Display ─────────────────────────────────────────────────────────────────
+// disp() and updateDisplay() moved to airbridge_display.h
 static void disp(const char* line1, const char* line2) {
-    oled_clear();
-    oled_text(14, 6, "AirBridge", 2);
-    oled_hline(0, 127, 26);
-    oled_text(0, 32, line1);
-    if (line2) oled_text(0, 48, line2);
-    oled_flush();
+    dispSplash(line1, line2);
 }
 
-static void _fmtSize(char* buf, size_t len, float mb) {
-    if (mb >= 1000.0f)   snprintf(buf, len, "%.1fGB", mb / 1024.0f);
-    else if (mb >= 0.1f) snprintf(buf, len, "%.1fMB", mb);
-    else                 snprintf(buf, len, "%.1fKB", mb * 1024.0f);
-}
+// _fmtSize() — moved to airbridge_utils.h
 
-static void updateDisplay() {
-    oled_clear();
-
-    // Row 0: Connection status + signal bars
-    {
-        char label[18];
-        int bars = 0;
-        int branch = 0;  // diagnostic
-        if (g_pppConnected && g_modemRssi > 0) {
-            branch = 1;
-            // Cellular data active + signal present
-            if (g_modemOp[0]) strlcpy(label, g_modemOp, sizeof(label));
-            else              strlcpy(label, "Cellular", sizeof(label));
-            // CSQ 0-31: 0-9=1bar, 10-14=2, 15-19=3, 20+=4
-            if      (g_modemRssi >= 20) bars = 4;
-            else if (g_modemRssi >= 15) bars = 3;
-            else if (g_modemRssi >= 10) bars = 2;
-            else                        bars = 1;
-        } else if (g_netConnected) {
-            branch = 2;
-            strlcpy(label, g_wifiLabel, sizeof(label));
-            bars = g_wifiBars;
-        } else if (g_pppConnected) {
-            branch = 3;
-            // PPP up but signal lost
-            strlcpy(label, "No Signal", sizeof(label));
-        } else if (g_modemReady) {
-            branch = 4;
-            if (g_modemOp[0]) {
-                snprintf(label, sizeof(label), "%s...", g_modemOp);
-            } else {
-                strlcpy(label, "Connecting...", sizeof(label));
-            }
-        } else {
-            branch = 5;
-            strlcpy(label, "No Network", sizeof(label));
-        }
-        oled_text(0, 0, label);
-
-        // One-time diagnostic: log which display branch we're taking
-        static bool dispDiag = false;
-        if (!dispDiag && g_modemReady) {
-            dispDiag = true;
-            log_write("Disp: branch=%d ppp=%d rssi=%d bars=%d op='%s'",
-                       branch, (int)g_pppConnected, g_modemRssi, bars, g_modemOp);
-        }
-
-        // Solid bars only (no outlines for inactive bars)
-        const int8_t xs[4] = {108,113,118,123}, hs[4] = {2,4,6,8};
-        for (int i = 0; i < bars; i++) {
-            oled_rect(xs[i], 8-hs[i], 3, hs[i], true);
-        }
-    }
-    oled_hline(0, 127, 9);
-
-    // ── Split Gauges: USB IN │ UPLOAD ──────────────────────────────────
-    float uploaded  = g_mbUploaded + g_uploadingMb;
-    float remaining = (g_mbQueued > g_uploadingMb) ? g_mbQueued - g_uploadingMb : 0;
-    float usbSessionMb = g_hostWrittenMb;  // USB bytes received this session
-
-    // Row 11: labels
-    // "USB IN" = 6 chars * 6px = 36px, centered in 0-62: (62-36)/2 = 13
-    oled_text(13, 11, "USB IN");
-    // "UPLOAD" = 6 chars * 6px = 36px, centered in 65-127: 65 + (62-36)/2 = 78
-    oled_text(78, 11, "UPLOAD");
-    // Vertical divider
-    for (int y = 11; y < 37; y += 2) oled_rect(63, y, 1, 1, true);
-
-    // Row 20: speeds (centered in each half)
-    {
-        char usbSpd[12], upSpd[12];
-        if (g_usbWriteKBps > 0.5f)
-            snprintf(usbSpd, sizeof(usbSpd), "%dKB/s", (int)g_usbWriteKBps);
-        else
-            strlcpy(usbSpd, "0KB/s", sizeof(usbSpd));
-
-        if (g_uploadKBps > 0.5f)
-            snprintf(upSpd, sizeof(upSpd), "%dKB/s", (int)g_uploadKBps);
-        else
-            strlcpy(upSpd, "0KB/s", sizeof(upSpd));
-
-        int usbW = strlen(usbSpd) * 6;
-        int upW  = strlen(upSpd) * 6;
-        oled_text((62 - usbW) / 2, 20, usbSpd);
-        oled_text(65 + (62 - upW) / 2, 20, upSpd);
-    }
-
-    // Row 29: totals (centered in each half)
-    {
-        char usbTot[12], upTot[12];
-        _fmtSize(usbTot, sizeof(usbTot), usbSessionMb);
-        _fmtSize(upTot, sizeof(upTot), uploaded);
-        int usbW = strlen(usbTot) * 6;
-        int upW  = strlen(upTot) * 6;
-        oled_text((62 - usbW) / 2, 29, usbTot);
-        oled_text(65 + (62 - upW) / 2, 29, upTot);
-    }
-
-    // Row 38: divider
-    oled_hline(0, 127, 38);
-
-    // Row 41: progress bar (upload progress)
-    {
-        float totalMb = uploaded + remaining;
-        oled_rect(0, 41, 128, 9, false);
-        if (totalMb > 0.001f) {
-            int fill = (int)(uploaded / totalMb * 126);
-            if (fill > 126) fill = 126;
-            if (fill > 0) oled_rect(1, 42, fill, 7, true);
-        }
-    }
-
-    // Row 52: remaining + ETA
-    {
-        char remStr[14], etaStr[14];
-        snprintf(remStr, sizeof(remStr), "REM:"); _fmtSize(remStr + 4, sizeof(remStr) - 4, remaining);
-        oled_text(0, 52, remStr);
-
-        // Smoothed speed for stable ETA (EMA alpha=0.2)
-        static float etaKBps = 0;
-        if (g_uploadKBps > 0.5f)
-            etaKBps = etaKBps * 0.8f + g_uploadKBps * 0.2f;
-        else
-            etaKBps = 0;  // clear immediately when not uploading
-
-        if (etaKBps > 0.5f && remaining > 0.001f) {
-            int etaSec = (int)(remaining * 1024.0f / etaKBps);
-            int mm = etaSec / 60, ss = etaSec % 60;
-            if (mm > 99) snprintf(etaStr, sizeof(etaStr), "ETA %dh%02d", mm / 60, mm % 60);
-            else         snprintf(etaStr, sizeof(etaStr), "ETA %d:%02d", mm, ss);
-        } else {
-            strlcpy(etaStr, "ETA --:--", sizeof(etaStr));
-        }
-        int etaW = strlen(etaStr) * 6;
-        oled_text(128 - etaW, 52, etaStr);
-    }
-
-    oled_flush();
+// updateDisplay() — rendering logic moved to airbridge_display.h
+// This wrapper populates DisplayState from globals.
+static DisplayState g_displayState = {};
+static void doUpdateDisplay() {
+    g_displayState.pppConnected  = g_pppConnected;
+    g_displayState.netConnected  = g_netConnected;
+    g_displayState.modemReady    = g_modemReady;
+    g_displayState.modemRssi     = g_modemRssi;
+    strlcpy(g_displayState.modemOp, g_modemOp, sizeof(g_displayState.modemOp));
+    strlcpy(g_displayState.wifiLabel, g_wifiLabel, sizeof(g_displayState.wifiLabel));
+    g_displayState.wifiBars      = g_wifiBars;
+    g_displayState.hostWrittenMb = g_hostWrittenMb;
+    g_displayState.mbUploaded    = g_mbUploaded;
+    g_displayState.mbQueued      = g_mbQueued;
+    g_displayState.uploadingMb   = g_uploadingMb;
+    g_displayState.usbWriteKBps  = g_usbWriteKBps;
+    g_displayState.uploadKBps    = g_uploadKBps;
+    updateDisplay(g_displayState);
 }
 
 // ── S3 upload via pre-signed URLs ───────────────────────────────────────────
@@ -1752,25 +1528,7 @@ done_headers:
     }
 
     if (!chunked) return raw;
-
-    // De-chunk
-    std::string body;
-    size_t pos = 0;
-    while (pos < raw.length()) {
-        size_t nl = raw.find('\n', pos);
-        if (nl == std::string::npos) break;
-        std::string szLine = raw.substr(pos, nl - pos);
-        // Trim \r
-        while (!szLine.empty() && (szLine.back() == '\r' || szLine.back() == ' '))
-            szLine.pop_back();
-        unsigned long chunkSz = strtoul(szLine.c_str(), nullptr, 16);
-        if (chunkSz == 0) break;
-        size_t dataStart = nl + 1;
-        if (dataStart + chunkSz <= raw.length())
-            body.append(raw, dataStart, chunkSz);
-        pos = dataStart + chunkSz + 2;
-    }
-    return body;
+    return dechunk(raw);
 }
 
 // Connect TLS to host:443, returns esp_tls handle or nullptr.
@@ -1858,62 +1616,7 @@ static void s3ClearSession() {
     }
 }
 
-// URL-encode a string for use in query parameters.
-static std::string urlEncode(const char* s) {
-    std::string out;
-    for (; *s; s++) {
-        if (isalnum((unsigned char)*s) || *s == '-' || *s == '_' || *s == '.' || *s == '~') {
-            out += *s;
-        } else {
-            char hex[4];
-            snprintf(hex, sizeof(hex), "%%%02X", (unsigned char)*s);
-            out += hex;
-        }
-    }
-    return out;
-}
-
-// Extract a JSON string value for a given key (no JSON library dependency).
-static std::string jsonStr(const std::string& json, const char* key) {
-    size_t pos = json.find(key);
-    if (pos == std::string::npos) return "";
-    size_t colon = json.find(':', pos);
-    if (colon == std::string::npos) return "";
-    size_t q1 = json.find('"', colon + 1);
-    if (q1 == std::string::npos) {
-        // Check for null
-        if (json.find("null", colon + 1) != std::string::npos) return "";
-        return "";
-    }
-    size_t q2 = json.find('"', q1 + 1);
-    if (q2 == std::string::npos) return "";
-    return json.substr(q1 + 1, q2 - q1 - 1);
-}
-
-static int jsonInt(const std::string& json, const char* key) {
-    size_t pos = json.find(key);
-    if (pos == std::string::npos) return -1;
-    size_t colon = json.find(':', pos);
-    if (colon == std::string::npos) return -1;
-    return atoi(json.c_str() + colon + 1);
-}
-
-// Parse URL into host and path components.
-static bool parseUrl(const std::string& url, char* host, size_t hostSz,
-                     char* path, size_t pathSz) {
-    size_t schemeEnd = url.find("://");
-    if (schemeEnd == std::string::npos) return false;
-    size_t hostStart = schemeEnd + 3;
-    size_t pathStart = url.find('/', hostStart);
-    if (pathStart == std::string::npos) {
-        strlcpy(host, url.substr(hostStart).c_str(), hostSz);
-        strlcpy(path, "/", pathSz);
-    } else {
-        strlcpy(host, url.substr(hostStart, pathStart - hostStart).c_str(), hostSz);
-        strlcpy(path, url.substr(pathStart).c_str(), pathSz);
-    }
-    return true;
-}
+// urlEncode(), jsonStr(), jsonInt(), parseUrl() — moved to airbridge_utils.h
 
 // Make an HTTPS GET request to the API Gateway presign endpoint.
 static std::string s3ApiGet(const char* queryParams) {
@@ -1976,16 +1679,7 @@ static bool s3ApiComplete(const char* uploadId, const char* key,
 
 // ── OTA firmware update ─────────────────────────────────────────────────────
 
-static bool versionNewer(const char* available, const char* current) {
-    int av[3] = {0,0,0}, cv[3] = {0,0,0};
-    sscanf(available, "%d.%d.%d", &av[0], &av[1], &av[2]);
-    sscanf(current,   "%d.%d.%d", &cv[0], &cv[1], &cv[2]);
-    for (int i = 0; i < 3; i++) {
-        if (av[i] > cv[i]) return true;
-        if (av[i] < cv[i]) return false;
-    }
-    return false;
-}
+// versionNewer() — moved to airbridge_utils.h
 
 static char g_otaTargetVer[16] = "";
 
@@ -2631,18 +2325,7 @@ static bool s3UploadFile(const char* name) {
     return true;
 }
 
-// ── Skip list ───────────────────────────────────────────────────────────────
-static const char* const SKIP_NAMES[] = {
-    "System Volume Information", "desktop.ini", "Thumbs.db",
-    ".Spotlight-V100", ".Trashes", ".fseventsd", "harvested",
-    "airbridge.log", nullptr
-};
-static bool isSkipped(const char* n) {
-    if (n[0] == '.' || n[0] == '~') return true;
-    for (int i = 0; SKIP_NAMES[i]; i++)
-        if (strcmp(n, SKIP_NAMES[i]) == 0) return true;
-    return false;
-}
+// SKIP_NAMES[], isSkipped() — moved to airbridge_utils.h
 
 // ── Cellular modem task (SIM7600 via raw UART + PPPoS) ──────────────────────
 
@@ -3650,7 +3333,7 @@ static void doHarvest() {
     // marks filesystem dirty and breaks file manager drag-and-drop.
     // g_harvesting already blocks MSC read/write callbacks.
     vTaskDelay(pdMS_TO_TICKS(500));
-    updateDisplay();
+    doUpdateDisplay();
 
     // Take mutex to exclude uploadTask from SD for entire harvest
     xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
@@ -3745,10 +3428,7 @@ static void doHarvest() {
 
         // Build destination name (flatten subdirs with __)
         char dstName[128];
-        if (stack[depth].prefix[0])
-            snprintf(dstName, sizeof(dstName), "%s__%s", stack[depth].prefix, name);
-        else
-            strlcpy(dstName, name, sizeof(dstName));
+        flattenPath(stack[depth].prefix, name, dstName, sizeof(dstName));
 
         // Skip if already uploaded (.done marker exists)
         char donePath[192];
@@ -3832,53 +3512,19 @@ static void doHarvest() {
                 if (!ext || strcmp(ext, ".eaofh") != 0) continue;
                 // Parse: flightHistory__EA500.000243_01218_20260406.eaofh
                 // or: EA500.000243_01218_20260406.eaofh
-                const char* p = strstr(ent->d_name, "EA");
-                if (!p) continue;
-                // Extract serial (up to first _NNNNN)
                 char serial[44] = "";
-                const char* us = strchr(p, '_');
-                if (us && (us - p) < 43) {
-                    memcpy(serial, p, us - p);
-                    serial[us - p] = '\0';
-                    // Extract flight number after serial_
-                    uint32_t fnum = strtoul(us + 1, nullptr, 10);
-                    if (fnum > maxFlight) {
-                        maxFlight = fnum;
-                        strlcpy(dsuSerial, serial, sizeof(dsuSerial));
-                    }
+                uint32_t fnum = 0;
+                if (parseDsuFilename(ent->d_name, serial, sizeof(serial), &fnum) && fnum > maxFlight) {
+                    maxFlight = fnum;
+                    strlcpy(dsuSerial, serial, sizeof(dsuSerial));
                 }
             }
             closedir(hdir);
         }
 
         if (maxFlight > 0 && dsuSerial[0]) {
-            // Build 78-byte cookie (flight-number mode)
-            uint8_t cookie[78] = {};
-            cookie[0] = 0xEA;  // magic
-            cookie[1] = 0x1E;  // file type
-            cookie[2] = 0x00; cookie[3] = 78;  // length BE u16
-            cookie[4] = 0xD1;  // DSU hardware ID
-            // Serial at offset 9 (43 bytes, null-padded)
-            strlcpy((char*)&cookie[9], dsuSerial, 43);
-            // Mode flag
-            cookie[60] = 0x01;
-            // Flight number at offset 62 (BE u32)
-            cookie[62] = (maxFlight >> 24) & 0xFF;
-            cookie[63] = (maxFlight >> 16) & 0xFF;
-            cookie[64] = (maxFlight >> 8) & 0xFF;
-            cookie[65] = maxFlight & 0xFF;
-            // CRC-16 (poly 0x8005, init 0xFFFF) over bytes 0-75
-            uint16_t crc = 0xFFFF;
-            for (int i = 0; i < 76; i++) {
-                crc ^= (uint16_t)cookie[i] << 8;
-                for (int b = 0; b < 8; b++) {
-                    if (crc & 0x8000) crc = (crc << 1) ^ 0x8005;
-                    else crc <<= 1;
-                    crc &= 0xFFFF;
-                }
-            }
-            cookie[76] = (crc >> 8) & 0xFF;
-            cookie[77] = crc & 0xFF;
+            uint8_t cookie[78];
+            buildDsuCookie(dsuSerial, maxFlight, cookie);
 
             // Write to SD root
             char cookiePath[64];
@@ -4270,7 +3916,7 @@ static void main_loop_task(void* param) {
                 }
                 xSemaphoreGive(g_sd_mutex);
             }
-            updateDisplay();
+            doUpdateDisplay();
         }
 
         // Snapshot volatile write timestamp to avoid race with MSC callback
@@ -4298,6 +3944,15 @@ extern "C" void app_main(void) {
     ESP_ERROR_CHECK(ret);
     log_init();
 
+    // ── HAL initialization ─────────────────────────────────────────────
+    static Esp32Display  s_display;
+    static Esp32Clock    s_clock;
+    static Esp32Nvs      s_nvs;
+    static Esp32Filesys  s_filesys;
+    static Esp32Network  s_network;
+    static HAL           s_hal = { &s_display, &s_clock, &s_nvs, &s_filesys, &s_network };
+    g_hal = &s_hal;
+
     g_sd_mutex = xSemaphoreCreateMutex();
 
     // ── Crash-loop detection ────────────────────────────────────────────
@@ -4318,7 +3973,7 @@ extern "C" void app_main(void) {
 
             if (boots > 5 && reason != ESP_RST_POWERON) {
                 ESP_LOGW(TAG, "CRASH LOOP DETECTED — pausing 30s for debug");
-                oled_init();
+                g_hal->display->init();
                 disp("CRASH LOOP", "Paused 30s");
 
                 // OTA rollback: if last OTA is pending, revert to previous partition
@@ -4379,8 +4034,8 @@ extern "C" void app_main(void) {
     }
 
     // ── OLED init ───────────────────────────────────────────────────────
-    if (!g_oled_ok) oled_init();
-    if (!g_oled_ok) {
+    if (!g_hal->display->ok()) g_hal->display->init();
+    if (!g_hal->display->ok()) {
         ESP_LOGE(TAG, "SSD1306 failed — continuing without display");
     }
 
@@ -4592,7 +4247,7 @@ extern "C" void app_main(void) {
     }
 
     // ── Boot splash (10s) ──────────────────────────────────────────────
-    if (g_oled_ok) {
+    if (g_hal->display->ok()) {
         // Load device ID for display
         s3LoadCreds();
 
