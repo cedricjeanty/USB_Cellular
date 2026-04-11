@@ -228,23 +228,16 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
         return res;
     }
 
-    // Get pre-signed URL
+    // Presign request
     char query[512];
     snprintf(query, sizeof(query), "file=%s&size=%u&device=%s",
              urlEncode(filename).c_str(), fileSize, creds.deviceId);
     std::string resp = s3ApiGetViaHal(creds.apiHost, creds.apiKey, query);
-    std::string url = jsonStr(resp, "url");
-    if (url.empty()) {
-        snprintf(res.error, sizeof(res.error), "Presign failed");
-        return res;
-    }
 
-    // Parse S3 URL
-    char s3Host[128], s3Path[2500];
-    if (!parseUrl(url, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
-        strlcpy(res.error, "URL parse failed", sizeof(res.error));
-        return res;
-    }
+    std::string url = jsonStr(resp, "url");
+    std::string uploadId = jsonStr(resp, "upload_id");
+    int totalParts = jsonInt(resp, "parts");
+    std::string s3Key = jsonStr(resp, "key");
 
     // Open file
     void* f = g_hal->filesys->open(filepath, "rb");
@@ -253,40 +246,131 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
         return res;
     }
 
-    // Connect to S3
-    TlsHandle tls = g_hal->network->connect(s3Host);
-    if (!tls) {
-        g_hal->filesys->close(f);
-        strlcpy(res.error, "TLS connect failed", sizeof(res.error));
-        return res;
-    }
-
-    // Send PUT header
-    char hdr[2700];
-    snprintf(hdr, sizeof(hdr),
-        "PUT %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
-        s3Path, s3Host, fileSize);
-    if (!g_hal->network->write(tls, hdr, strlen(hdr))) {
-        g_hal->network->destroy(tls);
-        g_hal->filesys->close(f);
-        strlcpy(res.error, "Header send failed", sizeof(res.error));
-        return res;
-    }
-
-    // Stream file
     uint32_t startMs = g_hal->clock->millis();
-    bool streamed = halStreamFile(tls, f, fileSize, progress);
+
+    // ── Single-part upload (small files, url is set) ────────────────────
+    if (url.length() > 0 && uploadId.empty()) {
+        char s3Host[128], s3Path[2500];
+        if (!parseUrl(url, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
+            g_hal->filesys->close(f);
+            strlcpy(res.error, "URL parse failed", sizeof(res.error));
+            return res;
+        }
+
+        TlsHandle tls = g_hal->network->connect(s3Host);
+        if (!tls) {
+            g_hal->filesys->close(f);
+            strlcpy(res.error, "TLS connect failed", sizeof(res.error));
+            return res;
+        }
+
+        char hdr[2700];
+        snprintf(hdr, sizeof(hdr),
+            "PUT %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+            s3Path, s3Host, fileSize);
+        if (!g_hal->network->write(tls, hdr, strlen(hdr))) {
+            g_hal->network->destroy(tls); g_hal->filesys->close(f);
+            strlcpy(res.error, "Header send failed", sizeof(res.error));
+            return res;
+        }
+
+        bool ok = halStreamFile(tls, f, fileSize, progress);
+        g_hal->filesys->close(f);
+        halHttpReadResponse(tls);
+        g_hal->network->destroy(tls);
+
+        if (!ok) { strlcpy(res.error, "Stream failed", sizeof(res.error)); return res; }
+
+        uint32_t elapsed = g_hal->clock->millis() - startMs;
+        res.success = true;
+        res.kbps = elapsed > 0 ? fileSize / 1024.0f / (elapsed / 1000.0f) : 0;
+        return res;
+    }
+
+    // ── Multipart upload (large files, upload_id is set) ────────────────
+    if (uploadId.empty() || s3Key.empty() || totalParts <= 0) {
+        g_hal->filesys->close(f);
+        snprintf(res.error, sizeof(res.error), "Presign failed");
+        return res;
+    }
+
+    // Check for NVS resume session
+    MultipartSession session = loadMultipartSession(filename);
+    uint32_t startPart = 1;
+    if (session.isResume) {
+        startPart = session.startPart;
+        strlcpy((char*)uploadId.c_str(), session.uploadId, sizeof(session.uploadId));
+    } else {
+        saveMultipartSession(filename, uploadId.c_str(), s3Key.c_str(), totalParts, fileSize);
+    }
+
+    // Seek to resume position
+    if (startPart > 1) {
+        g_hal->filesys->seek(f, (startPart - 1) * S3_CHUNK_SIZE, 0 /*SEEK_SET*/);
+    }
+
+    for (uint32_t partNum = startPart; partNum <= (uint32_t)totalParts; partNum++) {
+        uint32_t offset = (partNum - 1) * S3_CHUNK_SIZE;
+        uint32_t chunkSize = fileSize - offset;
+        if (chunkSize > S3_CHUNK_SIZE) chunkSize = S3_CHUNK_SIZE;
+
+        // Get presigned URL for this part
+        char pq[1024];
+        snprintf(pq, sizeof(pq), "upload_id=%s&key=%s&part=%u",
+                 uploadId.c_str(), urlEncode(s3Key.c_str()).c_str(), partNum);
+        std::string partResp = s3ApiGetViaHal(creds.apiHost, creds.apiKey, pq);
+        std::string partUrl = jsonStr(partResp, "url");
+        if (partUrl.empty()) {
+            g_hal->filesys->close(f);
+            snprintf(res.error, sizeof(res.error), "Presign part %u failed", partNum);
+            return res;
+        }
+
+        char s3Host[128], s3Path[2500];
+        if (!parseUrl(partUrl, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
+            g_hal->filesys->close(f);
+            strlcpy(res.error, "Part URL parse failed", sizeof(res.error));
+            return res;
+        }
+
+        TlsHandle tls = g_hal->network->connect(s3Host);
+        if (!tls) {
+            g_hal->filesys->close(f);
+            snprintf(res.error, sizeof(res.error), "TLS connect part %u failed", partNum);
+            return res;
+        }
+
+        char hdr[2700];
+        snprintf(hdr, sizeof(hdr),
+            "PUT %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+            s3Path, s3Host, chunkSize);
+        if (!g_hal->network->write(tls, hdr, strlen(hdr)) ||
+            !halStreamFile(tls, f, chunkSize, progress)) {
+            g_hal->network->destroy(tls); g_hal->filesys->close(f);
+            snprintf(res.error, sizeof(res.error), "Stream part %u failed", partNum);
+            return res;
+        }
+
+        char etag[64] = "";
+        halHttpReadResponse(tls, etag, sizeof(etag));
+        g_hal->network->destroy(tls);
+
+        if (etag[0]) savePartProgress(partNum, etag);
+    }
     g_hal->filesys->close(f);
 
-    if (!streamed) {
-        g_hal->network->destroy(tls);
-        strlcpy(res.error, "Stream failed", sizeof(res.error));
-        return res;
-    }
+    // Complete multipart
+    std::string partsJson = buildPartsJson(totalParts);
+    std::string completeReq = buildApiCompleteRequest(
+        creds.apiHost, creds.apiKey, uploadId.c_str(), s3Key.c_str(), partsJson.c_str());
 
-    // Read response
-    halHttpReadResponse(tls);
-    g_hal->network->destroy(tls);
+    TlsHandle tls = g_hal->network->connect(creds.apiHost);
+    if (tls) {
+        g_hal->network->write(tls, completeReq.c_str(), completeReq.size());
+        std::string cResp = halHttpReadResponse(tls);
+        g_hal->network->destroy(tls);
+    }
+    clearMultipartSession();
 
     uint32_t elapsed = g_hal->clock->millis() - startMs;
     res.success = true;

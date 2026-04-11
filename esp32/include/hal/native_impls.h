@@ -128,9 +128,13 @@ public:
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 
 class OpenSSLNetwork : public INetwork {
 public:
+    char bindAddr[32] = "";    // bind to specific source IP (e.g. PPP interface)
+    int maxBytesPerSec = 0;    // bandwidth limit (0 = unlimited)
+
     OpenSSLNetwork() {
         SSL_library_init();
         SSL_load_error_strings();
@@ -153,6 +157,14 @@ public:
         int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
         if (fd < 0) { freeaddrinfo(res); return nullptr; }
 
+        // Bind to specific source IP if configured (e.g. PPP interface)
+        if (bindAddr[0]) {
+            struct sockaddr_in src = {};
+            src.sin_family = AF_INET;
+            src.sin_addr.s_addr = inet_addr(bindAddr);
+            bind(fd, (struct sockaddr*)&src, sizeof(src));
+        }
+
         if (::connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
             ::close(fd); freeaddrinfo(res); return nullptr;
         }
@@ -172,9 +184,19 @@ public:
         const char* p = (const char*)data;
         size_t rem = len;
         while (rem > 0) {
-            int w = SSL_write(c->ssl, p, rem);
+            size_t chunk = rem;
+            if (maxBytesPerSec > 0 && len > 1024) {
+                // Throttle data writes but not TLS handshake (len=total call size)
+                chunk = maxBytesPerSec / 10;  // 100ms worth
+                if (chunk < 1024) chunk = 1024;
+                if (chunk > rem) chunk = rem;
+            }
+            int w = SSL_write(c->ssl, p, chunk);
             if (w <= 0) return false;
             p += w; rem -= w;
+            if (maxBytesPerSec > 0 && len > 1024) {
+                usleep(w * 1000000 / maxBytesPerSec);
+            }
         }
         return true;
     }

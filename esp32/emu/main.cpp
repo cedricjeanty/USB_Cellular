@@ -26,6 +26,8 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <sys/wait.h>
+#include <signal.h>
 
 #include "hal/hal.h"
 #include "hal/native_impls.h"
@@ -104,6 +106,8 @@ int modem_at_cmd(const char* cmd, char* resp, int resp_size, int timeout_ms) {
 static std::atomic<bool> s_modemInitDone{false};
 static ModemInitResult s_modemResult = {};
 
+static pid_t s_clientPppd = -1;
+
 static void modemInitThread(DisplayState* ds) {
     printf("[Modem] Starting AT init sequence...\n");
     bool synced = modemAtSync();
@@ -118,24 +122,65 @@ static void modemInitThread(DisplayState* ds) {
            s_modemResult.operatorName, s_modemResult.rssi,
            s_modemResult.registered, s_modemResult.connected);
 
-    // Update display state from modem result
     ds->modemReady = true;
     ds->modemRssi = s_modemResult.rssi;
     strlcpy(ds->modemOp, s_modemResult.operatorName, sizeof(ds->modemOp));
+
     if (s_modemResult.connected) {
         ds->pppConnected = true;
+        // Throttle upload bandwidth to match real cellular modem
+        // Real device: 921600 baud UART, ~60 KB/s effective after PPP overhead
+        s_net.maxBytesPerSec = 60 * 1024;  // 60 KB/s (matching real cellular)
+        printf("[Modem] Network throttled to 60 KB/s (matching cellular)\n");
+        s_log.write(0, "Cellular connected — upload throttled to 60 KB/s");
     }
     s_modemInitDone = true;
 }
 
-// ── S3 upload — uses shared uploadAllFiles() from airbridge_s3.h ────────────
+// ── S3 upload — runs in background thread like real device ──────────────────
 
-static void doUpload(DisplayState& ds) {
+static std::atomic<bool> s_uploading{false};
+
+static DisplayState* s_uploadDs = nullptr;
+
+static void uploadProgressCb(uint32_t bytesSent, uint32_t totalBytes) {
+    if (s_uploadDs) {
+        s_uploadDs->uploadingMb = bytesSent / 1e6f;
+    }
+}
+
+static void uploadThread(DisplayState* ds) {
+    s_uploadDs = ds;
     char harvestDir[256];
     snprintf(harvestDir, sizeof(harvestDir), "%s/harvested", SD_ROOT);
-    printf("[S3] Uploading files from %s...\n", harvestDir);
-    int n = uploadAllFiles(harvestDir);
-    printf("[S3] %d file(s) uploaded\n", n);
+    printf("[S3] Upload thread started — %s\n", harvestDir);
+
+    char name[64];
+    while (findNextUploadFile(harvestDir, name, sizeof(name))) {
+        char fullpath[192];
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", harvestDir, name);
+        uint32_t sz = 0; bool isDir = false;
+        g_hal->filesys->stat(fullpath, &sz, &isDir);
+        float fileMb = sz / 1e6f;
+        printf("[S3] Uploading %s (%.1f MB)...\n", name, fileMb);
+        ds->uploadingMb = 0;
+
+        UploadResult r = halS3UploadFile(fullpath, name, uploadProgressCb);
+        ds->uploadingMb = 0;
+        if (r.success) {
+            printf("[S3] Upload complete: %.0f KB/s\n", r.kbps);
+            markFileUploaded(harvestDir, name);
+            ds->mbUploaded += fileMb;
+            s_log.write(g_hal->clock->millis(), "Uploaded %s %.0f KB/s", name, r.kbps);
+        } else {
+            printf("[S3] Upload failed: %s\n", r.error);
+            s_log.write(g_hal->clock->millis(), "Upload FAIL %s: %s", name, r.error);
+            break;
+        }
+    }
+    s_uploadDs = nullptr;
+    printf("[S3] Upload thread done\n");
+    s_uploading = false;
 }
 
 // ── SDL2 rendering ──────────────────────────────────────────────────────────
@@ -191,6 +236,8 @@ int main(int argc, char* argv[]) {
     printf("NVS storage:     ./emu_nvs.dat\n\n");
     printf("Keys: C=cellular  H=harvest  P=upload  O=OTA-check  T=test-AT\n");
     printf("      I=status  U=usb-write  S=step  R=reset  Q=quit\n\n");
+    fflush(stdout);
+    setbuf(stdout, nullptr);  // disable buffering for real-time output
     s_log.clear();
 
     // Launch modem init in background (same AT sequence as real device)
@@ -248,9 +295,11 @@ int main(int argc, char* argv[]) {
                 case SDLK_p:
                     if (!ds.pppConnected) {
                         printf("Press C first to enable network\n");
+                    } else if (s_uploading) {
+                        printf("Upload already in progress\n");
                     } else {
-                        printf("Uploading to S3...\n");
-                        doUpload(ds);
+                        s_uploading = true;
+                        std::thread(uploadThread, &ds).detach();
                     }
                     break;
                 case SDLK_t: {
