@@ -33,6 +33,8 @@
 #include <vector>
 
 #include "hal/hal.h"
+#include "hal/uart_pty.h"
+#include "sim_modem.h"
 #include "airbridge_display.h"
 #include "airbridge_harvest.h"
 #include "airbridge_http.h"
@@ -261,8 +263,11 @@ static EmuClock       s_clock;
 static FileNvs        s_nvs("./emu_nvs.dat");
 static NativeFilesys  s_fs;
 static OpenSSLNetwork s_net;
-static HAL            s_hal = { &s_display, &s_clock, &s_nvs, &s_fs, &s_net };
+static PtyUart        s_uart;
+static HAL            s_hal = { &s_display, &s_clock, &s_nvs, &s_fs, &s_net, &s_uart };
 HAL* g_hal = &s_hal;
+
+static SimModem* s_modem = nullptr;
 
 static const char* SD_ROOT = "./emu_sdcard";
 
@@ -435,10 +440,22 @@ int main(int argc, char* argv[]) {
     // Create virtual SD card directory
     ::mkdir(SD_ROOT, 0755);
 
+    // Start SIM7600 modem simulator
+    s_modem = new SimModem();
+    s_modem->operatorName = "SimOperator";
+    s_modem->rssi = 22;
+    s_modem->echoEnabled = false;
+    if (s_modem->start()) {
+        s_uart.fd = s_modem->slave_fd;
+        printf("SIM7600 simulator running on PTY fd=%d\n", s_modem->slave_fd);
+    } else {
+        printf("WARNING: SIM7600 simulator failed to start\n");
+    }
+
     printf("AirBridge Emulator — device_id=%s\n", deviceId);
     printf("Virtual SD card: %s/\n", SD_ROOT);
     printf("NVS storage:     ./emu_nvs.dat\n\n");
-    printf("Keys: C=cellular  H=harvest  P=upload-to-S3\n");
+    printf("Keys: C=cellular  H=harvest  P=upload-to-S3  T=test-AT-cmd\n");
     printf("      U=usb-write +/-=speed  S=step  R=reset  Q=quit\n\n");
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
@@ -520,6 +537,36 @@ int main(int argc, char* argv[]) {
                     strlcpy(ds.modemOp, "Emulator", sizeof(ds.modemOp));
                     printf("State reset\n");
                     break;
+                case SDLK_t: {
+                    // Test AT command sequence via simulated UART
+                    if (!s_uart.fd || s_uart.fd < 0) {
+                        printf("No modem simulator running\n");
+                        break;
+                    }
+                    printf("[AT] Sending init sequence...\n");
+                    auto atCmd = [](const char* cmd) {
+                        std::string full = std::string(cmd) + "\r";
+                        s_uart.write(full.c_str(), full.size());
+                        usleep(100000);
+                        char buf[256] = "";
+                        int total = 0;
+                        for (int i = 0; i < 10; i++) {
+                            int n = s_uart.read(buf + total, sizeof(buf) - 1 - total, 100);
+                            if (n > 0) total += n;
+                            buf[total] = '\0';
+                            if (strstr(buf, "OK") || strstr(buf, "ERROR") || strstr(buf, "CONNECT")) break;
+                        }
+                        printf("[AT] %s → %s", cmd, buf);
+                        if (buf[total-1] != '\n') printf("\n");
+                    };
+                    atCmd("AT");
+                    atCmd("AT+CSQ");
+                    atCmd("AT+COPS?");
+                    atCmd("AT+CREG?");
+                    atCmd("AT+CCLK?");
+                    printf("[AT] Done\n");
+                    break;
+                }
                 default:
                     break;
                 }
@@ -533,6 +580,7 @@ int main(int argc, char* argv[]) {
         SDL_Delay(100);
     }
 
+    if (s_modem) { s_modem->stop(); delete s_modem; }
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();

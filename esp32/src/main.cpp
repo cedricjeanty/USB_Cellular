@@ -2329,19 +2329,36 @@ static bool s3UploadFile(const char* name) {
 
 // ── Cellular modem task (SIM7600 via raw UART + PPPoS) ──────────────────────
 
+// UART helpers — route through HAL when available, else use raw ESP-IDF
+static inline int mdm_write(const void* data, size_t len) {
+    if (g_hal && g_hal->uart) return g_hal->uart->write(data, len);
+    return mdm_write(data, len);
+}
+static inline int mdm_read(void* buf, size_t len, uint32_t timeout_ms) {
+    if (g_hal && g_hal->uart) return g_hal->uart->read(buf, len, timeout_ms);
+    return mdm_read(buf, len, timeout_ms);
+}
+static inline void mdm_flush() {
+    if (g_hal && g_hal->uart) { g_hal->uart->flush(); return; }
+    mdm_flush();
+}
+static inline void mdm_set_baudrate(uint32_t baud) {
+    if (g_hal && g_hal->uart) { g_hal->uart->set_baudrate(baud); return; }
+    mdm_set_baudrate(baud);
+}
+
 // Send AT command, wait for response, return response string
 static int modem_at_cmd(const char* cmd, char* resp, int resp_size, int timeout_ms) {
     // Send command
-    uart_write_bytes(UART_NUM_1, cmd, strlen(cmd));
-    uart_write_bytes(UART_NUM_1, "\r", 1);
+    mdm_write(cmd, strlen(cmd));
+    mdm_write("\r", 1);
 
     // Read response with timeout
     int total = 0;
     uint32_t start = millis();
     while ((millis() - start) < (uint32_t)timeout_ms && total < resp_size - 1) {
         uint8_t buf[128];
-        int len = uart_read_bytes(UART_NUM_1, buf, sizeof(buf),
-                                  pdMS_TO_TICKS(100));
+        int len = mdm_read(buf, sizeof(buf), 100);
         if (len > 0) {
             int copy = std::min(len, resp_size - 1 - total);
             memcpy(resp + total, buf, copy);
@@ -2364,7 +2381,7 @@ static uint32_t g_ppp_tx_calls = 0;
 static esp_err_t modem_ppp_transmit(void* h, void* buffer, size_t len) {
     g_ppp_tx_calls++;
     g_ppp_tx_bytes += len;
-    int written = uart_write_bytes(UART_NUM_1, buffer, len);
+    int written = mdm_write(buffer, len);
     return (written == (int)len) ? ESP_OK : ESP_FAIL;
 }
 
@@ -2424,15 +2441,15 @@ static void modemTask(void* param) {
     // Modem needs ~15-20s to boot after cold power-on.
     // Try +++ (exit data mode) then AT repeatedly until it responds.
     bool ready = false;
-    uart_flush(UART_NUM_1);
+    mdm_flush();
 
     char resp[512];
 
     // +++ escape (modem may be in PPP data mode from previous ESP32 boot)
     vTaskDelay(pdMS_TO_TICKS(1100));
-    uart_write_bytes(UART_NUM_1, "+++", 3);
+    mdm_write("+++", 3);
     vTaskDelay(pdMS_TO_TICKS(1100));
-    uart_flush(UART_NUM_1);
+    mdm_flush();
 
     // Try AT at 115200, up to 20s (covers modem cold boot)
     for (int i = 0; i < 40 && !ready; i++) {
@@ -2449,14 +2466,14 @@ static void modemTask(void* param) {
         const int tryBauds[] = { 921600, 460800, 3000000 };
         for (int b = 0; b < 3 && !ready; b++) {
             // First try WITHOUT flow control (modem may not assert CTS in data mode)
-            uart_set_baudrate(UART_NUM_1, tryBauds[b]);
+            mdm_set_baudrate(tryBauds[b]);
             vTaskDelay(pdMS_TO_TICKS(100));
-            uart_flush(UART_NUM_1);
+            mdm_flush();
             // +++ escape at this baud
             vTaskDelay(pdMS_TO_TICKS(1100));
-            uart_write_bytes(UART_NUM_1, "+++", 3);
+            mdm_write("+++", 3);
             vTaskDelay(pdMS_TO_TICKS(1100));
-            uart_flush(UART_NUM_1);
+            mdm_flush();
             modem_at_cmd("ATH", resp, sizeof(resp), 1000);
             int len = modem_at_cmd("AT", resp, sizeof(resp), 500);
             if (len > 0 && strstr(resp, "OK")) {
@@ -2471,11 +2488,11 @@ static void modemTask(void* param) {
             uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
                          PIN_MODEM_RTS, PIN_MODEM_CTS);
             uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_CTS_RTS, 122);
-            uart_flush(UART_NUM_1);
+            mdm_flush();
             vTaskDelay(pdMS_TO_TICKS(1100));
-            uart_write_bytes(UART_NUM_1, "+++", 3);
+            mdm_write("+++", 3);
             vTaskDelay(pdMS_TO_TICKS(1100));
-            uart_flush(UART_NUM_1);
+            mdm_flush();
             modem_at_cmd("ATH", resp, sizeof(resp), 1000);
             len = modem_at_cmd("AT", resp, sizeof(resp), 500);
             if (len > 0 && strstr(resp, "OK")) {
@@ -2494,8 +2511,8 @@ static void modemTask(void* param) {
         uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_DISABLE, 0);
         uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-        uart_set_baudrate(UART_NUM_1, 115200);
-        uart_flush(UART_NUM_1);
+        mdm_set_baudrate(115200);
+        mdm_flush();
     }
 
     if (ready) {
@@ -2591,9 +2608,9 @@ static void modemTask(void* param) {
             // Modem responds OK at old baud, THEN switches
 
             vTaskDelay(pdMS_TO_TICKS(200));
-            uart_set_baudrate(UART_NUM_1, bauds[i]);
+            mdm_set_baudrate(bauds[i]);
             vTaskDelay(pdMS_TO_TICKS(200));
-            uart_flush(UART_NUM_1);
+            mdm_flush();
 
             // Verify at new baud (multiple attempts)
             bool ok = false;
@@ -2638,9 +2655,9 @@ static void modemTask(void* param) {
                 cdc_printf("Modem: %d failed, resetting...\r\n", bauds[i]);
                 modem_at_cmd("AT+IPR=115200", resp, sizeof(resp), 2000);
                 vTaskDelay(pdMS_TO_TICKS(200));
-                uart_set_baudrate(UART_NUM_1, 115200);
+                mdm_set_baudrate(115200);
                 vTaskDelay(pdMS_TO_TICKS(200));
-                uart_flush(UART_NUM_1);
+                mdm_flush();
                 // Verify recovery
                 modem_at_cmd("AT", resp, sizeof(resp), 2000);
             }
@@ -2716,15 +2733,15 @@ static void modemTask(void* param) {
             vTaskDelay(pdMS_TO_TICKS(10000));
         }
         cdc_printf("Modem: dialing PPP (ATD*99#)...\r\n");
-        uart_write_bytes(UART_NUM_1, "ATD*99#\r", 8);
+        mdm_write("ATD*99#\r", 8);
 
         // Wait for CONNECT
         uint32_t t0 = millis();
         char connbuf[256] = "";
         int connlen = 0;
         while (millis() - t0 < 30000) {
-            int len = uart_read_bytes(UART_NUM_1, (uint8_t*)connbuf + connlen,
-                                      sizeof(connbuf) - 1 - connlen, pdMS_TO_TICKS(500));
+            int len = mdm_read((uint8_t*)connbuf + connlen,
+                                      sizeof(connbuf) - 1 - connlen, 500);
             if (len > 0) {
                 connlen += len;
                 connbuf[connlen] = '\0';
@@ -2754,13 +2771,13 @@ static void modemTask(void* param) {
         vTaskDelay(pdMS_TO_TICKS(5000));
         for (int dialAttempt = 0; dialAttempt < 3 && !connected; dialAttempt++) {
             cdc_printf("Modem: dialing PPP (attempt %d)...\r\n", dialAttempt + 1);
-            uart_write_bytes(UART_NUM_1, "ATD*99#\r", 8);
+            mdm_write("ATD*99#\r", 8);
             uint32_t t0 = millis();
             char connbuf[256] = "";
             int connlen = 0;
             while (millis() - t0 < 30000) {
-                int len = uart_read_bytes(UART_NUM_1, (uint8_t*)connbuf + connlen,
-                                          sizeof(connbuf) - 1 - connlen, pdMS_TO_TICKS(500));
+                int len = mdm_read((uint8_t*)connbuf + connlen,
+                                          sizeof(connbuf) - 1 - connlen, 500);
                 if (len > 0) {
                     connlen += len;
                     connbuf[connlen] = '\0';
@@ -2816,7 +2833,7 @@ static void modemTask(void* param) {
 
     while (true) {
         uint8_t buf[1024];
-        int len = uart_read_bytes(UART_NUM_1, buf, sizeof(buf), pdMS_TO_TICKS(20));
+        int len = mdm_read(buf, sizeof(buf), 20);
         if (len > 0) {
             // Scan for URCs in the data stream
             // PPP frames start with 0x7E; ASCII text outside frames = URCs
@@ -2932,9 +2949,9 @@ static void modemTask(void* param) {
 
             // 1. Exit modem data mode (don't touch esp_netif — it crashes)
             vTaskDelay(pdMS_TO_TICKS(1100));
-            uart_write_bytes(UART_NUM_1, "+++", 3);
+            mdm_write("+++", 3);
             vTaskDelay(pdMS_TO_TICKS(1100));
-            uart_flush(UART_NUM_1);
+            mdm_flush();
 
             char resp[128];
 
@@ -2992,9 +3009,9 @@ static void modemTask(void* param) {
             for (int attempt = 0; attempt < 3 && !redialOk; attempt++) {
                 cdc_printf("Modem: dialing PPP (attempt %d)...\r\n", attempt + 1);
                 // AT+CGACT removed — let ATD*99# handle PDP activation
-                uart_write_bytes(UART_NUM_1, "ATD*99#\r", 8);
-                int rd = uart_read_bytes(UART_NUM_1, (uint8_t*)resp,
-                            sizeof(resp) - 1, pdMS_TO_TICKS(15000));
+                mdm_write("ATD*99#\r", 8);
+                int rd = mdm_read((uint8_t*)resp,
+                            sizeof(resp) - 1, 15000);
                 if (rd > 0) {
                     resp[rd] = '\0';
                     if (strstr(resp, "CONNECT")) {
@@ -3109,12 +3126,12 @@ static void modemRssiCheck() {
     if (!g_pppConnected || g_tlsActive) return;
 
     vTaskDelay(pdMS_TO_TICKS(1100));
-    uart_write_bytes(UART_NUM_1, "+++", 3);
+    mdm_write("+++", 3);
     vTaskDelay(pdMS_TO_TICKS(1100));
 
     char resp[128];
-    int drained = uart_read_bytes(UART_NUM_1, (uint8_t*)resp,
-                    sizeof(resp) - 1, pdMS_TO_TICKS(1000));
+    int drained = mdm_read((uint8_t*)resp,
+                    sizeof(resp) - 1, 1000);
     bool inCmd = false;
     if (drained > 0) { resp[drained] = '\0'; inCmd = (strstr(resp, "OK") != nullptr); }
 
@@ -3950,8 +3967,9 @@ extern "C" void app_main(void) {
     static Esp32Nvs      s_nvs;
     static Esp32Filesys  s_filesys;
     static Esp32Network  s_network;
-    static HAL           s_hal = { &s_display, &s_clock, &s_nvs, &s_filesys, &s_network };
+    static HAL           s_hal = { &s_display, &s_clock, &s_nvs, &s_filesys, &s_network, nullptr };
     g_hal = &s_hal;
+    // uart is nullptr — mdm_* helpers fall back to raw ESP-IDF uart_* calls
 
     g_sd_mutex = xSemaphoreCreateMutex();
 

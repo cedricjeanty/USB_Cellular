@@ -8,6 +8,7 @@
 #include "hal/nvs.h"
 #include "hal/filesys.h"
 #include "hal/network.h"
+#include "hal/uart.h"
 
 struct HAL {
     IDisplay*  display;
@@ -15,6 +16,7 @@ struct HAL {
     INvs*      nvs;
     IFilesys*  filesys;
     INetwork*  network;
+    IUart*     uart;  // modem UART (nullptr = use raw ESP-IDF uart_* calls)
 };
 
 extern HAL* g_hal;
