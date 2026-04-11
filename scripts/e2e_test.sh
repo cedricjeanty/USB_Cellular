@@ -28,18 +28,23 @@ wait_for_usb() {
 }
 
 get_fw_version() {
-    if [ -e /dev/ttyACM0 ]; then
-        python3 -c "
-import serial, time, re
-s = serial.Serial('/dev/ttyACM0', 115200, timeout=3)
-s.write(b'STATUS\r\n')
-time.sleep(2)
-data = s.read(4096).decode(errors='replace')
-m = re.search(r'fw=([0-9]+\.[0-9]+\.[0-9]+)', data)
-if m: print(m.group(1))
-s.close()
+    python3 -c "
+import serial, time, re, glob
+ports = sorted(glob.glob('/dev/ttyACM*'))
+if not ports: exit()
+for port in ports:
+    try:
+        s = serial.Serial(port, 115200, timeout=3)
+        s.write(b'STATUS\r\n')
+        time.sleep(2)
+        data = s.read(4096).decode(errors='replace')
+        s.close()
+        m = re.search(r'fw=([0-9]+\.[0-9]+\.[0-9]+)', data)
+        if m:
+            print(m.group(1))
+            break
+    except: pass
 " 2>/dev/null
-    fi
 }
 
 deploy_ota() {
@@ -140,9 +145,16 @@ log "Flashing base firmware v$VBASE..."
 sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$VBASE\"/" "$FW_DIR/src/main.cpp"
 (cd "$FW_DIR" && ~/.local/bin/pio run 2>&1 | tail -1)
 deploy_ota "$VBASE"  # S3 matches base so OTA won't trigger on first boot
-python3 -c "import serial; s=serial.Serial('/dev/ttyACM0', 1200); s.close()" 2>/dev/null
-sleep 3
-(cd "$FW_DIR" && ~/.local/bin/pio run -t upload --upload-port /dev/ttyACM0 2>&1 | tail -1)
+CDC_PORT=$(ls /dev/ttyACM* 2>/dev/null | head -1)
+if [ -n "$CDC_PORT" ]; then
+    python3 -c "import serial; s=serial.Serial('$CDC_PORT', 1200); s.close()" 2>/dev/null
+    sleep 3
+    FLASH_PORT=$(ls /dev/ttyACM* 2>/dev/null | head -1)
+    (cd "$FW_DIR" && ~/.local/bin/pio run -t upload --upload-port "${FLASH_PORT:-/dev/ttyACM0}" 2>&1 | tail -1)
+else
+    log "WARN: no CDC port — skipping 1200-baud touch, trying direct upload"
+    (cd "$FW_DIR" && ~/.local/bin/pio run -t upload 2>&1 | tail -1)
+fi
 sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$VBASE\"/" "$FW_DIR/src/main.cpp"
 
 # Clean SD (wait for 60s USB delay)
@@ -208,22 +220,22 @@ wait_for_ota "$V2" 300
 # ── TEST 3: Normal 10MB upload ──────────────────────────────────
 log ""
 log "TEST 3: Normal 10MB upload"
-cleanup; aws s3 rm "s3://$BUCKET/$DEVICE/test_upload.bin" 2>/dev/null
+cleanup; aws s3 rm "s3://$BUCKET/$DEVICE/test_upload_${BASE_VER}.bin" 2>/dev/null
 CUR=$(get_fw_version); deploy_ota "${CUR:-$V2}"
 sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"${CUR:-$V2}\"/" "$FW_DIR/src/main.cpp"
 power_cycle 5; sleep 5; wait_for_usb
-write_test_file "test_upload.bin" 10
-wait_for_s3_file "test_upload.bin" 300
+write_test_file "test_upload_${BASE_VER}.bin" 10
+wait_for_s3_file "test_upload_${BASE_VER}.bin" 300
 [ -n "$S3_RESULT" ] && pass "Upload: $S3_RESULT" || fail "Upload: not found after 5 min"
 
 # ── TEST 4: Upload with power cut ───────────────────────────────
 log ""
 log "TEST 4: Upload + power cut"
-cleanup; aws s3 rm "s3://$BUCKET/$DEVICE/test_resume.bin" 2>/dev/null
+cleanup; aws s3 rm "s3://$BUCKET/$DEVICE/test_resume_${BASE_VER}.bin" 2>/dev/null
 CUR=$(get_fw_version); deploy_ota "${CUR:-$V2}"
 sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"${CUR:-$V2}\"/" "$FW_DIR/src/main.cpp"
 power_cycle 5; sleep 5; wait_for_usb
-write_test_file "test_resume.bin" 10
+write_test_file "test_resume_${BASE_VER}.bin" 10
 # Wait for upload to start then cut power
 # Wait longer: 60s USB delay + 26s modem + 15s harvest + upload start
 MP_CUT=false
@@ -233,7 +245,7 @@ for i in $(seq 1 30); do
         --query "Uploads[?contains(Key,'test_resume')].UploadId" --output text 2>&1)
     if [ -n "$MP" ] && [ "$MP" != "None" ]; then
         PARTS=$(aws s3api list-parts --bucket $BUCKET \
-            --key "$DEVICE/test_resume.bin" --upload-id "$MP" \
+            --key "$DEVICE/test_resume_${BASE_VER}.bin" --upload-id "$MP" \
             --query "length(Parts || \`[]\`)" --output text 2>&1)
         log "  $((i*10))s: $PARTS part(s) uploaded"
         if [ "$PARTS" -ge 1 ] 2>/dev/null; then
@@ -248,7 +260,7 @@ for i in $(seq 1 30); do
     fi
 done
 if $MP_CUT; then
-    wait_for_s3_file "test_resume.bin" 300
+    wait_for_s3_file "test_resume_${BASE_VER}.bin" 480
     [ -n "$S3_RESULT" ] && pass "Upload resumed: $S3_RESULT" || fail "Upload resume failed"
 else
     fail "Upload never started"
@@ -257,11 +269,11 @@ fi
 # ── TEST 5: Combined OTA + upload ──────────────────────────────
 log ""
 log "TEST 5: OTA + upload ($V2 → $V3)"
-cleanup; aws s3 rm "s3://$BUCKET/$DEVICE/test_combo.bin" 2>/dev/null
+cleanup; aws s3 rm "s3://$BUCKET/$DEVICE/test_combo_${BASE_VER}.bin" 2>/dev/null
 deploy_ota "$V3"
 sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$V2\"/" "$FW_DIR/src/main.cpp"
 power_cycle 5; sleep 5; wait_for_usb
-write_test_file "test_combo.bin" 10
+write_test_file "test_combo_${BASE_VER}.bin" 10
 OTA_OK=false; UPLOAD_OK=false
 for i in $(seq 1 120); do
     sleep 10
@@ -274,7 +286,7 @@ for i in $(seq 1 120); do
         [ "$local_v" = "$V3" ] && { OTA_OK=true; log "  OTA: $V3 ✓"; }
     fi
     if ! $UPLOAD_OK; then
-        found=$(aws s3 ls "s3://$BUCKET/$DEVICE/test_combo.bin" 2>&1 | grep "2026-")
+        found=$(aws s3 ls "s3://$BUCKET/$DEVICE/test_combo_${BASE_VER}.bin" 2>&1 | grep "2026-")
         [ -n "$found" ] && { UPLOAD_OK=true; log "  Upload: $found ✓"; }
     fi
     $OTA_OK && $UPLOAD_OK && break
@@ -286,11 +298,11 @@ $UPLOAD_OK && pass "Combined upload" || fail "Combined upload failed"
 # ── TEST 6: OTA + upload + power cut ───────────────────────────
 log ""
 log "TEST 6: Chaos test ($V3 → $V4)"
-cleanup; aws s3 rm "s3://$BUCKET/$DEVICE/test_chaos.bin" 2>/dev/null
+cleanup; aws s3 rm "s3://$BUCKET/$DEVICE/test_chaos_${BASE_VER}.bin" 2>/dev/null
 deploy_ota "$V4"
 sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$V3\"/" "$FW_DIR/src/main.cpp"
 power_cycle 5; sleep 5; wait_for_usb
-write_test_file "test_chaos.bin" 10
+write_test_file "test_chaos_${BASE_VER}.bin" 10
 log "  Cutting power at 45s..."
 sleep 45; $COOLGEAR off >/dev/null 2>&1; sleep 10
 log "  Powering back on..."
@@ -306,7 +318,7 @@ for i in $(seq 1 120); do
         [ "$local_v" = "$V4" ] && { OTA_OK=true; log "  OTA recovered: $V4 ✓"; }
     fi
     if ! $UPLOAD_OK; then
-        found=$(aws s3 ls "s3://$BUCKET/$DEVICE/test_chaos.bin" 2>&1 | grep "2026-")
+        found=$(aws s3 ls "s3://$BUCKET/$DEVICE/test_chaos_${BASE_VER}.bin" 2>&1 | grep "2026-")
         [ -n "$found" ] && { UPLOAD_OK=true; log "  Upload recovered ✓"; }
     fi
     $OTA_OK && $UPLOAD_OK && break

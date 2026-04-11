@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "10.1320.3"
+#define FW_VERSION "10.2001.5"
 
 #include <cstring>
 #include <ctime>
@@ -2229,16 +2229,17 @@ static void netDiag() {
     }
 }
 
-static bool otaCheck() {
-    if (!g_netConnected && !g_pppConnected) return false;
-    if (!s3LoadCreds()) return false;
+// Returns: 1=updated (staged, needs reboot), 0=up to date, -1=transient error
+static int otaCheck() {
+    if (!g_netConnected && !g_pppConnected) return -1;
+    if (!s3LoadCreds()) return 0;  // no creds = permanent, don't retry
     g_tlsActive = true;  // suppress +++ for entire OTA check
 
     log_write("OTA: checking for update (fw=%s)", FW_VERSION);
 
     // Step 1: GET /prod/firmware — check version
     esp_tls_t* tls = tls_connect(g_apiHost);
-    if (!tls) { log_write("OTA: TLS connect failed"); return false; }
+    if (!tls) { log_write("OTA: TLS connect failed"); return -1; }
     char req[512];
     int rlen = snprintf(req, sizeof(req),
         "GET /prod/firmware HTTP/1.1\r\n"
@@ -2246,13 +2247,13 @@ static bool otaCheck() {
         "x-api-key: %s\r\n"
         "Connection: close\r\n\r\n",
         g_apiHost, g_apiKey);
-    if (!tls_write_all(tls, req, rlen)) { tls_destroy(tls); return false; }
+    if (!tls_write_all(tls, req, rlen)) { tls_destroy(tls); return -1; }
     std::string verResp = httpReadResponse(tls);
     tls_destroy(tls);
 
     if (verResp.empty() || verResp.find("\"error\"") != std::string::npos) {
         log_write("OTA: no firmware available");
-        return false;
+        return 0;  // server says no firmware — don't retry
     }
 
     std::string newVer = jsonStr(verResp, "version");
@@ -2261,7 +2262,7 @@ static bool otaCheck() {
 
     if (newVer.empty() || !versionNewer(newVer.c_str(), FW_VERSION)) {
         log_write("OTA: up to date (remote=%s, local=%s)", newVer.c_str(), FW_VERSION);
-        return false;
+        return 0;  // up to date — don't retry
     }
     log_write("OTA: update available %s -> %s (%lu bytes)", FW_VERSION, newVer.c_str(), (unsigned long)fwSize);
 
@@ -2280,26 +2281,27 @@ static bool otaCheck() {
 
     // Step 2: GET /prod/firmware/download — get presigned URL
     tls = tls_connect(g_apiHost);
-    if (!tls) { log_write("OTA: TLS connect failed (download)"); return false; }
+    if (!tls) { log_write("OTA: TLS connect failed (download)"); g_otaActive = false; return -1; }
     rlen = snprintf(req, sizeof(req),
         "GET /prod/firmware/download HTTP/1.1\r\n"
         "Host: %s\r\n"
         "x-api-key: %s\r\n"
         "Connection: close\r\n\r\n",
         g_apiHost, g_apiKey);
-    if (!tls_write_all(tls, req, rlen)) { tls_destroy(tls); return false; }
+    if (!tls_write_all(tls, req, rlen)) { tls_destroy(tls); g_otaActive = false; return -1; }
     std::string dlResp = httpReadResponse(tls);
     tls_destroy(tls);
 
     std::string dlUrl = jsonStr(dlResp, "url");
-    if (dlUrl.empty()) { log_write("OTA: no download URL"); return false; }
+    if (dlUrl.empty()) { log_write("OTA: no download URL"); g_otaActive = false; return -1; }
 
     // Parse S3 presigned URL
     char s3Host[128];
     static char s3Path[2500];
     if (!parseUrl(dlUrl, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
         log_write("OTA: bad URL (len=%d)", (int)dlUrl.length());
-        return false;
+        g_otaActive = false;
+        return -1;
     }
     log_write("OTA: downloading from %s path_len=%d size=%lu", s3Host, (int)strlen(s3Path), (unsigned long)fwSize);
 
@@ -2309,7 +2311,7 @@ static bool otaCheck() {
         disp("OTA FAILED", "");
         vTaskDelay(pdMS_TO_TICKS(10000));
         g_otaActive = false;
-        return false;
+        return -1;
     }
 
     // Stage update: mark pending + record version. Applied on next power cycle.
@@ -2322,7 +2324,7 @@ static bool otaCheck() {
 
     log_write("OTA: v%s downloaded — ready to apply", newVer.c_str());
     g_otaActive = false;
-    return true;
+    return 1;
 }
 
 // Upload a file from /sdcard/harvested/<name> to S3 using pre-signed URLs.
@@ -2745,24 +2747,52 @@ static void modemTask(void* param) {
         }
     }
 
-    // Fallback: try other bauds with flow control
+    // Fallback: try other bauds — modem may be in PPP data mode at high baud
     if (!ready) {
-        uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
-                     PIN_MODEM_RTS, PIN_MODEM_CTS);
-        uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_CTS_RTS, 122);
         const int tryBauds[] = { 921600, 460800, 3000000 };
         for (int b = 0; b < 3 && !ready; b++) {
+            // First try WITHOUT flow control (modem may not assert CTS in data mode)
             uart_set_baudrate(UART_NUM_1, tryBauds[b]);
             vTaskDelay(pdMS_TO_TICKS(100));
             uart_flush(UART_NUM_1);
+            // +++ escape at this baud
+            vTaskDelay(pdMS_TO_TICKS(1100));
+            uart_write_bytes(UART_NUM_1, "+++", 3);
+            vTaskDelay(pdMS_TO_TICKS(1100));
+            uart_flush(UART_NUM_1);
+            modem_at_cmd("ATH", resp, sizeof(resp), 1000);
             int len = modem_at_cmd("AT", resp, sizeof(resp), 500);
             if (len > 0 && strstr(resp, "OK")) {
-                cdc_printf("Modem: found at %d\r\n", tryBauds[b]);
+                cdc_printf("Modem: found at %d (no FC)\r\n", tryBauds[b]);
                 modem_at_cmd("AT+IFC=0,0", resp, sizeof(resp), 1000);
                 modem_at_cmd("AT+IPR=115200", resp, sizeof(resp), 1000);
                 vTaskDelay(pdMS_TO_TICKS(200));
                 ready = true;
+                break;
             }
+            // Then try WITH flow control
+            uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
+                         PIN_MODEM_RTS, PIN_MODEM_CTS);
+            uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_CTS_RTS, 122);
+            uart_flush(UART_NUM_1);
+            vTaskDelay(pdMS_TO_TICKS(1100));
+            uart_write_bytes(UART_NUM_1, "+++", 3);
+            vTaskDelay(pdMS_TO_TICKS(1100));
+            uart_flush(UART_NUM_1);
+            modem_at_cmd("ATH", resp, sizeof(resp), 1000);
+            len = modem_at_cmd("AT", resp, sizeof(resp), 500);
+            if (len > 0 && strstr(resp, "OK")) {
+                cdc_printf("Modem: found at %d (FC)\r\n", tryBauds[b]);
+                modem_at_cmd("AT+IFC=0,0", resp, sizeof(resp), 1000);
+                modem_at_cmd("AT+IPR=115200", resp, sizeof(resp), 1000);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                ready = true;
+                break;
+            }
+            // Reset flow control for next iteration
+            uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_DISABLE, 0);
+            uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
+                         UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
         }
         uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_DISABLE, 0);
         uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
@@ -3403,11 +3433,24 @@ static void uploadTask(void* param) {
     for (int i = 0; i < 90 && !g_netConnected && !g_pppConnected; i++)
         vTaskDelay(pdMS_TO_TICKS(1000));
 
+    // Let network stack stabilize (default route, DNS, etc.)
+    if (g_pppConnected) vTaskDelay(pdMS_TO_TICKS(5000));
+
     // ── OTA check first (highest priority after network) ────────────
     if (!otaDone && (g_netConnected || g_pppConnected)) {
+        int otaResult = 0;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            if (attempt > 0) {
+                log_write("OTA: retry %d/3 in 10s", attempt + 1);
+                vTaskDelay(pdMS_TO_TICKS(10000));
+                if (!g_netConnected && !g_pppConnected) break;
+            }
+            otaResult = otaCheck();  // 1=updated, 0=up to date, -1=error
+            g_tlsActive = false;
+            if (otaResult >= 0) break;  // success or up-to-date → stop retrying
+        }
         otaDone = true;
-        bool staged = otaCheck();  // downloads firmware if available
-        g_tlsActive = false;
+        bool staged = (otaResult == 1);
 
         if (staged) {
             // OTA downloaded — reboot immediately unless host is actively writing
@@ -4030,14 +4073,16 @@ static void processCLI(const char* cmd) {
     } else if (strcmp(cmd, "OTA") == 0) {
         cdc_printf("CLI: checking for firmware update (current=%s)...\r\n", FW_VERSION);
         xTaskCreatePinnedToCore([](void*) {
-            bool ok = otaCheck();
+            int result = otaCheck();
             g_tlsActive = false;
-            if (ok) {
+            if (result == 1) {
                 cdc_printf("OTA: downloaded — rebooting in 3s\r\n");
                 vTaskDelay(pdMS_TO_TICKS(10000));
                 esp_restart();
+            } else if (result == 0) {
+                cdc_printf("OTA: up to date\r\n");
             } else {
-                cdc_printf("OTA: no update available or check failed\r\n");
+                cdc_printf("OTA: check failed (network error)\r\n");
             }
             vTaskDelete(nullptr);
         }, "ota", 16384, nullptr, 2, nullptr, 1);
@@ -4055,8 +4100,8 @@ static void processCLI(const char* cmd) {
 
     } else if (strcmp(cmd, "MODEM_START") == 0) {
         if (!g_modem_task) {
-            xTaskCreatePinnedToCore(modemTask, "modem", 8192, nullptr, 1,
-                                    &g_modem_task, 1);
+            xTaskCreatePinnedToCore(modemTask, "modem", 16384, nullptr, 2,
+                                    &g_modem_task, 0);
             cdc_printf("CLI: modem task started\r\n");
         } else {
             cdc_printf("CLI: modem task already running\r\n");
@@ -4137,14 +4182,14 @@ static void main_loop_task(void* param) {
     uint32_t usbPresentMs = millis();
 
     for (;;) {
-        // Watchdog: restart modem task if it died
-        if (g_modem_task == nullptr && g_modemReady) {
+        // Watchdog: restart modem task if it died (init failure OR runtime crash)
+        if (g_modem_task == nullptr) {
             log_write("Modem: task died — restarting");
             cdc_printf("Modem: restarting task...\r\n");
             g_modemReady = false;
             g_pppConnected = false;
             xTaskCreatePinnedToCore(modemTask, "modem", 16384, nullptr, 2, &g_modem_task, 0);
-            vTaskDelay(pdMS_TO_TICKS(5000));  // give it time to init
+            vTaskDelay(pdMS_TO_TICKS(30000));  // 30s cooldown for modem cold boot
         }
 
         // Enable USB MSC after delay (card sectors must be valid)
