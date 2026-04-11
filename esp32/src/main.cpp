@@ -23,6 +23,8 @@
 #include "airbridge_wifi_creds.h"
 #include "airbridge_harvest.h"
 #include "airbridge_http.h"
+#include "airbridge_triggers.h"
+#include "airbridge_cli.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -326,7 +328,7 @@ static SemaphoreHandle_t g_sd_mutex = nullptr;
 static volatile bool     g_sd_ready = false;
 
 // ── Harvest timing ──────────────────────────────────────────────────────────
-#define QUIET_WINDOW_MS     15000UL
+// QUIET_WINDOW_MS defined in airbridge_triggers.h
 #define DISPLAY_INTERVAL_MS  1000UL
 
 static volatile bool     g_hostConnected    = false;
@@ -3581,34 +3583,13 @@ static void harvestTask(void* param) {
 // ── Serial CLI ──────────────────────────────────────────────────────────────
 static void processCLI(const char* cmd) {
     if (strncmp(cmd, "SETWIFI ", 8) == 0) {
-        const char* rest = cmd + 8;
-        const char* sp   = strchr(rest, ' ');
-        char ssid[33] = "", pass[65] = "";
-        if (sp) {
-            int slen = sp - rest;
-            strlcpy(ssid, rest, std::min(slen + 1, (int)sizeof(ssid)));
-            strlcpy(pass, sp + 1, sizeof(pass));
-        } else {
-            strlcpy(ssid, rest, sizeof(ssid));
-        }
-        if (!ssid[0]) { cdc_printf("CLI: SETWIFI <ssid> <pass>\r\n"); return; }
-        saveNetwork(ssid, pass);
-        cdc_printf("CLI: WiFi saved: '%s'\r\n", ssid);
+        CliResult r = cliSetWifi(cmd + 8);
+        cdc_printf("CLI: %s\r\n", r.output);
 
     } else if (strncmp(cmd, "SETS3 ", 6) == 0) {
-        char apiHost[128], apiKey[64];
-        if (sscanf(cmd + 6, "%127s %63s", apiHost, apiKey) < 2) {
-            cdc_printf("CLI: SETS3 <api_host> <api_key>\r\n"); return;
-        }
-        nvs_handle_t h;
-        if (nvs_open("s3", NVS_READWRITE, &h) == ESP_OK) {
-            nvs_set_str(h, "api_host", apiHost);
-            nvs_set_str(h, "api_key", apiKey);
-            nvs_commit(h);
-            nvs_close(h);
-        }
-        g_apiHost[0] = 0; g_apiKey[0] = 0;
-        cdc_printf("CLI: S3 saved: api_host=%s\r\n", apiHost);
+        CliResult r = cliSetS3(cmd + 6);
+        g_apiHost[0] = 0; g_apiKey[0] = 0;  // force reload
+        cdc_printf("CLI: %s\r\n", r.output);
 
     } else if (strcmp(cmd, "STATUS") == 0) {
         char ipStr[20] = "disconnected";
@@ -3746,24 +3727,8 @@ static void processCLI(const char* cmd) {
         g_msc_ejected = false;
 
     } else if (strncmp(cmd, "SETMODE", 7) == 0) {
-        const char* mode = cmd + 7;
-        while (*mode == ' ') mode++;
-        if (!mode[0]) {
-            cdc_printf("CLI: current=%s  usage: SETMODE CDC | SETMODE MSC\r\n",
-                       g_msc_only ? "MSC" : "CDC");
-        } else {
-            uint8_t val = 1;
-            if (strcasecmp(mode, "CDC") == 0) val = 0;
-            else if (strcasecmp(mode, "MSC") == 0) val = 1;
-            else { cdc_printf("CLI: unknown mode '%s' — use CDC or MSC\r\n", mode); return; }
-            nvs_handle_t h;
-            if (nvs_open("usb", NVS_READWRITE, &h) == ESP_OK) {
-                nvs_set_u8(h, "msc_only", val);
-                nvs_commit(h);
-                nvs_close(h);
-            }
-            cdc_printf("CLI: USB mode set to %s — reboot to apply\r\n", val ? "MSC-only" : "CDC+MSC");
-        }
+        SetModeResult r = cliSetMode(cmd + 7, g_msc_only);
+        cdc_printf("CLI: %s\r\n", r.output);
 
     } else if (strcmp(cmd, "OTA") == 0) {
         cdc_printf("CLI: checking for firmware update (current=%s)...\r\n", FW_VERSION);
@@ -3938,9 +3903,8 @@ static void main_loop_task(void* param) {
 
         // Snapshot volatile write timestamp to avoid race with MSC callback
         uint32_t lastWr = g_lastWriteMs;
-        if (!g_harvesting && g_writeDetected && g_hostWasConnected &&
-            lastWr != 0 && now >= lastWr && (now - lastWr) >= QUIET_WINDOW_MS &&
-            (now - g_lastHarvestMs) >= g_harvestCoolMs) {
+        if (shouldHarvest(g_harvesting, g_writeDetected, g_hostWasConnected,
+                          lastWr, g_lastHarvestMs, g_harvestCoolMs, now)) {
             cdc_printf("Harvest: %.1f KB written, %us idle\r\n",
                      g_hostWrittenMb * 1024.0f, (now - lastWr) / 1000);
             log_write("Harvest trigger: %.1fKB, %us idle", g_hostWrittenMb * 1024.0f, (now - lastWr) / 1000);
