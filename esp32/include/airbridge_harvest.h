@@ -47,6 +47,14 @@ inline HarvestResult harvestFiles(const char* srcDir, const char* destDir) {
         char fullpath[160];
         snprintf(fullpath, sizeof(fullpath), "%s/%s", stack[depth].dirpath, ent.name);
 
+        // readdir may not provide size/type — stat to get real values
+        uint32_t statSize = 0;
+        bool statIsDir = ent.is_dir;
+        if (g_hal->filesys->stat(fullpath, &statSize, &statIsDir)) {
+            ent.size = statSize;
+            ent.is_dir = statIsDir;
+        }
+
         if (ent.is_dir) {
             if (depth < 3) {
                 depth++;
