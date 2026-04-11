@@ -17,6 +17,8 @@
 //   R       Reset display state
 //   Q/Esc   Quit
 
+#define FW_VERSION "10.2001.7"
+
 #include <SDL2/SDL.h>
 #include <cstdio>
 #include <cstring>
@@ -34,6 +36,7 @@
 #include "airbridge_s3.h"
 #include "airbridge_modem.h"
 #include "airbridge_triggers.h"
+#include "airbridge_runtime.h"
 
 // ── Display: same as TestDisplay but with SDL-compatible init ────────────────
 
@@ -67,6 +70,9 @@ HAL* g_hal = &s_hal;
 
 static SimModem* s_modem = nullptr;
 static const char* SD_ROOT = "./emu_sdcard";
+static SpeedTracker s_usbSpeed = {};
+static SpeedTracker s_uploadSpeed = {};
+static LogBuffer s_log;
 
 // mdm_* function definitions for airbridge_modem.h (route through HAL UART)
 int mdm_write(const void* data, size_t len) { return g_hal->uart->write(data, len); }
@@ -183,8 +189,9 @@ int main(int argc, char* argv[]) {
     printf("AirBridge Emulator — device_id=%s\n", deviceId);
     printf("Virtual SD card: %s/\n", SD_ROOT);
     printf("NVS storage:     ./emu_nvs.dat\n\n");
-    printf("Keys: C=cellular  H=harvest  P=upload-to-S3  T=test-AT-cmd\n");
-    printf("      U=usb-write +/-=speed  S=step  R=reset  Q=quit\n\n");
+    printf("Keys: C=cellular  H=harvest  P=upload  O=OTA-check  T=test-AT\n");
+    printf("      I=status  U=usb-write  S=step  R=reset  Q=quit\n\n");
+    s_log.clear();
 
     // Launch modem init in background (same AT sequence as real device)
     DisplayState ds = {};
@@ -293,13 +300,42 @@ int main(int argc, char* argv[]) {
                     strlcpy(ds.modemOp, "Emulator", sizeof(ds.modemOp));
                     printf("State reset\n");
                     break;
+                case SDLK_o:
+                    if (!ds.pppConnected) { printf("Press C first\n"); break; }
+                    printf("[OTA] Checking for update...\n");
+                    { OtaCheckResult ota = halOtaCheck(FW_VERSION);
+                      if (ota.status == 1) printf("[OTA] Update available: v%s (%u bytes)\n", ota.newVersion, ota.size);
+                      else if (ota.status == 0) printf("[OTA] Up to date\n");
+                      else printf("[OTA] Check failed\n");
+                      s_log.write(g_hal->clock->millis(), "OTA check: status=%d", ota.status);
+                    }
+                    break;
+                case SDLK_i: {
+                    DeviceStatus st = {};
+                    st.pppConnected = ds.pppConnected;
+                    st.modemRssi = ds.modemRssi;
+                    strlcpy(st.modemOp, ds.modemOp, sizeof(st.modemOp));
+                    st.mbQueued = ds.mbQueued;
+                    st.mbUploaded = ds.mbUploaded;
+                    st.hostWrittenMb = ds.hostWrittenMb;
+                    st.harvesting = false;
+                    strlcpy(st.fwVersion, FW_VERSION, sizeof(st.fwVersion));
+                    g_hal->nvs->get_str("s3", "api_host", st.apiHost, sizeof(st.apiHost));
+                    g_hal->nvs->get_str("s3", "device_id", st.deviceId, sizeof(st.deviceId));
+                    printf("--- STATUS ---\n%s--------------\n", formatStatus(st).c_str());
+                    if (s_log.len > 0) printf("--- LOG ---\n%s-----------\n", s_log.contents().c_str());
+                    break;
+                }
                 default:
                     break;
                 }
             }
         }
 
-        if (ds.usbWriteKBps > 0.5f) ds.usbWriteKBps *= 0.95f;
+        // Update speeds using shared SpeedTracker (same math as main_loop_task)
+        uint32_t now = g_hal->clock->millis();
+        ds.usbWriteKBps = s_usbSpeed.update(ds.hostWrittenMb, now);
+        ds.uploadKBps = s_uploadSpeed.update(ds.mbUploaded + ds.uploadingMb, now);
 
         updateDisplay(ds);
         renderFramebuffer(renderer);
