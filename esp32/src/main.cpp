@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "10.2001.5"
+#define FW_VERSION "10.2001.7"
 
 #include <cstring>
 #include <ctime>
@@ -1539,7 +1539,9 @@ static void updateDisplay() {
     {
         char label[18];
         int bars = 0;
+        int branch = 0;  // diagnostic
         if (g_pppConnected && g_modemRssi > 0) {
+            branch = 1;
             // Cellular data active + signal present
             if (g_modemOp[0]) strlcpy(label, g_modemOp, sizeof(label));
             else              strlcpy(label, "Cellular", sizeof(label));
@@ -1549,21 +1551,33 @@ static void updateDisplay() {
             else if (g_modemRssi >= 10) bars = 2;
             else                        bars = 1;
         } else if (g_netConnected) {
+            branch = 2;
             strlcpy(label, g_wifiLabel, sizeof(label));
             bars = g_wifiBars;
         } else if (g_pppConnected) {
+            branch = 3;
             // PPP up but signal lost
             strlcpy(label, "No Signal", sizeof(label));
         } else if (g_modemReady) {
+            branch = 4;
             if (g_modemOp[0]) {
                 snprintf(label, sizeof(label), "%s...", g_modemOp);
             } else {
                 strlcpy(label, "Connecting...", sizeof(label));
             }
         } else {
+            branch = 5;
             strlcpy(label, "No Network", sizeof(label));
         }
         oled_text(0, 0, label);
+
+        // One-time diagnostic: log which display branch we're taking
+        static bool dispDiag = false;
+        if (!dispDiag && g_modemReady) {
+            dispDiag = true;
+            log_write("Disp: branch=%d ppp=%d rssi=%d bars=%d op='%s'",
+                       branch, (int)g_pppConnected, g_modemRssi, bars, g_modemOp);
+        }
 
         // Solid bars only (no outlines for inactive bars)
         const int8_t xs[4] = {108,113,118,123}, hs[4] = {2,4,6,8};
@@ -2957,25 +2971,6 @@ static void modemTask(void* param) {
     modem_at_cmd("AT+CREG=1", resp, sizeof(resp), 1000);   // enable registration URCs
     modem_at_cmd("AT+AUTOCSQ=1,1", resp, sizeof(resp), 1000); // auto RSSI
 
-    // Quick RSSI + operator read (for display, non-blocking)
-    if (modem_at_cmd("AT+CSQ", resp, sizeof(resp), 1000) > 0) {
-        char* p = strstr(resp, "+CSQ:");
-        if (p) { int r = 99; sscanf(p, "+CSQ: %d", &r); g_modemRssi = r; }
-    }
-    if (modem_at_cmd("AT+COPS?", resp, sizeof(resp), 2000) > 0) {
-        char* q1 = strchr(resp, '"');
-        if (q1) {
-            char* q2 = strchr(q1 + 1, '"');
-            if (q2) {
-                int olen = std::min((int)(q2 - q1 - 1), (int)sizeof(g_modemOp) - 1);
-                memcpy(g_modemOp, q1 + 1, olen);
-                g_modemOp[olen] = '\0';
-            }
-        }
-        cdc_printf("Modem: %s RSSI=%d\r\n", g_modemOp, g_modemRssi);
-        log_write("Modem: operator=%s RSSI=%d", g_modemOp, g_modemRssi);
-    }
-
     // ── Wait for network registration (up to 30s) ────────────────────────
     // CREG stat: 0=not searching, 1=home, 2=searching, 3=denied, 5=roaming
     {
@@ -2996,7 +2991,7 @@ static void modemTask(void* param) {
         }
     }
 
-    // ── Verify signal strength before dialing ───────────────────────────
+    // ── Read RSSI + operator (after registration for reliable operator name) ─
     modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000);
     {
         char* p = strstr(resp, "+CSQ:");
@@ -3007,6 +3002,19 @@ static void modemTask(void* param) {
             log_write("Modem: RSSI=%d (pre-dial)", rssi);
             cdc_printf("Modem: RSSI=%d\r\n", rssi);
         }
+    }
+    if (modem_at_cmd("AT+COPS?", resp, sizeof(resp), 2000) > 0) {
+        char* q1 = strchr(resp, '"');
+        if (q1) {
+            char* q2 = strchr(q1 + 1, '"');
+            if (q2) {
+                int olen = std::min((int)(q2 - q1 - 1), (int)sizeof(g_modemOp) - 1);
+                memcpy(g_modemOp, q1 + 1, olen);
+                g_modemOp[olen] = '\0';
+            }
+        }
+        cdc_printf("Modem: %s RSSI=%d\r\n", g_modemOp, g_modemRssi);
+        log_write("Modem: operator=%s RSSI=%d", g_modemOp, g_modemRssi);
     }
 
     // ── Set APN ──────────────────────────────────────────────────────────
@@ -3283,6 +3291,19 @@ static void modemTask(void* param) {
                 log_write("RSSI: %d (reconnect)", g_modemRssi);
             }
 
+            // 5b. Re-read operator name for display
+            if (modem_at_cmd("AT+COPS?", resp, sizeof(resp), 2000) > 0) {
+                char* q1 = strchr(resp, '"');
+                if (q1) {
+                    char* q2 = strchr(q1 + 1, '"');
+                    if (q2) {
+                        int olen = std::min((int)(q2 - q1 - 1), (int)sizeof(g_modemOp) - 1);
+                        memcpy(g_modemOp, q1 + 1, olen);
+                        g_modemOp[olen] = '\0';
+                    }
+                }
+            }
+
             // 6. Redial PPP (up to 3 attempts)
             bool redialOk = false;
             for (int attempt = 0; attempt < 3 && !redialOk; attempt++) {
@@ -3318,6 +3339,17 @@ static void modemTask(void* param) {
             }
         }
 
+        // ── Periodic heap monitoring ─────────────────────────────────────
+        {
+            static uint32_t lastHeapLogMs = 0;
+            if (g_pppConnected && (millis() - lastHeapLogMs) > 120000) {
+                lastHeapLogMs = millis();
+                log_write("Heap: free=%lu min=%lu",
+                          (unsigned long)esp_get_free_heap_size(),
+                          (unsigned long)esp_get_minimum_free_heap_size());
+            }
+        }
+
         // ── Opportunistic log upload via cellular ─────────────────────────
         // 60s when idle, skip during file uploads. First upload 30s after connect.
         // Each boot session uses a dated filename (logs/YYYYMMDD_HHMMSS.log).
@@ -3337,49 +3369,49 @@ static void modemTask(void* param) {
             lastLogUploadMs = millis();
             logUpRunning = true;
             xTaskCreatePinnedToCore([](void*) {
-                if (!s3LoadCreds()) { logUpRunning = false; vTaskDelete(nullptr); return; }
+                // All std::string objects must be scoped so their destructors
+                // run before vTaskDelete (which does NOT call C++ destructors).
+                do {
+                    if (!s3LoadCreds()) break;
 
-                // Snapshot the full log buffer
-                if (xSemaphoreTake(g_log_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-                    logUpRunning = false; vTaskDelete(nullptr); return;
-                }
-                static char logSnap[LOG_BUF_SIZE];
-                int snapLen = g_log_len;
-                memcpy(logSnap, g_log_buf, snapLen);
-                xSemaphoreGive(g_log_mutex);
+                    // Snapshot the full log buffer
+                    if (xSemaphoreTake(g_log_mutex, pdMS_TO_TICKS(100)) != pdTRUE) break;
+                    static char logSnap[LOG_BUF_SIZE];
+                    int snapLen = g_log_len;
+                    memcpy(logSnap, g_log_buf, snapLen);
+                    xSemaphoreGive(g_log_mutex);
 
-                if (snapLen == 0) { logUpRunning = false; vTaskDelete(nullptr); return; }
+                    if (snapLen == 0) break;
 
-                // Use dated session filename
-                std::string enc = urlEncode(g_logFileName);
-                char query[512];
-                snprintf(query, sizeof(query), "file=%s&size=%d&device=%s",
-                         enc.c_str(), snapLen, g_deviceId);
-                std::string resp = s3ApiGet(query);
-                std::string url = jsonStr(resp, "\"url\"");
-                if (url.empty()) { logUpRunning = false; vTaskDelete(nullptr); return; }
+                    // Use dated session filename
+                    std::string enc = urlEncode(g_logFileName);
+                    char query[512];
+                    snprintf(query, sizeof(query), "file=%s&size=%d&device=%s",
+                             enc.c_str(), snapLen, g_deviceId);
+                    std::string resp = s3ApiGet(query);
+                    std::string url = jsonStr(resp, "\"url\"");
+                    if (url.empty()) break;
 
-                char s3Host[128];
-                static char s3Path[2500];
-                if (!parseUrl(url, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
-                    logUpRunning = false; vTaskDelete(nullptr); return;
-                }
+                    char s3Host[128];
+                    static char s3Path[2500];
+                    if (!parseUrl(url, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) break;
 
-                esp_tls_t* tls = tls_connect(s3Host);
-                if (!tls) { logUpRunning = false; vTaskDelete(nullptr); return; }
+                    esp_tls_t* tls = tls_connect(s3Host);
+                    if (!tls) break;
 
-                char hdr[2700];
-                int hlen = snprintf(hdr, sizeof(hdr),
-                    "PUT %s HTTP/1.1\r\n"
-                    "Host: %s\r\n"
-                    "Content-Length: %d\r\n"
-                    "Connection: close\r\n\r\n",
-                    s3Path, s3Host, snapLen);
+                    char hdr[2700];
+                    int hlen = snprintf(hdr, sizeof(hdr),
+                        "PUT %s HTTP/1.1\r\n"
+                        "Host: %s\r\n"
+                        "Content-Length: %d\r\n"
+                        "Connection: close\r\n\r\n",
+                        s3Path, s3Host, snapLen);
 
-                bool ok = tls_write_all(tls, hdr, hlen) &&
-                          tls_write_all(tls, logSnap, snapLen);
-                if (ok) httpReadResponse(tls);
-                tls_destroy(tls);
+                    bool ok = tls_write_all(tls, hdr, hlen) &&
+                              tls_write_all(tls, logSnap, snapLen);
+                    if (ok) httpReadResponse(tls);
+                    tls_destroy(tls);
+                } while (0);
                 logUpRunning = false;
                 vTaskDelete(nullptr);
             }, "log_up", 8192, nullptr, 2, nullptr, 1);
@@ -4341,8 +4373,6 @@ extern "C" void app_main(void) {
             uint8_t mode = 0;  // default: CDC+MSC (forced for debug) until SETMODE MSC is run
             nvs_get_u8(h, "msc_only", &mode);
             g_msc_only = (mode != 0);
-            // Force CDC for development — remove when switching to MSC-only
-            if (g_msc_only) { g_msc_only = false; nvs_set_u8(h, "msc_only", 0); nvs_commit(h); }
             nvs_close(h);
         }
         ESP_LOGI(TAG, "USB mode: %s", g_msc_only ? "MSC-only" : "CDC+MSC");
