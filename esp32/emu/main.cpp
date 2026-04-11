@@ -271,130 +271,54 @@ static SimModem* s_modem = nullptr;
 
 static const char* SD_ROOT = "./emu_sdcard";
 
-// ── S3 upload logic ─────────────────────────────────────────────────────────
+// ── S3 upload — uses shared halS3UploadFile() from airbridge_s3.h ───────────
 
-static bool uploadFile(const char* filepath, const char* filename, DisplayState& ds) {
-    char apiHost[128], apiKey[64], deviceId[16];
-    g_hal->nvs->get_str("s3", "api_host", apiHost, sizeof(apiHost));
-    g_hal->nvs->get_str("s3", "api_key", apiKey, sizeof(apiKey));
-    g_hal->nvs->get_str("s3", "device_id", deviceId, sizeof(deviceId));
-
-    if (!apiHost[0] || !apiKey[0]) {
-        printf("[S3] No credentials configured\n");
-        return false;
-    }
-
-    // Get file size
-    struct ::stat st;
-    if (::stat(filepath, &st) != 0) return false;
-    uint32_t fileSize = st.st_size;
-    float fileMb = fileSize / 1e6f;
-    printf("[S3] Uploading %s (%.1f MB)...\n", filename, fileMb);
-
-    // Get pre-signed URL
-    char qp[256];
-    snprintf(qp, sizeof(qp), "action=presign&file=%s&size=%u&device=%s",
-             urlEncode(filename).c_str(), fileSize, deviceId);
-    std::string resp = s3ApiGetViaHal(apiHost, apiKey, qp);
-    if (resp.empty()) { printf("[S3] Presign request failed\n"); return false; }
-
-    std::string url = jsonStr(resp, "url");
-    std::string key = jsonStr(resp, "key");
-    if (url.empty()) { printf("[S3] No URL in response: %s\n", resp.c_str()); return false; }
-
-    printf("[S3] Got presigned URL, uploading to key=%s\n", key.c_str());
-
-    // Parse S3 URL
-    char s3Host[128], s3Path[1024];
-    if (!parseUrl(url, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
-        printf("[S3] Failed to parse URL\n");
-        return false;
-    }
-
-    // Connect to S3 and PUT the file
-    TlsHandle tls = g_hal->network->connect(s3Host);
-    if (!tls) { printf("[S3] TLS connect to S3 failed\n"); return false; }
-
-    // Send PUT request header
-    char hdr[1200];
-    snprintf(hdr, sizeof(hdr),
-        "PUT %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
-        s3Path, s3Host, fileSize);
-    if (!g_hal->network->write(tls, hdr, strlen(hdr))) {
-        g_hal->network->destroy(tls);
-        printf("[S3] Failed to send PUT header\n");
-        return false;
-    }
-
-    // Stream file body
-    FILE* f = fopen(filepath, "rb");
-    if (!f) { g_hal->network->destroy(tls); return false; }
-
-    uint8_t buf[8192];
-    uint32_t sent = 0;
-    uint32_t startMs = SDL_GetTicks();
-    while (sent < fileSize) {
-        size_t toRead = ((fileSize - sent) < sizeof(buf)) ? (fileSize - sent) : sizeof(buf);
-        size_t n = fread(buf, 1, toRead, f);
-        if (n == 0) break;
-        if (!g_hal->network->write(tls, buf, n)) {
-            printf("[S3] Write failed at %u/%u bytes\n", sent, fileSize);
-            break;
-        }
-        sent += n;
-
-        // Update display with progress
-        ds.uploadingMb = sent / 1e6f;
-        ds.uploadKBps = (sent / 1024.0f) / ((SDL_GetTicks() - startMs) / 1000.0f + 0.001f);
-    }
-    fclose(f);
-
-    // Read response
-    std::string s3resp = halHttpReadResponse(tls);
-    g_hal->network->destroy(tls);
-
-    if (sent == fileSize) {
-        printf("[S3] Upload complete: %u bytes, %.0f KB/s\n", sent, ds.uploadKBps);
-        ds.mbUploaded += fileMb;
-        ds.uploadingMb = 0;
-
-        // Create .done__ marker
-        char donePath[512];
-        snprintf(donePath, sizeof(donePath), "%s/harvested/.done__%s", SD_ROOT, filename);
-        FILE* df = fopen(donePath, "w");
-        if (df) fclose(df);
-        return true;
-    }
-    return false;
-}
+#include "airbridge_s3.h"
 
 static void doUpload(DisplayState& ds) {
     char harvestDir[256];
     snprintf(harvestDir, sizeof(harvestDir), "%s/harvested", SD_ROOT);
 
-    DIR* dir = opendir(harvestDir);
+    // Scan for files needing upload (skip .done__ markers)
+    void* dir = g_hal->filesys->opendir(harvestDir);
     if (!dir) { printf("[S3] No harvested directory\n"); return; }
 
     std::vector<std::string> files;
-    struct dirent* ent;
-    while ((ent = ::readdir(dir)) != nullptr) {
-        if (ent->d_name[0] == '.') continue;
-        if (strncmp(ent->d_name, ".done__", 7) == 0) continue;
-        // Check if .done__ marker exists
-        char donePath[512];
-        snprintf(donePath, sizeof(donePath), "%s/.done__%s", harvestDir, ent->d_name);
-        struct ::stat st;
-        if (::stat(donePath, &st) == 0) continue;
+    FsDirEntry ent;
+    while (g_hal->filesys->readdir(dir, &ent)) {
+        if (ent.name[0] == '.') continue;
 
-        files.push_back(ent->d_name);
+        char donePath[512];
+        snprintf(donePath, sizeof(donePath), "%s/.done__%s", harvestDir, ent.name);
+        if (g_hal->filesys->exists(donePath)) continue;
+
+        files.push_back(ent.name);
     }
-    closedir(dir);
+    g_hal->filesys->closedir(dir);
 
     printf("[S3] %zu file(s) to upload\n", files.size());
     for (auto& name : files) {
         char fullpath[512];
         snprintf(fullpath, sizeof(fullpath), "%s/%s", harvestDir, name.c_str());
-        uploadFile(fullpath, name.c_str(), ds);
+        float fileMb = 0;
+        { uint32_t sz = 0; bool d = false; g_hal->filesys->stat(fullpath, &sz, &d); fileMb = sz / 1e6f; }
+
+        printf("[S3] Uploading %s (%.1f MB)...\n", name.c_str(), fileMb);
+        UploadResult res = halS3UploadFile(fullpath, name.c_str());
+
+        if (res.success) {
+            printf("[S3] Upload complete: %.0f KB/s\n", res.kbps);
+            ds.mbUploaded += fileMb;
+            ds.uploadKBps = res.kbps;
+
+            // Create .done__ marker
+            char donePath[512];
+            snprintf(donePath, sizeof(donePath), "%s/harvested/.done__%s", SD_ROOT, name.c_str());
+            void* df = g_hal->filesys->open(donePath, "w");
+            if (df) g_hal->filesys->close(df);
+        } else {
+            printf("[S3] Upload failed: %s\n", res.error);
+        }
     }
 }
 

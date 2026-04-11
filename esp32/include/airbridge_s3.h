@@ -1,9 +1,11 @@
 #pragma once
-// AirBridge S3 multipart upload session management
-// Extracted from s3UploadFile() for testing NVS resume/retry logic.
+// AirBridge S3 upload — credential loading, file upload (single + multipart),
+// session management with NVS resume/retry.
+// All I/O through HAL interfaces — works on ESP32 and native emulator.
 
 #include "hal/hal.h"
 #include "airbridge_utils.h"
+#include "airbridge_http.h"
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -102,4 +104,146 @@ inline void clearMultipartSession() {
     g_hal->nvs->erase_key("s3up", "parts");
     g_hal->nvs->erase_key("s3up", "size");
     g_hal->nvs->erase_key("s3up", "retries");
+}
+
+// ── S3 credentials ──────────────────────────────────────────────────────────
+
+struct S3Creds {
+    char apiHost[128];
+    char apiKey[64];
+    char deviceId[16];
+    bool valid;
+};
+
+inline S3Creds loadS3Creds() {
+    S3Creds c = {};
+    if (!g_hal || !g_hal->nvs) return c;
+    g_hal->nvs->get_str("s3", "api_host", c.apiHost, sizeof(c.apiHost));
+    g_hal->nvs->get_str("s3", "api_key", c.apiKey, sizeof(c.apiKey));
+    g_hal->nvs->get_str("s3", "device_id", c.deviceId, sizeof(c.deviceId));
+    c.valid = (c.apiHost[0] && c.apiKey[0]);
+    return c;
+}
+
+// ── Stream file to TLS via HAL ──────────────────────────────────────────────
+
+// Upload progress callback: called with bytes sent so far
+typedef void (*UploadProgressFn)(uint32_t bytesSent, uint32_t totalBytes);
+
+inline bool halStreamFile(TlsHandle tls, void* fileHandle, uint32_t len,
+                          UploadProgressFn progress = nullptr) {
+    if (!g_hal || !g_hal->network || !g_hal->filesys) return false;
+    uint8_t buf[8192];
+    uint32_t remaining = len;
+    uint32_t sent = 0;
+    while (remaining > 0) {
+        uint32_t toRead = (remaining < sizeof(buf)) ? remaining : sizeof(buf);
+        size_t n = g_hal->filesys->read(fileHandle, buf, toRead);
+        if (n == 0) return false;
+        if (!g_hal->network->write(tls, buf, n)) return false;
+        remaining -= n;
+        sent += n;
+        if (progress) progress(sent, len);
+    }
+    return true;
+}
+
+// ── Full single-file upload via HAL ─────────────────────────────────────────
+
+struct UploadResult {
+    bool success;
+    float kbps;          // upload speed
+    char error[128];     // error message if !success
+};
+
+// Upload a single file to S3 using pre-signed URLs.
+// filepath: full path to the file (e.g. "./emu_sdcard/harvested/data.csv")
+// filename: just the name (e.g. "data.csv") — used for S3 key
+// progress: optional callback for display updates
+inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
+                                     UploadProgressFn progress = nullptr) {
+    UploadResult res = {};
+    if (!g_hal || !g_hal->network || !g_hal->filesys || !g_hal->nvs) {
+        strlcpy(res.error, "HAL not initialized", sizeof(res.error));
+        return res;
+    }
+
+    S3Creds creds = loadS3Creds();
+    if (!creds.valid) {
+        strlcpy(res.error, "No S3 credentials", sizeof(res.error));
+        return res;
+    }
+
+    // Get file size
+    uint32_t fileSize = 0;
+    bool isDir = false;
+    if (!g_hal->filesys->stat(filepath, &fileSize, &isDir) || fileSize == 0) {
+        snprintf(res.error, sizeof(res.error), "Can't stat %s", filepath);
+        return res;
+    }
+
+    // Get pre-signed URL
+    char query[512];
+    snprintf(query, sizeof(query), "file=%s&size=%u&device=%s",
+             urlEncode(filename).c_str(), fileSize, creds.deviceId);
+    std::string resp = s3ApiGetViaHal(creds.apiHost, creds.apiKey, query);
+    std::string url = jsonStr(resp, "url");
+    if (url.empty()) {
+        snprintf(res.error, sizeof(res.error), "Presign failed");
+        return res;
+    }
+
+    // Parse S3 URL
+    char s3Host[128], s3Path[2500];
+    if (!parseUrl(url, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
+        strlcpy(res.error, "URL parse failed", sizeof(res.error));
+        return res;
+    }
+
+    // Open file
+    void* f = g_hal->filesys->open(filepath, "rb");
+    if (!f) {
+        snprintf(res.error, sizeof(res.error), "Can't open %s", filepath);
+        return res;
+    }
+
+    // Connect to S3
+    TlsHandle tls = g_hal->network->connect(s3Host);
+    if (!tls) {
+        g_hal->filesys->close(f);
+        strlcpy(res.error, "TLS connect failed", sizeof(res.error));
+        return res;
+    }
+
+    // Send PUT header
+    char hdr[2700];
+    snprintf(hdr, sizeof(hdr),
+        "PUT %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+        s3Path, s3Host, fileSize);
+    if (!g_hal->network->write(tls, hdr, strlen(hdr))) {
+        g_hal->network->destroy(tls);
+        g_hal->filesys->close(f);
+        strlcpy(res.error, "Header send failed", sizeof(res.error));
+        return res;
+    }
+
+    // Stream file
+    uint32_t startMs = g_hal->clock->millis();
+    bool streamed = halStreamFile(tls, f, fileSize, progress);
+    g_hal->filesys->close(f);
+
+    if (!streamed) {
+        g_hal->network->destroy(tls);
+        strlcpy(res.error, "Stream failed", sizeof(res.error));
+        return res;
+    }
+
+    // Read response
+    halHttpReadResponse(tls);
+    g_hal->network->destroy(tls);
+
+    uint32_t elapsed = g_hal->clock->millis() - startMs;
+    res.success = true;
+    res.kbps = elapsed > 0 ? fileSize / 1024.0f / (elapsed / 1000.0f) : 0;
+    return res;
 }
