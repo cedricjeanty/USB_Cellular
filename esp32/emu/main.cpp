@@ -22,6 +22,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <thread>
+#include <atomic>
 
 #include "hal/hal.h"
 #include "hal/native_impls.h"
@@ -30,6 +32,8 @@
 #include "airbridge_display.h"
 #include "airbridge_harvest.h"
 #include "airbridge_s3.h"
+#include "airbridge_modem.h"
+#include "airbridge_triggers.h"
 
 // ── Display: same as TestDisplay but with SDL-compatible init ────────────────
 
@@ -64,48 +68,68 @@ HAL* g_hal = &s_hal;
 static SimModem* s_modem = nullptr;
 static const char* SD_ROOT = "./emu_sdcard";
 
-// ── S3 upload — uses shared halS3UploadFile() from airbridge_s3.h ───────────
+// mdm_* function definitions for airbridge_modem.h (route through HAL UART)
+int mdm_write(const void* data, size_t len) { return g_hal->uart->write(data, len); }
+int mdm_read(void* buf, size_t len, uint32_t timeout_ms) { return g_hal->uart->read(buf, len, timeout_ms); }
+void mdm_flush() { g_hal->uart->flush(); }
+void mdm_set_baudrate(uint32_t baud) { g_hal->uart->set_baudrate(baud); }
+
+int modem_at_cmd(const char* cmd, char* resp, int resp_size, int timeout_ms) {
+    mdm_write(cmd, strlen(cmd));
+    mdm_write("\r", 1);
+    int total = 0;
+    uint32_t start = g_hal->clock->millis();
+    while ((g_hal->clock->millis() - start) < (uint32_t)timeout_ms && total < resp_size - 1) {
+        uint8_t buf[128];
+        int len = mdm_read(buf, sizeof(buf), 100);
+        if (len > 0) {
+            int copy = (len < resp_size - 1 - total) ? len : resp_size - 1 - total;
+            memcpy(resp + total, buf, copy);
+            total += copy;
+            resp[total] = '\0';
+            if (strstr(resp, "OK") || strstr(resp, "ERROR") || strstr(resp, "CONNECT")) break;
+        }
+    }
+    resp[total] = '\0';
+    return total;
+}
+
+// Background modem init thread — runs the same AT sequence as the real device
+static std::atomic<bool> s_modemInitDone{false};
+static ModemInitResult s_modemResult = {};
+
+static void modemInitThread(DisplayState* ds) {
+    printf("[Modem] Starting AT init sequence...\n");
+    bool synced = modemAtSync();
+    if (!synced) {
+        printf("[Modem] AT sync failed\n");
+        s_modemInitDone = true;
+        return;
+    }
+    printf("[Modem] AT sync OK — running init...\n");
+    s_modemResult = modemRunInit();
+    printf("[Modem] Init complete: op=%s rssi=%d reg=%d ppp=%d\n",
+           s_modemResult.operatorName, s_modemResult.rssi,
+           s_modemResult.registered, s_modemResult.connected);
+
+    // Update display state from modem result
+    ds->modemReady = true;
+    ds->modemRssi = s_modemResult.rssi;
+    strlcpy(ds->modemOp, s_modemResult.operatorName, sizeof(ds->modemOp));
+    if (s_modemResult.connected) {
+        ds->pppConnected = true;
+    }
+    s_modemInitDone = true;
+}
+
+// ── S3 upload — uses shared uploadAllFiles() from airbridge_s3.h ────────────
 
 static void doUpload(DisplayState& ds) {
     char harvestDir[256];
     snprintf(harvestDir, sizeof(harvestDir), "%s/harvested", SD_ROOT);
-
-    void* dir = g_hal->filesys->opendir(harvestDir);
-    if (!dir) { printf("[S3] No harvested directory\n"); return; }
-
-    std::vector<std::string> files;
-    FsDirEntry ent;
-    while (g_hal->filesys->readdir(dir, &ent)) {
-        if (ent.name[0] == '.') continue;
-        char donePath[512];
-        snprintf(donePath, sizeof(donePath), "%s/.done__%s", harvestDir, ent.name);
-        if (g_hal->filesys->exists(donePath)) continue;
-        files.push_back(ent.name);
-    }
-    g_hal->filesys->closedir(dir);
-
-    printf("[S3] %zu file(s) to upload\n", files.size());
-    for (auto& name : files) {
-        char fullpath[512];
-        snprintf(fullpath, sizeof(fullpath), "%s/%s", harvestDir, name.c_str());
-        float fileMb = 0;
-        { uint32_t sz = 0; bool d = false; g_hal->filesys->stat(fullpath, &sz, &d); fileMb = sz / 1e6f; }
-
-        printf("[S3] Uploading %s (%.1f MB)...\n", name.c_str(), fileMb);
-        UploadResult res = halS3UploadFile(fullpath, name.c_str());
-
-        if (res.success) {
-            printf("[S3] Upload complete: %.0f KB/s\n", res.kbps);
-            ds.mbUploaded += fileMb;
-            ds.uploadKBps = res.kbps;
-            char donePath[512];
-            snprintf(donePath, sizeof(donePath), "%s/harvested/.done__%s", SD_ROOT, name.c_str());
-            void* df = g_hal->filesys->open(donePath, "w");
-            if (df) g_hal->filesys->close(df);
-        } else {
-            printf("[S3] Upload failed: %s\n", res.error);
-        }
-    }
+    printf("[S3] Uploading files from %s...\n", harvestDir);
+    int n = uploadAllFiles(harvestDir);
+    printf("[S3] %d file(s) uploaded\n", n);
 }
 
 // ── SDL2 rendering ──────────────────────────────────────────────────────────
@@ -162,6 +186,11 @@ int main(int argc, char* argv[]) {
     printf("Keys: C=cellular  H=harvest  P=upload-to-S3  T=test-AT-cmd\n");
     printf("      U=usb-write +/-=speed  S=step  R=reset  Q=quit\n\n");
 
+    // Launch modem init in background (same AT sequence as real device)
+    DisplayState ds = {};
+    strlcpy(ds.modemOp, "Booting...", sizeof(ds.modemOp));
+    std::thread modemThread(modemInitThread, &ds);
+
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
@@ -181,9 +210,6 @@ int main(int argc, char* argv[]) {
         SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!renderer)
         renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
-
-    DisplayState ds = {};
-    strlcpy(ds.modemOp, "Emulator", sizeof(ds.modemOp));
 
     bool running = true;
     while (running) {
@@ -280,6 +306,7 @@ int main(int argc, char* argv[]) {
         SDL_Delay(100);
     }
 
+    if (modemThread.joinable()) modemThread.join();
     if (s_modem) { s_modem->stop(); delete s_modem; }
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);

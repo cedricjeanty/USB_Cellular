@@ -106,6 +106,55 @@ inline void clearMultipartSession() {
     g_hal->nvs->erase_key("s3up", "retries");
 }
 
+// Upload progress callback: called with bytes sent so far
+typedef void (*UploadProgressFn)(uint32_t bytesSent, uint32_t totalBytes);
+
+// ── Find next file to upload ─────────────────────────────────────────────────
+
+// Scan harvestDir for the next file that needs uploading (no .done__ marker).
+// Returns filename in `out`, or empty string if nothing to upload.
+inline bool findNextUploadFile(const char* harvestDir, char* out, size_t outSz) {
+    out[0] = '\0';
+    if (!g_hal || !g_hal->filesys) return false;
+
+    void* dir = g_hal->filesys->opendir(harvestDir);
+    if (!dir) return false;
+
+    FsDirEntry ent;
+    while (g_hal->filesys->readdir(dir, &ent)) {
+        if (ent.is_dir) continue;
+        if (ent.name[0] == '.') continue;
+        if (strcmp(ent.name, "airbridge.log") == 0) continue;
+
+        // Skip 0-byte files
+        char fullpath[192];
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", harvestDir, ent.name);
+        uint32_t sz = 0; bool isDir = false;
+        if (g_hal->filesys->stat(fullpath, &sz, &isDir) && sz == 0) continue;
+
+        // Skip if .done__ marker exists
+        char donePath[256];
+        snprintf(donePath, sizeof(donePath), "%s/.done__%s", harvestDir, ent.name);
+        if (g_hal->filesys->exists(donePath)) continue;
+
+        strlcpy(out, ent.name, outSz);
+        break;
+    }
+    g_hal->filesys->closedir(dir);
+    return out[0] != '\0';
+}
+
+// Mark a file as uploaded: delete the harvested copy and create .done__ marker.
+inline void markFileUploaded(const char* harvestDir, const char* filename) {
+    if (!g_hal || !g_hal->filesys) return;
+    char path[192], donePath[256];
+    snprintf(path, sizeof(path), "%s/%s", harvestDir, filename);
+    snprintf(donePath, sizeof(donePath), "%s/.done__%s", harvestDir, filename);
+    g_hal->filesys->remove(path);
+    void* f = g_hal->filesys->open(donePath, "w");
+    if (f) g_hal->filesys->close(f);
+}
+
 // ── S3 credentials ──────────────────────────────────────────────────────────
 
 struct S3Creds {
@@ -126,9 +175,6 @@ inline S3Creds loadS3Creds() {
 }
 
 // ── Stream file to TLS via HAL ──────────────────────────────────────────────
-
-// Upload progress callback: called with bytes sent so far
-typedef void (*UploadProgressFn)(uint32_t bytesSent, uint32_t totalBytes);
 
 inline bool halStreamFile(TlsHandle tls, void* fileHandle, uint32_t len,
                           UploadProgressFn progress = nullptr) {
@@ -246,4 +292,25 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
     res.success = true;
     res.kbps = elapsed > 0 ? fileSize / 1024.0f / (elapsed / 1000.0f) : 0;
     return res;
+}
+
+// ── Upload all pending files ────────────────────────────────────────────────
+
+// Upload all pending files from harvestDir. Returns count of files uploaded.
+inline int uploadAllFiles(const char* harvestDir, UploadProgressFn progress = nullptr) {
+    int count = 0;
+    char name[64];
+    while (findNextUploadFile(harvestDir, name, sizeof(name))) {
+        char fullpath[192];
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", harvestDir, name);
+
+        UploadResult r = halS3UploadFile(fullpath, name, progress);
+        if (r.success) {
+            markFileUploaded(harvestDir, name);
+            count++;
+        } else {
+            break;
+        }
+    }
+    return count;
 }

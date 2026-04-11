@@ -25,6 +25,7 @@
 #include "airbridge_http.h"
 #include "airbridge_triggers.h"
 #include "airbridge_cli.h"
+#include "airbridge_modem.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -2332,25 +2333,25 @@ static bool s3UploadFile(const char* name) {
 // ── Cellular modem task (SIM7600 via raw UART + PPPoS) ──────────────────────
 
 // UART helpers — route through HAL when available, else use raw ESP-IDF
-static inline int mdm_write(const void* data, size_t len) {
+int mdm_write(const void* data, size_t len) {
     if (g_hal && g_hal->uart) return g_hal->uart->write(data, len);
-    return mdm_write(data, len);
+    return uart_write_bytes(UART_NUM_1, data, len);
 }
-static inline int mdm_read(void* buf, size_t len, uint32_t timeout_ms) {
+int mdm_read(void* buf, size_t len, uint32_t timeout_ms) {
     if (g_hal && g_hal->uart) return g_hal->uart->read(buf, len, timeout_ms);
-    return mdm_read(buf, len, timeout_ms);
+    return uart_read_bytes(UART_NUM_1, buf, len, pdMS_TO_TICKS(timeout_ms));
 }
-static inline void mdm_flush() {
+void mdm_flush() {
     if (g_hal && g_hal->uart) { g_hal->uart->flush(); return; }
-    mdm_flush();
+    uart_flush(UART_NUM_1);
 }
-static inline void mdm_set_baudrate(uint32_t baud) {
+void mdm_set_baudrate(uint32_t baud) {
     if (g_hal && g_hal->uart) { g_hal->uart->set_baudrate(baud); return; }
-    mdm_set_baudrate(baud);
+    uart_set_baudrate(UART_NUM_1, baud);
 }
 
 // Send AT command, wait for response, return response string
-static int modem_at_cmd(const char* cmd, char* resp, int resp_size, int timeout_ms) {
+int modem_at_cmd(const char* cmd, char* resp, int resp_size, int timeout_ms) {
     // Send command
     mdm_write(cmd, strlen(cmd));
     mdm_write("\r", 1);
