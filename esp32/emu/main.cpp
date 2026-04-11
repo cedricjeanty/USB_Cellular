@@ -88,25 +88,21 @@ static const int SCALE = 6;
 static const int WIN_W = SCREEN_W * SCALE;
 static const int WIN_H = SCREEN_H * SCALE;
 
-// OLED colors: blue tint for top rows, warm white for rest (like real SSD1306)
-static const uint32_t COLOR_ON_TOP  = 0xFF4488CC;  // Blue-ish (rows 0-15)
-static const uint32_t COLOR_ON_BOT  = 0xFFCCDDEE;  // Warm white (rows 16-63)
-static const uint32_t COLOR_OFF     = 0xFF0A0A0A;  // Near black
+// Monochrome OLED: white on black
+static void renderFramebuffer(SDL_Renderer* renderer) {
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+    SDL_RenderClear(renderer);
 
-static void renderFramebuffer(SDL_Renderer* renderer, SDL_Texture* texture) {
-    uint32_t pixels[SCREEN_W * SCREEN_H];
-
+    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
     for (int y = 0; y < SCREEN_H; y++) {
-        uint32_t color_on = (y < 16) ? COLOR_ON_TOP : COLOR_ON_BOT;
         for (int x = 0; x < SCREEN_W; x++) {
             bool on = (s_display.framebuf[x + (y / 8) * SCREEN_W] & (1 << (y & 7))) != 0;
-            pixels[y * SCREEN_W + x] = on ? color_on : COLOR_OFF;
+            if (on) {
+                SDL_Rect r = { x * SCALE, y * SCALE, SCALE, SCALE };
+                SDL_RenderFillRect(renderer, &r);
+            }
         }
     }
-
-    SDL_UpdateTexture(texture, nullptr, pixels, SCREEN_W * sizeof(uint32_t));
-    SDL_RenderClear(renderer);
-    SDL_RenderCopy(renderer, texture, nullptr, nullptr);
     SDL_RenderPresent(renderer);
 }
 
@@ -135,13 +131,6 @@ int main(int argc, char* argv[]) {
     if (!renderer) {
         renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
     }
-
-    SDL_Texture* texture = SDL_CreateTexture(renderer,
-        SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
-        SCREEN_W, SCREEN_H);
-
-    // Nearest-neighbor scaling for crisp pixels
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
 
     DisplayState ds = {};
     strlcpy(ds.modemOp, "T-Mobile", sizeof(ds.modemOp));
@@ -219,12 +208,11 @@ int main(int argc, char* argv[]) {
 
         // Render display
         updateDisplay(ds);
-        renderFramebuffer(renderer, texture);
+        renderFramebuffer(renderer);
 
         SDL_Delay(100);  // ~10 fps
     }
 
-    SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();
