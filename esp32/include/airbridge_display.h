@@ -91,11 +91,11 @@ inline void updateDisplay(DisplayState& ds) {
         g_hal->display->text(65 + (62 - upW) / 2, 20, upSpd);
     }
 
-    // Row 29: totals (size 2 — short strings like "4.2MB")
+    // Row 29: totals (size 2, short format: "4.2M", "99K", "1.2G")
     {
         char usbTot[12], upTot[12];
-        _fmtSize(usbTot, sizeof(usbTot), usbSessionMb);
-        _fmtSize(upTot, sizeof(upTot), uploaded);
+        _fmtSizeShort(usbTot, sizeof(usbTot), usbSessionMb);
+        _fmtSizeShort(upTot, sizeof(upTot), uploaded);
         int usbW = g_hal->display->text_width(usbTot, 2);
         int upW  = g_hal->display->text_width(upTot, 2);
         g_hal->display->text((62 - usbW) / 2, 29, usbTot, 2);
@@ -119,11 +119,11 @@ inline void updateDisplay(DisplayState& ds) {
         snprintf(remStr, sizeof(remStr), "REM:"); _fmtSize(remStr + 4, sizeof(remStr) - 4, remaining);
         g_hal->display->text(0, 57, remStr);
 
-        // Smoothed speed for stable ETA (EMA alpha=0.2)
+        // Smoothed speed for stable ETA (slow EMA — doesn't dash out on brief zero)
         if (ds.uploadKBps > 0.5f)
-            ds.etaKBps = ds.etaKBps * 0.8f + ds.uploadKBps * 0.2f;
-        else
-            ds.etaKBps = 0;
+            ds.etaKBps = ds.etaKBps * 0.7f + ds.uploadKBps * 0.3f;
+        else if (ds.etaKBps > 0.5f)
+            ds.etaKBps *= 0.95f;  // decay slowly instead of zeroing
 
         if (ds.etaKBps > 0.5f && remaining > 0.001f) {
             int etaSec = (int)(remaining * 1024.0f / ds.etaKBps);

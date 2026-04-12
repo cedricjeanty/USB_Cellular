@@ -184,6 +184,33 @@ deploy_ota() {
     log "  OTA deployed: v$version"
 }
 
+wait_for_ota() {
+    local expected="$1" timeout="${2:-240}"
+    local t=0
+    OTA_RESULT=""
+    while [ $t -lt $timeout ]; do
+        sleep 5; t=$((t + 5))
+        # Check if device rebooted (USB disappears briefly)
+        if ! lsusb 2>/dev/null | grep -q "1209:000"; then
+            log "  ${t}s: device rebooting..."
+            sleep 15; t=$((t + 15))
+            # Wait for USB to reappear
+            for i in $(seq 1 30); do
+                lsusb 2>/dev/null | grep -q "1209:000" && break
+                sleep 1
+            done
+            sleep 5; t=$((t + 5))
+        fi
+        OTA_RESULT=$(get_fw_version | tr -d '[:space:]')
+        [ "$OTA_RESULT" = "$expected" ] && return 0
+        [ $((t % 30)) -eq 0 ] && log "  ${t}s: fw=$OTA_RESULT (waiting for $expected)"
+    done
+    OTA_RESULT=$(get_fw_version | tr -d '[:space:]')
+    return 1
+}
+
+OTA_RESULT=""
+
 cleanup_s3() {
     # Abort stale multipart uploads
     for uid in $(aws s3api list-multipart-uploads --bucket "$BUCKET" \

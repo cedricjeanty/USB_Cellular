@@ -146,8 +146,19 @@ inline bool isSkipped(const char* n) {
 }
 
 // ── Size formatting ─────────────────────────────────────────────────────────
+// Full format with "B" suffix (used in CLI/logs)
 inline void _fmtSize(char* buf, size_t len, float mb) {
     if (mb >= 1000.0f)   snprintf(buf, len, "%.1fGB", mb / 1024.0f);
     else if (mb >= 0.1f) snprintf(buf, len, "%.1fMB", mb);
     else                 snprintf(buf, len, "%.1fKB", mb * 1024.0f);
+}
+
+// Short format without "B" — for display (fits size 2 font in 62px column)
+// K, M, G: max "999M" = 4 chars
+inline void _fmtSizeShort(char* buf, size_t len, float mb) {
+    if (mb >= 1000.0f)       snprintf(buf, len, "%.1fG", mb / 1024.0f);
+    else if (mb >= 100.0f)   snprintf(buf, len, "%.0fM", mb);
+    else if (mb >= 0.1f)     snprintf(buf, len, "%.1fM", mb);
+    else if (mb * 1024 >= 100.0f) snprintf(buf, len, "%.0fK", mb * 1024.0f);
+    else                     snprintf(buf, len, "%.1fK", mb * 1024.0f);
 }
