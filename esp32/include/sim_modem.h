@@ -34,7 +34,7 @@ public:
     int         rssi = 22;
     int         ber = 99;
     int         regStat = 1;       // +CREG stat: 1=home, 5=roaming
-    const char* operatorName = "SimOperator";
+    const char* operatorName = "SimCellular";
     bool        echoEnabled = true;
     bool        apnSet = false;    // tracks AT+CGDCONT state (cleared by AT+CFUN=0, set by AT+CGDCONT)
     int         baudRate = 115200;  // tracks actual baud (persisted via AT+IPR, like real SIM7600 NVS)
