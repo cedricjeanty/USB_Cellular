@@ -36,7 +36,7 @@ public:
     int         regStat = 1;       // +CREG stat: 1=home, 5=roaming
     const char* operatorName = "SimOperator";
     bool        echoEnabled = true;
-    int         baudRate = 921600;  // effective baud for throttling
+    int         baudRate = 115200;  // tracks actual negotiated baud (starts at 115200, firmware upgrades)
 
     // PTY file descriptors (firmware side)
     int master_fd = -1;   // simulator reads/writes this
@@ -230,6 +230,11 @@ private:
         } else if (upper.find("AT+CGDCONT=") == 0) {
             respond("OK");
         } else if (upper.find("AT+IPR=") == 0) {
+            int newBaud = atoi(c.c_str() + 7);
+            if (newBaud > 0) {
+                baudRate = newBaud;
+                printf("[SimModem] Baud rate set to %d\n", baudRate);
+            }
             respond("OK");
         } else if (upper.find("AT+IFC=") == 0) {
             respond("OK");
@@ -387,14 +392,23 @@ private:
         while (running_) {
             if (dataMode_) {
                 // PPP data mode: parse frames, negotiate LCP/IPCP, watch for +++
+                // Throttle: limit bytes per tick to match baud rate
+                // 8N1 = 10 bits per byte, so max bytes/sec = baudRate / 10
+                int maxBytesPerTick = baudRate / 10 / 100;  // per 10ms tick
+                if (maxBytesPerTick < 16) maxBytesPerTick = 16;
+
                 uint8_t buf[1024];
+                int readLimit = (maxBytesPerTick < (int)sizeof(buf)) ? maxBytesPerTick : sizeof(buf);
+
                 struct pollfd pfd = { master_fd, POLLIN, 0 };
-                int ret = poll(&pfd, 1, 50);
+                int ret = poll(&pfd, 1, 10);  // 10ms tick
+                int bytesThisTick = 0;
+
                 if (ret > 0) {
-                    int n = ::read(master_fd, buf, sizeof(buf));
+                    int n = ::read(master_fd, buf, readLimit);
                     if (n > 0) {
+                        bytesThisTick += n;
                         checkEscape(buf, n);
-                        // Accumulate and process PPP frames
                         for (int i = 0; i < n; i++) {
                             if (buf[i] == 0x7E) {
                                 if (inFrame_ && pppBuf_.size() > 0) {
@@ -410,13 +424,29 @@ private:
                         }
                     }
                 }
+
                 // Read IP packets from TUN → wrap in PPP → send to firmware
-                if (tun_fd_ >= 0 && ipcpUp_) {
+                if (tun_fd_ >= 0 && ipcpUp_ && bytesThisTick < maxBytesPerTick) {
                     uint8_t tunBuf[1500];
                     int tn = ::read(tun_fd_, tunBuf, sizeof(tunBuf));
                     if (tn > 0) {
-                        sendPppFrame(PPP_IP, std::vector<uint8_t>(tunBuf, tunBuf + tn));
+                        auto frame = ppp_build_frame(PPP_IP, tunBuf, tn);
+                        // Throttle: limit how fast we send to firmware
+                        int allowed = maxBytesPerTick - bytesThisTick;
+                        if ((int)frame.size() <= allowed) {
+                            ::write(master_fd, frame.data(), frame.size());
+                            bytesThisTick += frame.size();
+                        }
+                        // else: drop this tick, will retry next tick
                     }
+                }
+
+                // Sleep to enforce tick rate — this is the actual throttle
+                if (bytesThisTick > 0) {
+                    // Sleep proportional to bytes transferred at baud rate
+                    // time_us = bytes * 10 bits * 1e6 / baudRate
+                    uint32_t sleep_us = (uint32_t)bytesThisTick * 10000000ULL / baudRate;
+                    if (sleep_us > 0) usleep(sleep_us);
                 }
 
                 if (gotEscapePlus_ && (now_ms() - lastPlusMs_) > 500) {
