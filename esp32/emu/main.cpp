@@ -324,6 +324,34 @@ int main(int argc, char* argv[]) {
     if (!renderer)
         renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
 
+    // Check for pending uploads from previous session (like real uploadTask does on boot)
+    {
+        char harvestDir[256];
+        snprintf(harvestDir, sizeof(harvestDir), "%s/harvested", SD_ROOT);
+        char pendingName[64];
+        if (findNextUploadFile(harvestDir, pendingName, sizeof(pendingName))) {
+            printf("[Boot] Found pending upload: %s — will upload after modem init\n", pendingName);
+            ds.mbQueued = 0;
+            // Count pending files
+            void* dir = g_hal->filesys->opendir(harvestDir);
+            if (dir) {
+                FsDirEntry ent;
+                while (g_hal->filesys->readdir(dir, &ent)) {
+                    if (ent.name[0] == '.') continue;
+                    char dp[256];
+                    snprintf(dp, sizeof(dp), "%s/.done__%s", harvestDir, ent.name);
+                    if (!g_hal->filesys->exists(dp)) {
+                        uint32_t sz = 0; bool isDir = false;
+                        char fp[256]; snprintf(fp, sizeof(fp), "%s/%s", harvestDir, ent.name);
+                        if (g_hal->filesys->stat(fp, &sz, &isDir) && !isDir)
+                            ds.mbQueued += sz / 1e6f;
+                    }
+                }
+                g_hal->filesys->closedir(dir);
+            }
+        }
+    }
+
     bool running = true;
     while (running) {
         SDL_Event event;
@@ -443,6 +471,15 @@ int main(int argc, char* argv[]) {
         // ── Automated pipeline (mirrors main_loop_task) ─────────────
         uint32_t now = g_hal->clock->millis();
 
+        // Auto-upload pending files after modem connects (boot resume)
+        static bool bootUploadChecked = false;
+        if (!bootUploadChecked && s_modemInitDone && ds.pppConnected && ds.mbQueued > 0.001f && !s_uploading) {
+            bootUploadChecked = true;
+            printf("[Boot] Starting upload of pending files (%.1f MB)\n", ds.mbQueued);
+            s_uploading = true;
+            std::thread(uploadThread, &ds).detach();
+        }
+
         // Poll for new files in emu_sdcard/ (simulates USB MSC writes)
         {
             static uint32_t lastScanMs = 0;
@@ -511,8 +548,8 @@ int main(int argc, char* argv[]) {
             s_harvestCoolMs = QUIET_WINDOW_MS;
             s_harvesting = false;
 
-            // Auto-upload if connected
-            if (ds.pppConnected && r.count > 0 && !s_uploading) {
+            // Auto-upload if connected (new harvest or pending from previous session)
+            if (ds.pppConnected && (r.count > 0 || ds.mbQueued > 0.001f) && !s_uploading) {
                 s_uploading = true;
                 std::thread(uploadThread, &ds).detach();
             }
