@@ -500,9 +500,27 @@ int main(int argc, char* argv[]) {
                 printf("[OTA] Update available: v%s (%u bytes)\n", ota.newVersion, ota.size);
                 dispOtaProgress(ota.newVersion, 0);
                 renderFramebuffer(renderer);
-                s_log.write(now, "OTA: v%s available (%u bytes)", ota.newVersion, ota.size);
-                // Show for 3 seconds then continue (real device would download+flash)
-                SDL_Delay(3000);
+
+                // Download firmware (real device would flash — emulator saves to file)
+                printf("[OTA] Downloading...\n");
+                OtaDownloadResult dl = halOtaDownload(ota, "./emu_ota_update.bin",
+                    [](uint32_t sent, uint32_t total) {
+                        // Update OTA progress display
+                        // (can't call renderFramebuffer from callback — just update state)
+                    });
+
+                if (dl.success) {
+                    printf("[OTA] Downloaded %u bytes → emu_ota_update.bin\n", dl.bytesDownloaded);
+                    dispOtaProgress(ota.newVersion, 100);
+                    renderFramebuffer(renderer);
+                    // Mark pending in NVS (emulator simulates reboot by reading this on next start)
+                    g_hal->nvs->set_str("ota", "pending_version", ota.newVersion);
+                    s_log.write(now, "OTA: downloaded v%s (%u bytes)", ota.newVersion, dl.bytesDownloaded);
+                    SDL_Delay(2000);
+                } else {
+                    printf("[OTA] Download failed: %s\n", dl.error);
+                    s_log.write(now, "OTA: download failed: %s", dl.error);
+                }
             } else if (ota.status == 0) {
                 printf("[OTA] Up to date\n");
                 s_log.write(now, "OTA: up to date");

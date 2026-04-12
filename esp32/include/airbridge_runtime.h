@@ -87,6 +87,96 @@ inline OtaCheckResult halOtaCheck(const char* currentVersion) {
     return r;
 }
 
+// ── OTA download via HAL ─────────────────────────────────────────────────────
+
+struct OtaDownloadResult {
+    bool success;
+    uint32_t bytesDownloaded;
+    char error[128];
+};
+
+// Download firmware binary from the URL in OtaCheckResult.
+// Saves to outputPath via HAL filesystem. Verifies size matches.
+inline OtaDownloadResult halOtaDownload(const OtaCheckResult& ota, const char* outputPath,
+                                         UploadProgressFn progress = nullptr) {
+    OtaDownloadResult r = {};
+    if (!g_hal || !g_hal->network || !g_hal->filesys) {
+        strlcpy(r.error, "HAL not initialized", sizeof(r.error));
+        return r;
+    }
+    if (ota.status != 1 || !ota.downloadUrl[0]) {
+        strlcpy(r.error, "No update available", sizeof(r.error));
+        return r;
+    }
+
+    // Parse download URL
+    char host[128], path[2500];
+    if (!parseUrl(std::string(ota.downloadUrl), host, sizeof(host), path, sizeof(path))) {
+        strlcpy(r.error, "URL parse failed", sizeof(r.error));
+        return r;
+    }
+
+    // Connect and send GET
+    TlsHandle tls = g_hal->network->connect(host);
+    if (!tls) { strlcpy(r.error, "TLS connect failed", sizeof(r.error)); return r; }
+
+    char hdr[2700];
+    snprintf(hdr, sizeof(hdr),
+        "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host);
+    if (!g_hal->network->write(tls, hdr, strlen(hdr))) {
+        g_hal->network->destroy(tls);
+        strlcpy(r.error, "Request failed", sizeof(r.error));
+        return r;
+    }
+
+    // Skip HTTP headers
+    char linebuf[512];
+    while (true) {
+        int pos = 0;
+        while (pos < (int)sizeof(linebuf) - 1) {
+            char c;
+            int rd = g_hal->network->read(tls, &c, 1);
+            if (rd <= 0) goto done;
+            linebuf[pos++] = c;
+            if (c == '\n') break;
+        }
+        linebuf[pos] = '\0';
+        if (pos <= 2 && (linebuf[0] == '\r' || linebuf[0] == '\n')) break;
+    }
+
+    // Stream body to file
+    {
+        void* f = g_hal->filesys->open(outputPath, "wb");
+        if (!f) {
+            g_hal->network->destroy(tls);
+            strlcpy(r.error, "Can't create output file", sizeof(r.error));
+            return r;
+        }
+
+        uint8_t buf[4096];
+        while (true) {
+            int n = g_hal->network->read(tls, buf, sizeof(buf));
+            if (n <= 0) break;
+            g_hal->filesys->write(f, buf, n);
+            r.bytesDownloaded += n;
+            if (progress) progress(r.bytesDownloaded, ota.size);
+        }
+        g_hal->filesys->close(f);
+    }
+done:
+    g_hal->network->destroy(tls);
+
+    // Verify size
+    if (ota.size > 0 && r.bytesDownloaded != ota.size) {
+        snprintf(r.error, sizeof(r.error), "Size mismatch: got %u, expected %u",
+                 r.bytesDownloaded, ota.size);
+        return r;
+    }
+
+    r.success = true;
+    return r;
+}
+
 // ── Speed calculation (EMA smoothing) ───────────────────────────────────────
 
 struct SpeedTracker {
