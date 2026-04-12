@@ -37,6 +37,8 @@ void setUp(void) {
     TEST_ASSERT_TRUE(s_modem->start());
     s_uart.fd = s_modem->slave_fd;
     usleep(50000);  // let thread start
+    // Set APN (required before ATD*99# — SimModem enforces this like real SIM7600)
+    sendAT("AT+CGDCONT=1,\"IP\",\"hologram\"");
 }
 
 void tearDown(void) {

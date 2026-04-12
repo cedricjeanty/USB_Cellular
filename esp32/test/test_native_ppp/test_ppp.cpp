@@ -149,6 +149,9 @@ void test_urc_ignores_binary(void) {
 static SimModem* mdm = nullptr;
 static PtyUart uart;
 
+// Forward declaration
+static std::string sendAT(const char* cmd);
+
 static void setupModem() {
     if (mdm) { mdm->stop(); delete mdm; }
     mdm = new SimModem();
@@ -156,6 +159,8 @@ static void setupModem() {
     mdm->start();
     uart.fd = mdm->slave_fd;
     usleep(50000);
+    // Set APN (required before ATD*99# — SimModem enforces this like real SIM7600)
+    sendAT("AT+CGDCONT=1,\"IP\",\"hologram\"");
 }
 
 static void teardownModem() {
