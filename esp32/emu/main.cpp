@@ -385,7 +385,7 @@ int main(int argc, char* argv[]) {
                 case SDLK_c:
                     ds.pppConnected = !ds.pppConnected;
                     if (ds.pppConnected) { ds.modemRssi = 22; ds.modemReady = true; }
-                    else { ds.modemRssi = 0; }
+                    // Keep RSSI on disconnect — matches firmware fix (don't zero signal)
                     printf("Cellular: %s\n", ds.pppConnected ? "ON (using laptop internet)" : "OFF");
                     break;
                 case SDLK_h: {

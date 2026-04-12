@@ -2907,7 +2907,8 @@ static void modemTask(void* param) {
             }
             g_pppNeedsReconnect = false;
             g_pppConnected = false;
-            g_modemRssi = 0;
+            // Keep g_modemRssi — don't zero it. Display will show operator name
+            // with last-known signal until RSSI is re-read after registration.
 
             // 1. Exit modem data mode (don't touch esp_netif — it crashes)
             vTaskDelay(pdMS_TO_TICKS(1100));
@@ -2943,14 +2944,17 @@ static void modemTask(void* param) {
                 continue;  // back to data pump loop
             }
 
-            // 5. Read RSSI
+            // 5. Read RSSI + log for diagnostics
             modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000);
-            char* p = strstr(resp, "+CSQ:");
-            if (p) {
-                int rssi = 99;
-                sscanf(p, "+CSQ: %d", &rssi);
-                if (rssi != 99) g_modemRssi = rssi;
-                log_write("RSSI: %d (reconnect)", g_modemRssi);
+            {
+                char* p = strstr(resp, "+CSQ:");
+                if (p) {
+                    int rssi = 99;
+                    sscanf(p, "+CSQ: %d", &rssi);
+                    if (rssi != 99) g_modemRssi = rssi;
+                }
+                log_write("Reconnect: reg=OK rssi=%d op=%s", g_modemRssi, g_modemOp);
+                cdc_printf("Modem: reconnect rssi=%d op=%s\r\n", g_modemRssi, g_modemOp);
             }
 
             // 5b. Re-read operator name for display
@@ -2966,11 +2970,12 @@ static void modemTask(void* param) {
                 }
             }
 
-            // 6. Redial PPP (up to 3 attempts)
+            // 6. Re-set APN (may be lost after CFUN reset) and redial PPP
+            modem_at_cmd("AT+CGDCONT=1,\"IP\",\"hologram\"", resp, sizeof(resp), 5000);
+
             bool redialOk = false;
             for (int attempt = 0; attempt < 3 && !redialOk; attempt++) {
                 cdc_printf("Modem: dialing PPP (attempt %d)...\r\n", attempt + 1);
-                // AT+CGACT removed — let ATD*99# handle PDP activation
                 mdm_write("ATD*99#\r", 8);
                 int rd = mdm_read((uint8_t*)resp,
                             sizeof(resp) - 1, 15000);
