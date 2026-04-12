@@ -182,14 +182,21 @@ inline bool halStreamFile(TlsHandle tls, void* fileHandle, uint32_t len,
     uint8_t buf[8192];
     uint32_t remaining = len;
     uint32_t sent = 0;
+    int throttle = g_hal->network->getMaxBytesPerSec();
     while (remaining > 0) {
         uint32_t toRead = (remaining < sizeof(buf)) ? remaining : sizeof(buf);
+        if (throttle > 0) {
+            uint32_t maxChunk = throttle / 10;  // 100ms worth
+            if (maxChunk < 1024) maxChunk = 1024;
+            if (toRead > maxChunk) toRead = maxChunk;
+        }
         size_t n = g_hal->filesys->read(fileHandle, buf, toRead);
         if (n == 0) return false;
         if (!g_hal->network->write(tls, buf, n)) return false;
         remaining -= n;
         sent += n;
         if (progress) progress(sent, len);
+        if (throttle > 0) usleep(n * 1000000 / throttle);
     }
     return true;
 }

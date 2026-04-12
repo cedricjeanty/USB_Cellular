@@ -13,15 +13,11 @@ class INetwork {
 public:
     virtual ~INetwork() = default;
 
-    // Connect to host:443 via TLS. Returns handle or nullptr.
     virtual TlsHandle connect(const char* host) = 0;
-
-    // Write all bytes. Returns true on success.
     virtual bool write(TlsHandle conn, const void* data, size_t len) = 0;
-
-    // Read up to len bytes. Returns bytes read, 0 on close, <0 on error.
     virtual int read(TlsHandle conn, void* buf, size_t len) = 0;
-
-    // Close and destroy the connection.
     virtual void destroy(TlsHandle conn) = 0;
+
+    // Bandwidth limit in bytes/sec (0 = unlimited). Used by halStreamFile for throttling.
+    virtual int getMaxBytesPerSec() { return 0; }
 };

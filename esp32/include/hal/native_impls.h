@@ -184,19 +184,9 @@ public:
         const char* p = (const char*)data;
         size_t rem = len;
         while (rem > 0) {
-            size_t chunk = rem;
-            if (maxBytesPerSec > 0 && len > 1024) {
-                // Throttle data writes but not TLS handshake (len=total call size)
-                chunk = maxBytesPerSec / 10;  // 100ms worth
-                if (chunk < 1024) chunk = 1024;
-                if (chunk > rem) chunk = rem;
-            }
-            int w = SSL_write(c->ssl, p, chunk);
+            int w = SSL_write(c->ssl, p, rem);
             if (w <= 0) return false;
             p += w; rem -= w;
-            if (maxBytesPerSec > 0 && len > 1024) {
-                usleep(w * 1000000 / maxBytesPerSec);
-            }
         }
         return true;
     }
@@ -215,6 +205,8 @@ public:
         ::close(c->fd);
         delete c;
     }
+
+    int getMaxBytesPerSec() override { return maxBytesPerSec; }
 
 private:
     SSL_CTX* ctx_ = nullptr;
