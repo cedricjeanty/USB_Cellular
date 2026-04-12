@@ -552,27 +552,46 @@ int main(int argc, char* argv[]) {
             std::thread(uploadThread, &ds).detach();
         }
 
-        // Poll for new files in emu_sdcard/ (simulates USB MSC writes)
+        // Poll for new files in emu_sdcard/ + subdirs (simulates USB MSC writes)
         {
             static uint32_t lastScanMs = 0;
             static int lastFileCount = -1;
             if (now - lastScanMs > 2000) {  // scan every 2s
                 lastScanMs = now;
                 int count = 0;
-                void* dir = g_hal->filesys->opendir(SD_ROOT);
-                if (dir) {
+                // Count files in root + one level of subdirectories (like flightHistory/)
+                auto countDir = [&](const char* path) {
+                    void* dir = g_hal->filesys->opendir(path);
+                    if (!dir) return;
                     FsDirEntry ent;
                     while (g_hal->filesys->readdir(dir, &ent)) {
                         if (ent.name[0] == '.') continue;
                         if (strcmp(ent.name, "harvested") == 0) continue;
                         if (isSkipped(ent.name)) continue;
+                        char fp[256]; snprintf(fp, sizeof(fp), "%s/%s", path, ent.name);
                         uint32_t sz = 0; bool isDir = false;
-                        char fp[256]; snprintf(fp, sizeof(fp), "%s/%s", SD_ROOT, ent.name);
-                        if (g_hal->filesys->stat(fp, &sz, &isDir) && !isDir && sz > 0)
+                        g_hal->filesys->stat(fp, &sz, &isDir);
+                        if (isDir) {
+                            // Recurse one level
+                            void* sub = g_hal->filesys->opendir(fp);
+                            if (sub) {
+                                FsDirEntry se;
+                                while (g_hal->filesys->readdir(sub, &se)) {
+                                    if (se.name[0] == '.') continue;
+                                    char sfp[384]; snprintf(sfp, sizeof(sfp), "%s/%s", fp, se.name);
+                                    uint32_t ssz = 0; bool sd = false;
+                                    if (g_hal->filesys->stat(sfp, &ssz, &sd) && !sd && ssz > 0)
+                                        count++;
+                                }
+                                g_hal->filesys->closedir(sub);
+                            }
+                        } else if (sz > 0) {
                             count++;
+                        }
                     }
                     g_hal->filesys->closedir(dir);
-                }
+                };
+                countDir(SD_ROOT);
                 if (lastFileCount >= 0 && count > lastFileCount) {
                     // New files detected — simulate USB write
                     s_writeDetected = true;
