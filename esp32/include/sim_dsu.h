@@ -18,6 +18,7 @@ public:
     const char* sdRoot = "./emu_sdcard";
     uint32_t nextFlight = 1001;  // default starting flight
     int flightIncrement = 5;     // flights between sessions
+    int writeSpeedKBps = 200;    // USB→SPI→SD write speed (~200 KB/s observed on real device)
 
     // Metrics template directory (real data from ~/EA500/)
     const char* metricsSource = nullptr;
@@ -128,13 +129,17 @@ private:
         FILE* df = fopen(dst, "wb");
         if (!df) { fclose(sf); return 0; }
 
-        uint8_t buf[65536];
+        uint8_t buf[8192];
         uint32_t total = 0;
         while (true) {
             size_t n = fread(buf, 1, sizeof(buf), sf);
             if (n == 0) break;
             fwrite(buf, 1, n, df);
+            fflush(df);
             total += n;
+            if (writeSpeedKBps > 0) {
+                usleep(n * 1000 / writeSpeedKBps);
+            }
         }
         fclose(sf);
         fclose(df);
@@ -145,19 +150,22 @@ private:
         FILE* f = fopen(path, "wb");
         if (!f) return 0;
 
-        // Write random-ish data in chunks
         uint8_t buf[8192];
         uint32_t rem = size;
         uint32_t seed = (uint32_t)time(nullptr);
         while (rem > 0) {
             uint32_t chunk = (rem < sizeof(buf)) ? rem : sizeof(buf);
-            // Simple PRNG fill (not truly random but good enough for testing)
             for (uint32_t i = 0; i < chunk; i++) {
                 seed = seed * 1103515245 + 12345;
                 buf[i] = (seed >> 16) & 0xFF;
             }
             fwrite(buf, 1, chunk, f);
+            fflush(f);
             rem -= chunk;
+            // Throttle to match real USB write speed
+            if (writeSpeedKBps > 0) {
+                usleep(chunk * 1000 / writeSpeedKBps);
+            }
         }
         fclose(f);
         return size;
