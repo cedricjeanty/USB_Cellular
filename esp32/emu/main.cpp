@@ -76,6 +76,14 @@ static SpeedTracker s_usbSpeed = {};
 static SpeedTracker s_uploadSpeed = {};
 static LogBuffer s_log;
 
+// Harvest pipeline state (mirrors firmware globals)
+static bool     s_writeDetected = false;
+static bool     s_hostWasConnected = false;
+static bool     s_harvesting = false;
+static uint32_t s_lastWriteMs = 0;
+static uint32_t s_lastHarvestMs = 0;
+static uint32_t s_harvestCoolMs = 30000;  // initial cooldown, then QUIET_WINDOW_MS
+
 // mdm_* function definitions for airbridge_modem.h (route through HAL UART)
 int mdm_write(const void* data, size_t len) { return g_hal->uart->write(data, len); }
 int mdm_read(void* buf, size_t len, uint32_t timeout_ms) { return g_hal->uart->read(buf, len, timeout_ms); }
@@ -431,8 +439,85 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Update speeds using shared SpeedTracker (same math as main_loop_task)
+        // ── Automated pipeline (mirrors main_loop_task) ─────────────
         uint32_t now = g_hal->clock->millis();
+
+        // Poll for new files in emu_sdcard/ (simulates USB MSC writes)
+        {
+            static uint32_t lastScanMs = 0;
+            static int lastFileCount = -1;
+            if (now - lastScanMs > 2000) {  // scan every 2s
+                lastScanMs = now;
+                int count = 0;
+                void* dir = g_hal->filesys->opendir(SD_ROOT);
+                if (dir) {
+                    FsDirEntry ent;
+                    while (g_hal->filesys->readdir(dir, &ent)) {
+                        if (ent.name[0] == '.') continue;
+                        if (strcmp(ent.name, "harvested") == 0) continue;
+                        if (isSkipped(ent.name)) continue;
+                        uint32_t sz = 0; bool isDir = false;
+                        char fp[256]; snprintf(fp, sizeof(fp), "%s/%s", SD_ROOT, ent.name);
+                        if (g_hal->filesys->stat(fp, &sz, &isDir) && !isDir && sz > 0)
+                            count++;
+                    }
+                    g_hal->filesys->closedir(dir);
+                }
+                if (lastFileCount >= 0 && count > lastFileCount) {
+                    // New files detected — simulate USB write
+                    s_writeDetected = true;
+                    s_lastWriteMs = now;
+                    s_hostWasConnected = true;
+                    float newMb = 0;
+                    // Estimate total size
+                    void* d2 = g_hal->filesys->opendir(SD_ROOT);
+                    if (d2) {
+                        FsDirEntry e2;
+                        while (g_hal->filesys->readdir(d2, &e2)) {
+                            if (e2.name[0] == '.' || strcmp(e2.name, "harvested") == 0) continue;
+                            uint32_t sz = 0; bool isDir = false;
+                            char fp[256]; snprintf(fp, sizeof(fp), "%s/%s", SD_ROOT, e2.name);
+                            if (g_hal->filesys->stat(fp, &sz, &isDir) && !isDir)
+                                newMb += sz / 1e6f;
+                        }
+                        g_hal->filesys->closedir(d2);
+                    }
+                    ds.hostWrittenMb = newMb;
+                    printf("[USB] New files detected (%d → %d), %.1f MB\n",
+                           lastFileCount, count, newMb);
+                }
+                lastFileCount = count;
+            }
+        }
+
+        // Harvest trigger — uses shared shouldHarvest() (same logic as firmware)
+        if (shouldHarvest(s_harvesting, s_writeDetected, s_hostWasConnected,
+                          s_lastWriteMs, s_lastHarvestMs, s_harvestCoolMs, now)) {
+            printf("[Harvest] Triggering (%.1f MB written, %us idle)\n",
+                   ds.hostWrittenMb, (now - s_lastWriteMs) / 1000);
+            s_harvesting = true;
+
+            char destDir[256];
+            snprintf(destDir, sizeof(destDir), "%s/harvested", SD_ROOT);
+            HarvestResult r = harvestFiles(SD_ROOT, destDir);
+            printf("[Harvest] Done: %u file(s), %.1f MB\n", r.count, r.usedMb);
+            ds.mbQueued += r.usedMb;
+
+            s_writeDetected = false;
+            s_lastWriteMs = 0;
+            s_hostWasConnected = false;
+            s_lastHarvestMs = now;
+            s_harvestCoolMs = QUIET_WINDOW_MS;
+            s_harvesting = false;
+
+            // Auto-upload if connected
+            if (ds.pppConnected && r.count > 0 && !s_uploading) {
+                s_uploading = true;
+                std::thread(uploadThread, &ds).detach();
+            }
+        }
+
+        // Update speeds using shared SpeedTracker (same math as main_loop_task)
         ds.usbWriteKBps = s_usbSpeed.update(ds.hostWrittenMb, now);
         ds.uploadKBps = s_uploadSpeed.update(ds.mbUploaded + ds.uploadingMb, now);
 
