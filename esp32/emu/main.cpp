@@ -126,13 +126,63 @@ static void modemInitThread(DisplayState* ds) {
     ds->modemRssi = s_modemResult.rssi;
     strlcpy(ds->modemOp, s_modemResult.operatorName, sizeof(ds->modemOp));
 
-    if (s_modemResult.connected) {
-        ds->pppConnected = true;
-        // Throttle upload bandwidth to match real cellular modem
-        // Real device: 921600 baud UART, ~60 KB/s effective after PPP overhead
-        s_net.maxBytesPerSec = 60 * 1024;  // 60 KB/s (matching real cellular)
-        printf("[Modem] Network throttled to 60 KB/s (matching cellular)\n");
-        s_log.write(0, "Cellular connected — upload throttled to 60 KB/s");
+    if (s_modemResult.connected && s_modem) {
+        // Start pppd on the slave fd — it negotiates PPP with SimModem
+        // and creates a real ppp0 network interface.
+        printf("[Modem] Starting pppd on %s...\n", s_modem->slavePath);
+
+        // Close our slave fd so pppd can open it
+        if (s_uart.fd >= 0) { close(s_uart.fd); s_uart.fd = -1; }
+
+        s_clientPppd = fork();
+        if (s_clientPppd == 0) {
+            int devnull = open("/dev/null", O_WRONLY);
+            if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); close(devnull); }
+            execlp("sudo", "sudo", "pppd",
+                s_modem->slavePath,
+                "921600",
+                "noauth",
+                "nodetach",
+                "local",
+                "nodefaultroute",
+                "logfile", "/tmp/sim_pppd_client.log",
+                (char*)nullptr);
+            _exit(1);
+        }
+
+        if (s_clientPppd > 0) {
+            // Wait for ppp interface to appear
+            for (int i = 0; i < 30; i++) {
+                usleep(500000);
+                // Check for any ppp interface
+                if (access("/sys/class/net/ppp0", F_OK) == 0 ||
+                    access("/sys/class/net/ppp1", F_OK) == 0) {
+                    ds->pppConnected = true;
+
+                    // Policy routing: only emulator traffic goes through PPP
+                    system("sudo ip rule del from 10.64.64.2 table 100 2>/dev/null");
+                    system("sudo ip route flush table 100 2>/dev/null");
+                    // Find which ppp interface has 10.64.64.2
+                    char cmd[128];
+                    snprintf(cmd, sizeof(cmd),
+                        "PPP_IF=$(ip -o addr show | grep 10.64.64.2 | awk '{print $2}') && "
+                        "sudo ip route add default dev $PPP_IF table 100 && "
+                        "sudo ip rule add from 10.64.64.2 table 100 priority 100");
+                    system(cmd);
+
+                    strlcpy(s_net.bindAddr, "10.64.64.2", sizeof(s_net.bindAddr));
+                    s_net.maxBytesPerSec = 0;  // no app-level throttle — PTY is the bottleneck
+                    printf("[Modem] PPP up — traffic routes through PPP tunnel\n");
+                    s_log.write(0, "PPP tunnel up — all traffic via cellular sim");
+                    break;
+                }
+            }
+            if (!ds->pppConnected) {
+                printf("[Modem] PPP interface didn't come up — falling back to direct\n");
+                ds->pppConnected = true;
+                s_net.maxBytesPerSec = 60 * 1024;
+            }
+        }
     }
     s_modemInitDone = true;
 }
@@ -392,6 +442,13 @@ int main(int argc, char* argv[]) {
     }
 
     if (modemThread.joinable()) modemThread.join();
+    // Clean up pppd and routing
+    if (s_clientPppd > 0) {
+        system("sudo ip rule del from 10.64.64.2 table 100 2>/dev/null");
+        system("sudo ip route flush table 100 2>/dev/null");
+        kill(s_clientPppd, SIGTERM);
+        waitpid(s_clientPppd, nullptr, 0);
+    }
     if (s_modem) { s_modem->stop(); delete s_modem; }
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
