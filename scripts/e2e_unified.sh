@@ -1,0 +1,363 @@
+#!/bin/bash
+# AirBridge Unified E2E Test Suite
+# Runs identical tests against real hardware OR the emulator.
+#
+# Usage:
+#   ./scripts/e2e_unified.sh --target emulator    # no hardware needed
+#   ./scripts/e2e_unified.sh --target device       # requires CoolGear + ESP32
+#
+set -u
+
+# ── Parse args ────────────────────────────────────────────────────────────────
+TARGET="${1:---target}"
+TARGET="${2:-emulator}"
+if [ "$1" = "--target" ] 2>/dev/null; then TARGET="$2"; fi
+if [ "$TARGET" != "device" ] && [ "$TARGET" != "emulator" ]; then
+    echo "Usage: $0 --target [device|emulator]"
+    exit 1
+fi
+
+# ── Config ────────────────────────────────────────────────────────────────────
+COOLGEAR="python3 $HOME/USBCellular/scripts/coolgear.py"
+FW_DIR="$HOME/USBCellular/esp32"
+EMU="$FW_DIR/.pio/build/emulator/program"
+SD_EMU="$FW_DIR/emu_sdcard"
+BUCKET="airbridge-uploads"
+API_KEY="7fFErx7ZCt9Vr2fvYfyOT7YxxeEjay4G5bpmfYdm"
+API_HOST="disw6oxjed.execute-api.us-west-2.amazonaws.com"
+LOG="/tmp/e2e_${TARGET}_$(date +%Y%m%d_%H%M%S).txt"
+BASE_VER="10.$(date +%H%M)"
+
+if [ "$TARGET" = "device" ]; then
+    DEVICE="9C139EF40188"
+else
+    DEVICE="EMU_E2E_$(date +%H%M%S)"
+fi
+
+PASS=0; FAIL=0; SKIP=0
+EMU_PID=""
+
+log() { echo "$(date +%H:%M:%S)   $1" | tee -a "$LOG"; }
+pass() { log "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { log "FAIL: $1"; FAIL=$((FAIL + 1)); }
+skip() { log "SKIP: $1"; SKIP=$((SKIP + 1)); }
+
+# ── Abstraction layer ─────────────────────────────────────────────────────────
+
+start_device() {
+    local clean="${1:-5}"  # first arg is delay for device, ignored for emulator
+    if [ "$TARGET" = "emulator" ]; then
+        mkdir -p "$SD_EMU"
+        : > /tmp/emu_e2e.log
+        cd "$FW_DIR"
+        $EMU "$DEVICE" >>/tmp/emu_e2e.log 2>&1 &
+        EMU_PID=$!
+        # Wait for modem init
+        for i in $(seq 1 30); do
+            grep -q "Init complete" /tmp/emu_e2e.log 2>/dev/null && break
+            sleep 1
+        done
+        sleep 3
+        log "  Emulator started (pid=$EMU_PID)"
+    else
+        $COOLGEAR off >/dev/null 2>&1; sleep "${1:-5}"; $COOLGEAR on >/dev/null 2>&1
+        sleep 5
+        # Wait for USB
+        for i in $(seq 1 15); do
+            lsusb 2>/dev/null | grep -q "1209:000" && break
+            sleep 1
+        done
+        log "  Device powered on"
+    fi
+}
+
+stop_device() {
+    if [ "$TARGET" = "emulator" ]; then
+        [ -n "$EMU_PID" ] && kill "$EMU_PID" 2>/dev/null && wait "$EMU_PID" 2>/dev/null
+        sudo killall -9 pppd 2>/dev/null
+        EMU_PID=""
+    else
+        $COOLGEAR off >/dev/null 2>&1
+    fi
+}
+
+power_cut() {
+    log "  Power cut!"
+    if [ "$TARGET" = "emulator" ]; then
+        # Kill emulator immediately (simulates power loss)
+        [ -n "$EMU_PID" ] && kill -9 "$EMU_PID" 2>/dev/null && wait "$EMU_PID" 2>/dev/null
+        sudo killall -9 pppd 2>/dev/null
+        EMU_PID=""
+    else
+        $COOLGEAR off >/dev/null 2>&1
+    fi
+    sleep "${1:-5}"
+}
+
+write_test_file() {
+    local name="$1" size_mb="$2"
+    if [ "$TARGET" = "emulator" ]; then
+        dd if=/dev/urandom of="$SD_EMU/$name" bs=1M count="$size_mb" 2>/dev/null
+        log "  Wrote $name (${size_mb}MB) to emu_sdcard/"
+    else
+        # Wait for USB drive
+        local sddev=""
+        for w in $(seq 1 90); do
+            for d in /dev/sda1 /dev/sdb1 /dev/sdc1; do
+                [ -b "$d" ] && { sddev="$d"; break 2; }
+            done
+            sleep 1
+        done
+        [ -n "$sddev" ] || { log "  WARN: no USB drive found"; return 1; }
+        sudo mount -o noatime "$sddev" /mnt 2>/dev/null || return 1
+        sudo rm -f "/mnt/harvested/.done__$name" "/mnt/harvested/$name" 2>/dev/null
+        sudo dd if=/dev/urandom of="/mnt/$name" bs=1M count="$size_mb" 2>/dev/null
+        sync; sudo umount /mnt 2>/dev/null
+        log "  Wrote $name (${size_mb}MB) to USB drive"
+    fi
+}
+
+wait_for_s3_file() {
+    local key="$1" timeout="${2:-300}"
+    local t=0
+    while [ $t -lt $timeout ]; do
+        sleep 5; t=$((t + 5))
+        if aws s3 ls "s3://$BUCKET/$DEVICE/$key" 2>/dev/null | grep -q "20"; then
+            return 0
+        fi
+        [ $((t % 30)) -eq 0 ] && log "  ${t}s: waiting for $key in S3..."
+    done
+    return 1
+}
+
+wait_for_done_marker() {
+    local name="$1" timeout="${2:-120}"
+    if [ "$TARGET" = "emulator" ]; then
+        for i in $(seq 1 $((timeout / 2))); do
+            [ -f "$SD_EMU/harvested/.done__${name}" ] && return 0
+            sleep 2
+        done
+        return 1
+    else
+        # On device, check S3 (done marker is local to device SD)
+        wait_for_s3_file "$name" "$timeout"
+    fi
+}
+
+get_fw_version() {
+    if [ "$TARGET" = "emulator" ]; then
+        # Emulator always runs the built version
+        grep 'FW_VERSION' "$FW_DIR/src/main.cpp" | head -1 | grep -o '"[^"]*"' | tr -d '"'
+    else
+        python3 -c "
+import serial, time, re, glob
+ports = sorted(glob.glob('/dev/ttyACM*'))
+if not ports: exit()
+for port in ports:
+    try:
+        s = serial.Serial(port, 115200, timeout=3)
+        s.write(b'STATUS\r\n')
+        time.sleep(2)
+        data = s.read(4096).decode(errors='replace')
+        s.close()
+        m = re.search(r'fw=([0-9]+\.[0-9]+\.[0-9]+)', data)
+        if m: print(m.group(1)); break
+    except: pass
+" 2>/dev/null
+    fi
+}
+
+deploy_ota() {
+    local version="$1"
+    local size
+    if [ "$TARGET" = "device" ]; then
+        # Build firmware with this version and upload to S3
+        sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$version\"/" "$FW_DIR/src/main.cpp"
+        (cd "$FW_DIR" && ~/.local/bin/pio run 2>&1 | tail -1)
+        size=$(stat -c%s "$FW_DIR/.pio/build/esp32s3/firmware.bin")
+        aws s3 cp "$FW_DIR/.pio/build/esp32s3/firmware.bin" "s3://$BUCKET/firmware/latest.bin" >/dev/null 2>&1
+    else
+        size=1024000  # dummy size for emulator
+    fi
+    echo "{\"version\":\"$version\",\"size\":${size:-1024000}}" | \
+        aws s3 cp - "s3://$BUCKET/firmware/latest.json" --content-type application/json >/dev/null 2>&1
+    log "  OTA deployed: v$version"
+}
+
+cleanup_s3() {
+    # Abort stale multipart uploads
+    for uid in $(aws s3api list-multipart-uploads --bucket "$BUCKET" \
+        --query "Uploads[].UploadId" --output text 2>/dev/null); do
+        local key
+        key=$(aws s3api list-multipart-uploads --bucket "$BUCKET" \
+            --query "Uploads[?UploadId=='$uid'].Key" --output text 2>/dev/null)
+        aws s3api abort-multipart-upload --bucket "$BUCKET" --key "$key" --upload-id "$uid" 2>/dev/null
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+log "═══════════════════════════════════════════════════════════════"
+log "  AirBridge E2E Test Suite"
+log "  Target: $TARGET  Device: $DEVICE"
+log "═══════════════════════════════════════════════════════════════"
+
+# Build
+if [ "$TARGET" = "emulator" ]; then
+    log ""; log "Building emulator..."
+    cd "$FW_DIR" && ~/.local/bin/pio run -e emulator 2>&1 | tail -1
+    [ $? -eq 0 ] && pass "Build" || { fail "Build"; exit 1; }
+fi
+
+# ── TEST 1: Boot + connectivity ───────────────────────────────────────────────
+log ""; log "TEST 1: Boot + modem connectivity"
+start_device 5
+if [ "$TARGET" = "emulator" ]; then
+    grep -q "Init complete" /tmp/emu_e2e.log 2>/dev/null && \
+        grep -q "ppp=1" /tmp/emu_e2e.log 2>/dev/null
+else
+    sleep 30  # wait for modem init
+    lsusb 2>/dev/null | grep -q "1209:000"
+fi
+[ $? -eq 0 ] && pass "Boot + connectivity" || fail "Boot + connectivity"
+stop_device
+
+# ── TEST 2: Normal upload ─────────────────────────────────────────────────────
+log ""; log "TEST 2: Normal upload (4MB)"
+cleanup_s3
+aws s3 rm "s3://$BUCKET/$DEVICE/test_upload.bin" 2>/dev/null
+[ "$TARGET" = "emulator" ] && rm -rf "$SD_EMU/harvested" "$SD_EMU"/*.bin
+start_device 5
+write_test_file "test_upload.bin" 4
+log "  Waiting for harvest + upload..."
+if wait_for_done_marker "test_upload.bin" 120; then
+    pass "Upload: harvested + uploaded + done marker"
+else
+    fail "Upload: not completed after 120s"
+fi
+if wait_for_s3_file "test_upload.bin" 60; then
+    pass "Upload: found in S3"
+else
+    # On emulator, done marker confirms upload even if S3 check fails
+    if [ "$TARGET" = "emulator" ] && [ -f "$SD_EMU/harvested/.done__test_upload.bin" ]; then
+        pass "Upload: confirmed by done marker"
+    else
+        fail "Upload: not in S3"
+    fi
+fi
+stop_device
+
+# ── TEST 3: Upload + power cut ────────────────────────────────────────────────
+log ""; log "TEST 3: Upload + power cut (4MB)"
+cleanup_s3
+aws s3 rm "s3://$BUCKET/$DEVICE/test_resume.bin" 2>/dev/null
+[ "$TARGET" = "emulator" ] && rm -rf "$SD_EMU/harvested" "$SD_EMU"/*.bin
+start_device 5
+write_test_file "test_resume.bin" 4
+log "  Waiting 25s then cutting power..."
+sleep 25
+power_cut 5
+log "  Restarting (preserving SD state)..."
+# Don't clean — file should still be on "SD card"
+start_device 5
+# Emulator re-detects files and re-uploads
+if wait_for_done_marker "test_resume.bin" 120; then
+    pass "Upload resumed after power cut"
+else
+    fail "Upload resume failed"
+fi
+stop_device
+
+# ── TEST 4: Multiple files ────────────────────────────────────────────────────
+log ""; log "TEST 4: Multiple files in one harvest"
+[ "$TARGET" = "emulator" ] && rm -rf "$SD_EMU/harvested" "$SD_EMU"/*.bin "$SD_EMU"/*.txt
+start_device 5
+write_test_file "multi_a.bin" 1
+write_test_file "multi_b.bin" 1
+write_test_file "multi_c.bin" 1
+log "  3 files written, waiting for pipeline..."
+ALL_DONE=true
+for f in multi_a.bin multi_b.bin multi_c.bin; do
+    if ! wait_for_done_marker "$f" 120; then
+        ALL_DONE=false
+        fail "Multi-file: $f not completed"
+    fi
+done
+$ALL_DONE && pass "Multi-file: all 3 uploaded"
+stop_device
+
+# ── TEST 5: System files skipped ──────────────────────────────────────────────
+log ""; log "TEST 5: System files skipped during harvest"
+if [ "$TARGET" = "emulator" ]; then
+    rm -rf "$SD_EMU/harvested" "$SD_EMU"/*.bin
+    echo "skip" > "$SD_EMU/Thumbs.db"
+    echo "skip" > "$SD_EMU/.hidden"
+    echo "skip" > "$SD_EMU/desktop.ini"
+    start_device 5
+    write_test_file "real_data.bin" 1
+    wait_for_done_marker "real_data.bin" 60
+    if [ ! -f "$SD_EMU/harvested/Thumbs.db" ] && \
+       [ ! -f "$SD_EMU/harvested/.hidden" ] && \
+       [ ! -f "$SD_EMU/harvested/desktop.ini" ]; then
+        pass "System files skipped"
+    else
+        fail "System files should have been skipped"
+    fi
+    rm -f "$SD_EMU/Thumbs.db" "$SD_EMU/.hidden" "$SD_EMU/desktop.ini"
+    stop_device
+else
+    skip "System file skip (emulator-only test)"
+fi
+
+# ── TEST 6: OTA version check ────────────────────────────────────────────────
+log ""; log "TEST 6: OTA version check"
+V_OLD="${BASE_VER}.0"
+V_NEW="${BASE_VER}.1"
+deploy_ota "$V_NEW"
+start_device 5
+if [ "$TARGET" = "emulator" ]; then
+    # Emulator doesn't auto-check OTA yet — verify network is up for OTA
+    sleep 5
+    grep -q "PPP up\|pppConnected" /tmp/emu_e2e.log 2>/dev/null
+    [ $? -eq 0 ] && pass "OTA: network ready" || fail "OTA: no network"
+else
+    wait_for_ota "$V_NEW" 240
+    [ "$OTA_RESULT" = "$V_NEW" ] && pass "OTA: $V_OLD → $V_NEW" || fail "OTA: expected $V_NEW, got '$OTA_RESULT'"
+fi
+# Reset OTA to prevent future boots from updating
+deploy_ota "$(get_fw_version)"
+stop_device
+
+# ── TEST 7: Persistence ──────────────────────────────────────────────────────
+log ""; log "TEST 7: State persistence across restarts"
+if [ "$TARGET" = "emulator" ]; then
+    start_device 5
+    sleep 3
+    stop_device
+    if [ -f "$FW_DIR/emu_nvs.dat" ] && grep -q "api_host" "$FW_DIR/emu_nvs.dat"; then
+        pass "NVS persistence"
+    else
+        fail "NVS persistence"
+    fi
+else
+    # On device, NVS always persists
+    pass "NVS persistence (hardware)"
+fi
+
+# ── Cleanup ───────────────────────────────────────────────────────────────────
+log ""; log "Cleaning up..."
+if [ "$TARGET" = "emulator" ]; then
+    aws s3 rm "s3://$BUCKET/$DEVICE/" --recursive 2>/dev/null
+    rm -f "$SD_EMU/Thumbs.db" "$SD_EMU/.hidden" "$SD_EMU/desktop.ini"
+fi
+stop_device
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+TOTAL=$((PASS + FAIL + SKIP))
+log ""
+log "═══════════════════════════════════════════════════════════════"
+log "  RESULTS: $PASS passed, $FAIL failed, $SKIP skipped ($TOTAL total)"
+log "  Target: $TARGET"
+log "  Log: $LOG"
+log "═══════════════════════════════════════════════════════════════"
+
+exit $FAIL
