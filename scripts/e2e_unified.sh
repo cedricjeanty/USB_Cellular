@@ -146,10 +146,11 @@ wait_for_done_marker() {
 
 get_fw_version() {
     if [ "$TARGET" = "emulator" ]; then
-        # Emulator always runs the built version
         grep 'FW_VERSION' "$FW_DIR/src/main.cpp" | head -1 | grep -o '"[^"]*"' | tr -d '"'
     else
-        python3 -c "
+        # Try serial first (CDC mode)
+        local ver=""
+        ver=$(python3 -c "
 import serial, time, re, glob
 ports = sorted(glob.glob('/dev/ttyACM*'))
 if not ports: exit()
@@ -163,7 +164,17 @@ for port in ports:
         m = re.search(r'fw=([0-9]+\.[0-9]+\.[0-9]+)', data)
         if m: print(m.group(1)); break
     except: pass
-" 2>/dev/null
+" 2>/dev/null)
+        if [ -n "$ver" ]; then echo "$ver"; return; fi
+
+        # Fallback: check S3 log for firmware version
+        local latest
+        latest=$(aws s3 ls "s3://$BUCKET/$DEVICE/logs/" 2>/dev/null | sort | tail -1 | awk '{print $4}')
+        if [ -n "$latest" ]; then
+            local log_content
+            log_content=$(aws s3 cp "s3://$BUCKET/$DEVICE/logs/$latest" - 2>/dev/null)
+            echo "$log_content" | grep -oP 'fw=\K[0-9]+\.[0-9]+\.[0-9]+' | head -1
+        fi
     fi
 }
 
@@ -189,20 +200,29 @@ wait_for_ota() {
     local t=0
     OTA_RESULT=""
     while [ $t -lt $timeout ]; do
-        sleep 5; t=$((t + 5))
+        sleep 10; t=$((t + 10))
         # Check if device rebooted (USB disappears briefly)
         if ! lsusb 2>/dev/null | grep -q "1209:000"; then
             log "  ${t}s: device rebooting..."
             sleep 15; t=$((t + 15))
-            # Wait for USB to reappear
             for i in $(seq 1 30); do
                 lsusb 2>/dev/null | grep -q "1209:000" && break
                 sleep 1
             done
-            sleep 5; t=$((t + 5))
+            sleep 10; t=$((t + 10))
         fi
+        # Check firmware version via serial or S3 log
         OTA_RESULT=$(get_fw_version | tr -d '[:space:]')
         [ "$OTA_RESULT" = "$expected" ] && return 0
+        # Also check S3 logs directly for the OTA confirmation
+        local latest
+        latest=$(aws s3 ls "s3://$BUCKET/$DEVICE/logs/" 2>/dev/null | sort | tail -1 | awk '{print $4}')
+        if [ -n "$latest" ]; then
+            local log_ver
+            log_ver=$(aws s3 cp "s3://$BUCKET/$DEVICE/logs/$latest" - 2>/dev/null | \
+                grep -oP 'fw=\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            [ "$log_ver" = "$expected" ] && { OTA_RESULT="$log_ver"; return 0; }
+        fi
         [ $((t % 30)) -eq 0 ] && log "  ${t}s: fw=$OTA_RESULT (waiting for $expected)"
     done
     OTA_RESULT=$(get_fw_version | tr -d '[:space:]')
@@ -338,7 +358,36 @@ if [ "$TARGET" = "emulator" ]; then
     rm -f "$SD_EMU/Thumbs.db" "$SD_EMU/.hidden" "$SD_EMU/desktop.ini"
     stop_device
 else
-    skip "System file skip (emulator-only test)"
+    # On device: write system files to USB drive, verify they don't appear in S3
+    start_device 5
+    # Wait for USB drive
+    local sddev=""
+    for w in $(seq 1 90); do
+        for d in /dev/sda1 /dev/sdb1 /dev/sdc1; do [ -b "$d" ] && { sddev="$d"; break 2; }; done
+        sleep 1
+    done
+    if [ -n "$sddev" ]; then
+        sudo mount -o noatime "$sddev" /mnt 2>/dev/null
+        echo "skip" | sudo tee /mnt/Thumbs.db >/dev/null
+        echo "skip" | sudo tee /mnt/desktop.ini >/dev/null
+        sudo dd if=/dev/urandom of=/mnt/real_sysfile_test.bin bs=1K count=50 2>/dev/null
+        sync; sudo umount /mnt 2>/dev/null
+        # Wait for harvest + upload
+        if wait_for_s3_file "real_sysfile_test.bin" 180; then
+            pass "System files: real file uploaded"
+            # Verify system files were NOT uploaded
+            if ! aws s3 ls "s3://$BUCKET/$DEVICE/Thumbs.db" 2>/dev/null | grep -q "20"; then
+                pass "System files: Thumbs.db skipped"
+            else
+                fail "System files: Thumbs.db should not be in S3"
+            fi
+        else
+            fail "System files: real file not uploaded"
+        fi
+    else
+        skip "System file skip (no USB drive found)"
+    fi
+    stop_device
 fi
 
 # ── TEST 6: OTA check + download ──────────────────────────────────────────────
@@ -370,8 +419,32 @@ if [ "$TARGET" = "emulator" ]; then
     stop_device
 else
     start_device 5
-    wait_for_ota "$V_NEW" 240
-    [ "$OTA_RESULT" = "$V_NEW" ] && pass "OTA: updated to $V_NEW" || fail "OTA: expected $V_NEW, got '$OTA_RESULT'"
+    # Wait for modem init + OTA check + download + reboot + second boot + log upload
+    wait_for_ota "$V_NEW" 300
+    if [ "$OTA_RESULT" = "$V_NEW" ]; then
+        pass "OTA: updated to $V_NEW"
+    else
+        # Check S3 log for OTA evidence
+        local latest
+        latest=$(aws s3 ls "s3://$BUCKET/$DEVICE/logs/" 2>/dev/null | sort | tail -1 | awk '{print $4}')
+        if [ -n "$latest" ]; then
+            local log_content
+            log_content=$(aws s3 cp "s3://$BUCKET/$DEVICE/logs/$latest" - 2>/dev/null)
+            if echo "$log_content" | grep -q "up to date"; then
+                local log_ver
+                log_ver=$(echo "$log_content" | grep -oP 'fw=\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+                if [ "$log_ver" = "$V_NEW" ]; then
+                    pass "OTA: updated to $V_NEW (verified via S3 log)"
+                else
+                    fail "OTA: S3 log shows fw=$log_ver, expected $V_NEW"
+                fi
+            else
+                fail "OTA: expected $V_NEW, got '$OTA_RESULT'"
+            fi
+        else
+            fail "OTA: no S3 log found"
+        fi
+    fi
     stop_device
 fi
 # Reset OTA to current version

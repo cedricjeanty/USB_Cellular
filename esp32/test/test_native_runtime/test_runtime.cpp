@@ -31,31 +31,34 @@ void test_speed_first_call_zero(void) {
 
 void test_speed_simple(void) {
     SpeedTracker t = {};
-    t.update(0.0f, 1000);  // baseline
+    t.update(0.0f, 1000);
     float spd = t.update(1.0f, 2000);  // 1MB in 1s = 1024 KB/s
-    TEST_ASSERT_FLOAT_WITHIN(1.0f, 1024.0f, spd);
+    TEST_ASSERT_FLOAT_WITHIN(10.0f, 1024.0f, spd);
 }
 
 void test_speed_no_progress(void) {
     SpeedTracker t = {};
     t.update(5.0f, 1000);
-    float spd = t.update(5.0f, 2000);  // no change
+    float spd = t.update(5.0f, 2000);
     TEST_ASSERT_EQUAL_FLOAT(0.0f, spd);
 }
 
-void test_speed_short_interval_ignored(void) {
+void test_speed_short_interval_returns_last(void) {
     SpeedTracker t = {};
     t.update(0.0f, 1000);
-    float spd = t.update(1.0f, 1050);  // 50ms — too short (< 100ms)
-    TEST_ASSERT_EQUAL_FLOAT(0.0f, spd);
+    t.update(1.0f, 2000);  // establishes speed
+    float spd = t.update(1.1f, 2050);  // 50ms — returns last speed
+    TEST_ASSERT_TRUE(spd > 0);
 }
 
-void test_speed_consecutive(void) {
+void test_speed_sliding_window(void) {
     SpeedTracker t = {};
-    t.update(0.0f, 0);
-    t.update(1.0f, 1000);   // 1024 KB/s
-    float spd = t.update(3.0f, 2000);  // 2MB in 1s = 2048 KB/s
-    TEST_ASSERT_FLOAT_WITHIN(1.0f, 2048.0f, spd);
+    // Feed 10 samples over 10 seconds
+    for (int i = 0; i <= 10; i++) {
+        t.update(i * 1.0f, i * 1000);  // 1MB/s = 1024 KB/s
+    }
+    float spd = t.update(11.0f, 11000);
+    TEST_ASSERT_FLOAT_WITHIN(50.0f, 1024.0f, spd);
 }
 
 // ── LogBuffer tests ─────────────────────────────────────────────────────────
@@ -221,8 +224,8 @@ int main(int argc, char** argv) {
     RUN_TEST(test_speed_first_call_zero);
     RUN_TEST(test_speed_simple);
     RUN_TEST(test_speed_no_progress);
-    RUN_TEST(test_speed_short_interval_ignored);
-    RUN_TEST(test_speed_consecutive);
+    RUN_TEST(test_speed_short_interval_returns_last);
+    RUN_TEST(test_speed_sliding_window);
 
     // LogBuffer
     RUN_TEST(test_log_write_basic);

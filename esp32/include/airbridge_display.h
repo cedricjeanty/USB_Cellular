@@ -21,8 +21,6 @@ struct DisplayState {
     float    uploadingMb;
     float    usbWriteKBps;
     float    uploadKBps;
-    // EMA state for stable ETA (persists across calls)
-    float    etaKBps;
 };
 
 // Render the main operational display
@@ -119,14 +117,10 @@ inline void updateDisplay(DisplayState& ds) {
         snprintf(remStr, sizeof(remStr), "REM:"); _fmtSize(remStr + 4, sizeof(remStr) - 4, remaining);
         g_hal->display->text(0, 57, remStr);
 
-        // Smoothed speed for stable ETA (slow EMA — doesn't dash out on brief zero)
-        if (ds.uploadKBps > 0.5f)
-            ds.etaKBps = ds.etaKBps * 0.7f + ds.uploadKBps * 0.3f;
-        else if (ds.etaKBps > 0.5f)
-            ds.etaKBps *= 0.95f;  // decay slowly instead of zeroing
-
-        if (ds.etaKBps > 0.5f && remaining > 0.001f) {
-            int etaSec = (int)(remaining * 1024.0f / ds.etaKBps);
+        // ETA uses the display upload speed directly (already smoothed by 10s window)
+        // Dashes out only when speed is truly zero (no data in entire 10s window)
+        if (ds.uploadKBps > 0.5f && remaining > 0.001f) {
+            int etaSec = (int)(remaining * 1024.0f / ds.uploadKBps);
             int mm = etaSec / 60, ss = etaSec % 60;
             if (mm > 99) snprintf(etaStr, sizeof(etaStr), "ETA %dh%02d", mm / 60, mm % 60);
             else         snprintf(etaStr, sizeof(etaStr), "ETA %d:%02d", mm, ss);

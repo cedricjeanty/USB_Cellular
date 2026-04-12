@@ -171,12 +171,9 @@ void test_updateDisplay_eta_shown(void) {
     DisplayState ds = make_default_state();
     ds.uploadKBps = 100.0f;
     ds.mbQueued = 10.0f;
-    ds.etaKBps = 100.0f;  // pre-prime EMA so it doesn't need warmup
-
     updateDisplay(ds);
-    // ETA should be calculated: remaining=10MB, speed=100KB/s
-    // etaKBps = 100*0.8 + 100*0.2 = 100
-    // etaSec = 10*1024/100 = 102s → 1:42
+    // ETA uses uploadKBps directly (smoothed by SpeedTracker in main loop)
+    // remaining=10MB, speed=100KB/s → etaSec = 10*1024/100 = 102s → 1:42
     // "ETA 1:42" rendered at bottom-right
     TEST_ASSERT_EQUAL_INT(1, s_display.flush_count);
     // Just verify something was drawn in the ETA row area (y=52-58)

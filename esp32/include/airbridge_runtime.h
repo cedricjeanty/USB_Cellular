@@ -179,22 +179,37 @@ done:
 
 // ── Speed calculation (EMA smoothing) ───────────────────────────────────────
 
+// 10-second sliding window speed tracker.
+// Stores (timestamp, totalMb) samples and computes average KB/s over the window.
+// Gives smooth, stable speed readings suitable for display and ETA.
 struct SpeedTracker {
-    float prevMb;
-    uint32_t prevMs;
+    static const int MAX_SAMPLES = 20;  // 20 samples × 500ms = 10s window
+    struct Sample { uint32_t ms; float mb; };
+    Sample samples[MAX_SAMPLES];
+    int head = 0;
+    int count = 0;
+    float lastSpeed = 0;
 
-    // Compute speed in KB/s from delta since last call.
-    // Returns 0 if no progress or insufficient time elapsed.
+    // Record a sample and return smoothed speed in KB/s.
     float update(float currentMb, uint32_t nowMs) {
-        float dt = (prevMs > 0) ? (nowMs - prevMs) / 1000.0f : 0;
-        float speed = 0;
-        if (dt > 0.1f) {
-            float delta = currentMb - prevMb;
-            speed = (delta > 0) ? (delta * 1024.0f / dt) : 0;
+        // Add sample
+        samples[head] = { nowMs, currentMb };
+        head = (head + 1) % MAX_SAMPLES;
+        if (count < MAX_SAMPLES) count++;
+
+        // Find oldest sample within the 10s window
+        int oldest = (head - count + MAX_SAMPLES) % MAX_SAMPLES;
+        uint32_t dt = nowMs - samples[oldest].ms;
+        float deltaMb = currentMb - samples[oldest].mb;
+
+        if (dt < 500) return lastSpeed;  // not enough time elapsed
+
+        if (deltaMb > 0.0001f) {
+            lastSpeed = deltaMb * 1024.0f / (dt / 1000.0f);
+        } else {
+            lastSpeed = 0;  // no progress in window → zero
         }
-        prevMb = currentMb;
-        prevMs = nowMs;
-        return speed;
+        return lastSpeed;
     }
 };
 
