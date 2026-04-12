@@ -37,6 +37,7 @@
 #include "airbridge_harvest.h"
 #include "airbridge_s3.h"
 #include "airbridge_modem.h"
+#include "sim_dsu.h"
 #include "airbridge_triggers.h"
 #include "airbridge_runtime.h"
 
@@ -294,7 +295,7 @@ int main(int argc, char* argv[]) {
     printf("Virtual SD card: %s/\n", SD_ROOT);
     printf("NVS storage:     ./emu_nvs.dat\n\n");
     printf("Auto: modem init → OTA check → file detect → harvest → upload\n");
-    printf("Keys: I=status  T=test-AT  C=toggle-net  R=reset  Q=quit\n\n");
+    printf("Keys: D=DSU-session  I=status  T=test-AT  C=toggle-net  R=reset  Q=quit\n\n");
     fflush(stdout);
     setbuf(stdout, nullptr);  // disable buffering for real-time output
     s_log.clear();
@@ -448,6 +449,18 @@ int main(int argc, char* argv[]) {
                     ds.mbUploaded += 5.0f;
                     ds.uploadingMb = 2.0f;
                     break;
+                case SDLK_d: {
+                    printf("[DSU] Running download session...\n");
+                    SimDSU dsu;
+                    dsu.sdRoot = SD_ROOT;
+                    SimDSU::SessionResult sr = dsu.runSession(4.0f);  // 4MB
+                    if (sr.success) {
+                        printf("[DSU] Session complete: %s (%u bytes)\n", sr.filename, sr.bytesWritten);
+                    } else {
+                        printf("[DSU] Session failed\n");
+                    }
+                    break;
+                }
                 case SDLK_r:
                     ds = {};
                     strlcpy(ds.modemOp, "Emulator", sizeof(ds.modemOp));
@@ -599,6 +612,20 @@ int main(int argc, char* argv[]) {
             HarvestResult r = harvestFiles(SD_ROOT, destDir);
             printf("[Harvest] Done: %u file(s), %.1f MB\n", r.count, r.usedMb);
             ds.mbQueued += r.usedMb;
+
+            // Write DSU cookie if flight history files were harvested
+            if (r.maxFlight > 0 && r.dsuSerial[0]) {
+                uint8_t cookie[78];
+                buildDsuCookie(r.dsuSerial, r.maxFlight, cookie);
+                char cookiePath[256];
+                snprintf(cookiePath, sizeof(cookiePath), "%s/dsuCookie.easdf", SD_ROOT);
+                void* cf = g_hal->filesys->open(cookiePath, "wb");
+                if (cf) {
+                    g_hal->filesys->write(cf, cookie, 78);
+                    g_hal->filesys->close(cf);
+                    printf("[Harvest] Cookie: %s flight %u\n", r.dsuSerial, r.maxFlight);
+                }
+            }
 
             s_writeDetected = false;
             s_lastWriteMs = 0;
