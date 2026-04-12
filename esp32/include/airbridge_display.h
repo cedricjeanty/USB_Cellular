@@ -91,15 +91,15 @@ inline void updateDisplay(DisplayState& ds) {
         g_hal->display->text(65 + (62 - upW) / 2, 20, upSpd);
     }
 
-    // Row 29: totals (size 2, short format: "4.2M", "99K", "1.2G")
+    // Row 30: totals (size 2, short format: "4.2M", "99K", "1.2G")
     {
         char usbTot[12], upTot[12];
         _fmtSizeShort(usbTot, sizeof(usbTot), usbSessionMb);
         _fmtSizeShort(upTot, sizeof(upTot), uploaded);
         int usbW = g_hal->display->text_width(usbTot, 2);
         int upW  = g_hal->display->text_width(upTot, 2);
-        g_hal->display->text((62 - usbW) / 2, 29, usbTot, 2);
-        g_hal->display->text(65 + (62 - upW) / 2, 29, upTot, 2);
+        g_hal->display->text((62 - usbW) / 2, 30, usbTot, 2);
+        g_hal->display->text(65 + (62 - upW) / 2, 30, upTot, 2);
     }
 
     // Row 50: progress bar (thin)
