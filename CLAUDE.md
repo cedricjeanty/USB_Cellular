@@ -1,5 +1,7 @@
 # Developer Brief: USB WiFi Airbridge
 
+**Development workflow:** If you find a bug, replicate it in the emulator first, then fix it there. If you add a feature, add it to the emulator, and add a test for it. The emulator runs the same shared code as the firmware — fixes and features should go through the extracted headers (`esp32/include/airbridge_*.h`), not be duplicated.
+
 Two hardware variants exist: a Raspberry Pi Zero 2 W (legacy, being deprecated) and an
 ESP32-S3 (active development). Both present a USB mass storage device to a legacy host,
 harvest files when idle, and upload via cellular.
