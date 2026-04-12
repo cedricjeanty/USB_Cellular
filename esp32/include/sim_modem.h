@@ -36,6 +36,7 @@ public:
     int         regStat = 1;       // +CREG stat: 1=home, 5=roaming
     const char* operatorName = "SimOperator";
     bool        echoEnabled = true;
+    bool        apnSet = false;    // tracks AT+CGDCONT state (cleared by AT+CFUN=0, set by AT+CGDCONT)
     int         baudRate = 115200;  // tracks actual baud (persisted via AT+IPR, like real SIM7600 NVS)
 
     // PTY file descriptors (firmware side)
@@ -219,6 +220,8 @@ private:
             echoEnabled = true;
             respond("OK");
         } else if (upper.find("AT+CFUN=") == 0) {
+            int func = atoi(c.c_str() + 8);
+            if (func == 0) apnSet = false;  // radio off clears PDP context (like real SIM7600)
             respond("OK");
         } else if (upper == "AT+CSQ") {
             char buf[32];
@@ -252,6 +255,7 @@ private:
             respond(buf);
             respond("OK");
         } else if (upper.find("AT+CGDCONT=") == 0) {
+            apnSet = true;
             respond("OK");
         } else if (upper.find("AT+IPR=") == 0) {
             int newBaud = atoi(c.c_str() + 7);
@@ -264,8 +268,12 @@ private:
         } else if (upper.find("AT+IFC=") == 0) {
             respond("OK");
         } else if (upper == "ATD*99#") {
-            respond("CONNECT 921600");
-            dataMode_ = true;
+            if (!apnSet) {
+                respond("NO CARRIER");  // PDP context not set — like real SIM7600
+            } else {
+                respond("CONNECT 921600");
+                dataMode_ = true;
+            }
         } else if (upper == "ATO") {
             respond("CONNECT");
             dataMode_ = true;

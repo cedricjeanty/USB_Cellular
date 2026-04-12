@@ -18,6 +18,99 @@ extern int mdm_read(void* buf, size_t len, uint32_t timeout_ms);
 extern void mdm_flush();
 extern void mdm_set_baudrate(uint32_t baud);
 
+// Result of modem reconnect
+struct ModemReconnectResult {
+    bool connected;
+    int  rssi;
+    char operatorName[32];
+    bool registered;
+};
+
+// Reconnect PPP after a connection drop.
+// Escapes data mode, resets radio, waits for registration,
+// re-sets APN, and redials PPP.
+inline ModemReconnectResult modemReconnect() {
+    ModemReconnectResult r = {};
+    char resp[256];
+
+    // 1. Escape PPP data mode
+    g_hal->clock->delay_ms(1100);
+    mdm_write("+++", 3);
+    g_hal->clock->delay_ms(1100);
+    mdm_flush();
+
+    // 2. Hang up + reset radio
+    modem_at_cmd("ATH", resp, sizeof(resp), 2000);
+    modem_at_cmd("AT+CFUN=0", resp, sizeof(resp), 5000);
+    g_hal->clock->delay_ms(10000);
+    modem_at_cmd("AT+CFUN=1", resp, sizeof(resp), 5000);
+    g_hal->clock->delay_ms(5000);
+
+    // 3. Wait for registration (up to 60s)
+    for (int w = 0; w < 30; w++) {
+        modem_at_cmd("AT+CREG?", resp, sizeof(resp), 2000);
+        if (strstr(resp, ",1") || strstr(resp, ",5")) {
+            r.registered = true;
+            break;
+        }
+        g_hal->clock->delay_ms(2000);
+    }
+    if (!r.registered) return r;
+
+    // 4. Read RSSI
+    modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000);
+    {
+        char* p = strstr(resp, "+CSQ:");
+        if (p) {
+            int rssi = 99;
+            sscanf(p, "+CSQ: %d", &rssi);
+            if (rssi != 99) r.rssi = rssi;
+        }
+    }
+
+    // 5. Read operator
+    if (modem_at_cmd("AT+COPS?", resp, sizeof(resp), 2000) > 0) {
+        char* q1 = strchr(resp, '"');
+        if (q1) {
+            char* q2 = strchr(q1 + 1, '"');
+            if (q2) {
+                int olen = q2 - q1 - 1;
+                if (olen > 31) olen = 31;
+                memcpy(r.operatorName, q1 + 1, olen);
+                r.operatorName[olen] = '\0';
+            }
+        }
+    }
+
+    // 6. Re-set APN (CRITICAL — lost after AT+CFUN=0)
+    modem_at_cmd("AT+CGDCONT=1,\"IP\",\"hologram\"", resp, sizeof(resp), 5000);
+
+    // 7. Redial PPP (3 attempts)
+    for (int attempt = 0; attempt < 3 && !r.connected; attempt++) {
+        if (attempt > 0) {
+            modem_at_cmd("ATH", resp, sizeof(resp), 2000);
+            g_hal->clock->delay_ms(5000);
+        }
+        mdm_write("ATD*99#\r", 8);
+
+        uint32_t t0 = g_hal->clock->millis();
+        char connbuf[256] = "";
+        int connlen = 0;
+        while (g_hal->clock->millis() - t0 < 15000) {
+            int len = mdm_read((uint8_t*)connbuf + connlen,
+                               sizeof(connbuf) - 1 - connlen, 500);
+            if (len > 0) {
+                connlen += len;
+                connbuf[connlen] = '\0';
+                if (strstr(connbuf, "CONNECT")) { r.connected = true; break; }
+                if (strstr(connbuf, "ERROR") || strstr(connbuf, "NO CARRIER")) break;
+            }
+        }
+    }
+
+    return r;
+}
+
 // Result of modem AT initialization
 struct ModemInitResult {
     bool synced;           // AT sync succeeded

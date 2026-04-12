@@ -153,6 +153,58 @@ void test_init_time_sync(void) {
     TEST_ASSERT_TRUE(diff < 86400);  // within 24h (handles TZ parsing quirks)
 }
 
+// ── Reconnect tests ─────────────────────────────────────────────────────────
+
+void test_reconnect_sets_apn(void) {
+    // This test would have caught the missing APN bug.
+    // After AT+CFUN=0 (radio off), SimModem clears apnSet.
+    // modemReconnect() must send AT+CGDCONT before ATD*99#,
+    // otherwise SimModem returns NO CARRIER.
+
+    modemAtSync();
+    ModemInitResult init = modemRunInit();
+    TEST_ASSERT_TRUE(init.connected);
+
+    // Simulate PPP drop — modemReconnect does the full sequence
+    ModemReconnectResult rr = modemReconnect();
+    TEST_ASSERT_TRUE(rr.registered);
+    TEST_ASSERT_TRUE(rr.connected);  // would FAIL without AT+CGDCONT in reconnect
+    TEST_ASSERT_TRUE(rr.rssi > 0 && rr.rssi < 99);
+    TEST_ASSERT_TRUE(rr.operatorName[0] != '\0');
+}
+
+void test_reconnect_without_apn_fails(void) {
+    // Verify SimModem enforces APN requirement
+    modemAtSync();
+
+    char resp[256];
+    // Set APN and dial — should work
+    modem_at_cmd("AT+CGDCONT=1,\"IP\",\"hologram\"", resp, sizeof(resp), 1000);
+    modem_at_cmd("ATD*99#", resp, sizeof(resp), 2000);
+    TEST_ASSERT_TRUE(strstr(resp, "CONNECT") != nullptr);
+
+    // Escape back to command mode
+    g_hal->clock->delay_ms(1100);
+    mdm_write("+++", 3);
+    g_hal->clock->delay_ms(1100);
+    mdm_flush();
+    usleep(600000);
+    mdm_read(resp, sizeof(resp), 500);
+
+    // Reset radio (clears APN)
+    modem_at_cmd("AT+CFUN=0", resp, sizeof(resp), 2000);
+    modem_at_cmd("AT+CFUN=1", resp, sizeof(resp), 2000);
+
+    // Dial WITHOUT re-setting APN — should fail
+    modem_at_cmd("ATD*99#", resp, sizeof(resp), 2000);
+    TEST_ASSERT_TRUE(strstr(resp, "NO CARRIER") != nullptr);
+
+    // Now set APN and dial — should work
+    modem_at_cmd("AT+CGDCONT=1,\"IP\",\"hologram\"", resp, sizeof(resp), 1000);
+    modem_at_cmd("ATD*99#", resp, sizeof(resp), 2000);
+    TEST_ASSERT_TRUE(strstr(resp, "CONNECT") != nullptr);
+}
+
 // ── Test runner ─────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -165,6 +217,10 @@ int main(int argc, char** argv) {
     RUN_TEST(test_init_weak_signal);
     RUN_TEST(test_init_different_operator);
     RUN_TEST(test_init_time_sync);
+
+    // Reconnect
+    RUN_TEST(test_reconnect_sets_apn);
+    RUN_TEST(test_reconnect_without_apn_fails);
 
     return UNITY_END();
 }

@@ -2907,98 +2907,29 @@ static void modemTask(void* param) {
             }
             g_pppNeedsReconnect = false;
             g_pppConnected = false;
-            // Keep g_modemRssi — don't zero it. Display will show operator name
-            // with last-known signal until RSSI is re-read after registration.
+            // Keep g_modemRssi — display shows last-known signal during reconnect
 
-            // 1. Exit modem data mode (don't touch esp_netif — it crashes)
-            vTaskDelay(pdMS_TO_TICKS(1100));
-            mdm_write("+++", 3);
-            vTaskDelay(pdMS_TO_TICKS(1100));
-            mdm_flush();
+            cdc_printf("Modem: reconnecting...\r\n");
+            ModemReconnectResult rr = modemReconnect();
 
-            char resp[128];
-
-            // 3. Reset modem radio (AT+CFUN=0 off, then AT+CFUN=1 on)
-            cdc_printf("Modem: resetting radio...\r\n");
-            modem_at_cmd("ATH", resp, sizeof(resp), 2000);
-            modem_at_cmd("AT+CFUN=0", resp, sizeof(resp), 5000);
-            vTaskDelay(pdMS_TO_TICKS(10000));
-            modem_at_cmd("AT+CFUN=1", resp, sizeof(resp), 5000);
-            vTaskDelay(pdMS_TO_TICKS(5000));
-
-            // 4. Wait for registration (up to 60s)
-            bool registered = false;
-            for (int w = 0; w < 30; w++) {
-                modem_at_cmd("AT+CREG?", resp, sizeof(resp), 2000);
-                if (strstr(resp, ",1") || strstr(resp, ",5")) {
-                    registered = true;
-                    break;
-                }
-                vTaskDelay(pdMS_TO_TICKS(2000));
+            if (rr.registered) {
+                g_modemRssi = rr.rssi;
+                strlcpy(g_modemOp, rr.operatorName, sizeof(g_modemOp));
+                log_write("Reconnect: rssi=%d op=%s", rr.rssi, rr.operatorName);
+                cdc_printf("Modem: reconnect rssi=%d op=%s\r\n", rr.rssi, rr.operatorName);
             }
-            if (!registered) {
+
+            if (rr.connected) {
+                lastPppRxMs = millis();
+                test_launched = false;
+                cdc_printf("Modem: PPP CONNECT — negotiating...\r\n");
+                log_write("Modem: PPP redial CONNECT");
+            } else if (!rr.registered) {
                 cdc_printf("Modem: registration timeout — retry in 60s\r\n");
                 log_write("Modem: reconnect reg timeout");
                 vTaskDelay(pdMS_TO_TICKS(60000));
                 g_pppNeedsReconnect = true;
-                continue;  // back to data pump loop
-            }
-
-            // 5. Read RSSI + log for diagnostics
-            modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000);
-            {
-                char* p = strstr(resp, "+CSQ:");
-                if (p) {
-                    int rssi = 99;
-                    sscanf(p, "+CSQ: %d", &rssi);
-                    if (rssi != 99) g_modemRssi = rssi;
-                }
-                log_write("Reconnect: reg=OK rssi=%d op=%s", g_modemRssi, g_modemOp);
-                cdc_printf("Modem: reconnect rssi=%d op=%s\r\n", g_modemRssi, g_modemOp);
-            }
-
-            // 5b. Re-read operator name for display
-            if (modem_at_cmd("AT+COPS?", resp, sizeof(resp), 2000) > 0) {
-                char* q1 = strchr(resp, '"');
-                if (q1) {
-                    char* q2 = strchr(q1 + 1, '"');
-                    if (q2) {
-                        int olen = std::min((int)(q2 - q1 - 1), (int)sizeof(g_modemOp) - 1);
-                        memcpy(g_modemOp, q1 + 1, olen);
-                        g_modemOp[olen] = '\0';
-                    }
-                }
-            }
-
-            // 6. Re-set APN (may be lost after CFUN reset) and redial PPP
-            modem_at_cmd("AT+CGDCONT=1,\"IP\",\"hologram\"", resp, sizeof(resp), 5000);
-
-            bool redialOk = false;
-            for (int attempt = 0; attempt < 3 && !redialOk; attempt++) {
-                cdc_printf("Modem: dialing PPP (attempt %d)...\r\n", attempt + 1);
-                mdm_write("ATD*99#\r", 8);
-                int rd = mdm_read((uint8_t*)resp,
-                            sizeof(resp) - 1, 15000);
-                if (rd > 0) {
-                    resp[rd] = '\0';
-                    if (strstr(resp, "CONNECT")) {
-                        // PPP data pump will feed new modem data to esp_netif
-                        lastPppRxMs = millis();
-                        test_launched = false;
-                        redialOk = true;
-                        cdc_printf("Modem: PPP CONNECT — negotiating...\r\n");
-                        log_write("Modem: PPP redial CONNECT");
-                    } else {
-                        cdc_printf("Modem: dial failed: %.60s\r\n", resp);
-                        modem_at_cmd("ATH", resp, sizeof(resp), 2000);
-                        vTaskDelay(pdMS_TO_TICKS(5000));
-                    }
-                } else {
-                    cdc_printf("Modem: dial timeout\r\n");
-                    vTaskDelay(pdMS_TO_TICKS(5000));
-                }
-            }
-            if (!redialOk) {
+            } else {
                 log_write("Modem: reconnect failed — retry in 60s");
                 cdc_printf("Modem: reconnect failed, retry in 60s\r\n");
                 vTaskDelay(pdMS_TO_TICKS(60000));
