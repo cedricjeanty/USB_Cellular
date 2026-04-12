@@ -272,7 +272,7 @@ int main(int argc, char* argv[]) {
 
     ::mkdir(SD_ROOT, 0755);
 
-    s_modem = new SimModem();
+    s_modem = new SimModem("./emu_modem.dat");
     s_modem->operatorName = "SimOperator";
     s_modem->rssi = 22;
     s_modem->echoEnabled = false;

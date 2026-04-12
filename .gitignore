@@ -6,3 +6,4 @@ src/airbridge/__pycache__/
 tests/__pycache__/
 emu_sdcard/
 emu_nvs.dat
+emu_modem.dat

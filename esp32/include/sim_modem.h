@@ -36,7 +36,7 @@ public:
     int         regStat = 1;       // +CREG stat: 1=home, 5=roaming
     const char* operatorName = "SimOperator";
     bool        echoEnabled = true;
-    int         baudRate = 115200;  // tracks actual negotiated baud (starts at 115200, firmware upgrades)
+    int         baudRate = 115200;  // tracks actual baud (persisted via AT+IPR, like real SIM7600 NVS)
 
     // PTY file descriptors (firmware side)
     int master_fd = -1;   // simulator reads/writes this
@@ -46,7 +46,10 @@ public:
     std::atomic<bool> pppUp{false};
     char slavePath[64] = "";  // PTY slave path for firmware-side pppd
 
+    const char* nvsPath = nullptr;  // optional file to persist modem state (baud rate)
+
     SimModem() {}
+    SimModem(const char* persistPath) : nvsPath(persistPath) { loadState(); }
     ~SimModem() { stop(); }
 
     bool start() {
@@ -154,7 +157,28 @@ private:
         ::write(master_fd, resp.c_str(), resp.size());
     }
 
-    // (pppd bridge removed — PPP is now handled internally)
+    // ── Modem NVS persistence (baud rate survives restarts) ────────────
+
+    void loadState() {
+        if (!nvsPath) return;
+        FILE* f = fopen(nvsPath, "r");
+        if (!f) return;
+        char line[64];
+        while (fgets(line, sizeof(line), f)) {
+            int b;
+            if (sscanf(line, "baud=%d", &b) == 1 && b > 0) baudRate = b;
+        }
+        fclose(f);
+        printf("[SimModem] Loaded state: baud=%d\n", baudRate);
+    }
+
+    void saveState() {
+        if (!nvsPath) return;
+        FILE* f = fopen(nvsPath, "w");
+        if (!f) return;
+        fprintf(f, "baud=%d\n", baudRate);
+        fclose(f);
+    }
 
     // ── +++ escape detection ────────────────────────────────────────────
 
@@ -233,7 +257,8 @@ private:
             int newBaud = atoi(c.c_str() + 7);
             if (newBaud > 0) {
                 baudRate = newBaud;
-                printf("[SimModem] Baud rate set to %d\n", baudRate);
+                saveState();  // persist like real SIM7600 NVS
+                printf("[SimModem] Baud rate set to %d (saved)\n", baudRate);
             }
             respond("OK");
         } else if (upper.find("AT+IFC=") == 0) {
