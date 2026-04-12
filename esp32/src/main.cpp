@@ -26,6 +26,7 @@
 #include "airbridge_triggers.h"
 #include "airbridge_cli.h"
 #include "airbridge_modem.h"
+#include "airbridge_runtime.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -1941,83 +1942,42 @@ static void netDiag() {
 }
 
 // Returns: 1=updated (staged, needs reboot), 0=up to date, -1=transient error
+// OTA check — uses shared halOtaCheck() for version check + URL,
+// then ESP-IDF-specific otaDownloadAndFlash() for the actual flash.
 static int otaCheck() {
     if (!g_netConnected && !g_pppConnected) return -1;
-    if (!s3LoadCreds()) return 0;  // no creds = permanent, don't retry
-    g_tlsActive = true;  // suppress +++ for entire OTA check
+    g_tlsActive = true;
 
     log_write("OTA: checking for update (fw=%s)", FW_VERSION);
 
-    // Step 1: GET /prod/firmware — check version
-    esp_tls_t* tls = tls_connect(g_apiHost);
-    if (!tls) { log_write("OTA: TLS connect failed"); return -1; }
-    char req[512];
-    int rlen = snprintf(req, sizeof(req),
-        "GET /prod/firmware HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "x-api-key: %s\r\n"
-        "Connection: close\r\n\r\n",
-        g_apiHost, g_apiKey);
-    if (!tls_write_all(tls, req, rlen)) { tls_destroy(tls); return -1; }
-    std::string verResp = httpReadResponse(tls);
-    tls_destroy(tls);
+    // Steps 1-2: version check + download URL (shared code)
+    OtaCheckResult ota = halOtaCheck(FW_VERSION);
 
-    if (verResp.empty() || verResp.find("\"error\"") != std::string::npos) {
-        log_write("OTA: no firmware available");
-        return 0;  // server says no firmware — don't retry
+    if (ota.status == 0) {
+        log_write("OTA: up to date");
+        return 0;
+    }
+    if (ota.status < 0) {
+        log_write("OTA: check failed");
+        return -1;
     }
 
-    std::string newVer = jsonStr(verResp, "version");
-    int fwSizeInt = jsonInt(verResp, "size");
-    uint32_t fwSize = (fwSizeInt > 0) ? (uint32_t)fwSizeInt : 0;
-
-    if (newVer.empty() || !versionNewer(newVer.c_str(), FW_VERSION)) {
-        log_write("OTA: up to date (remote=%s, local=%s)", newVer.c_str(), FW_VERSION);
-        return 0;  // up to date — don't retry
-    }
-    log_write("OTA: update available %s -> %s (%lu bytes)", FW_VERSION, newVer.c_str(), (unsigned long)fwSize);
-
-    // Show on OLED
-    oled_clear();
-    oled_text(14, 0, "AirBridge", 2);
-    oled_hline(0, 127, 20);
-    char updLine[28];
-    snprintf(updLine, sizeof(updLine), "Update: v%s", newVer.c_str());
-    int uw = oled_text_width(updLine);
-    oled_text((128 - uw) / 2, 28, updLine);
-    oled_text(22, 44, "Downloading...");
-    oled_flush();
+    // Update available — show on display (shared)
+    dispOtaProgress(ota.newVersion, -1);
     g_otaActive = true;
-    strlcpy(g_otaTargetVer, newVer.c_str(), sizeof(g_otaTargetVer));
+    strlcpy(g_otaTargetVer, ota.newVersion, sizeof(g_otaTargetVer));
+    log_write("OTA: update %s -> %s (%lu bytes)", FW_VERSION, ota.newVersion, (unsigned long)ota.size);
 
-    // Step 2: GET /prod/firmware/download — get presigned URL
-    tls = tls_connect(g_apiHost);
-    if (!tls) { log_write("OTA: TLS connect failed (download)"); g_otaActive = false; return -1; }
-    rlen = snprintf(req, sizeof(req),
-        "GET /prod/firmware/download HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "x-api-key: %s\r\n"
-        "Connection: close\r\n\r\n",
-        g_apiHost, g_apiKey);
-    if (!tls_write_all(tls, req, rlen)) { tls_destroy(tls); g_otaActive = false; return -1; }
-    std::string dlResp = httpReadResponse(tls);
-    tls_destroy(tls);
-
-    std::string dlUrl = jsonStr(dlResp, "url");
-    if (dlUrl.empty()) { log_write("OTA: no download URL"); g_otaActive = false; return -1; }
-
-    // Parse S3 presigned URL
+    // Step 3: Download and flash (ESP-IDF specific)
     char s3Host[128];
     static char s3Path[2500];
-    if (!parseUrl(dlUrl, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
-        log_write("OTA: bad URL (len=%d)", (int)dlUrl.length());
+    if (!parseUrl(std::string(ota.downloadUrl), s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
+        log_write("OTA: bad URL");
         g_otaActive = false;
         return -1;
     }
-    log_write("OTA: downloading from %s path_len=%d size=%lu", s3Host, (int)strlen(s3Path), (unsigned long)fwSize);
 
-    // Step 3: Download and flash
-    if (!otaDownloadAndFlash(s3Host, s3Path, fwSize)) {
+    if (!otaDownloadAndFlash(s3Host, s3Path, ota.size)) {
         log_write("OTA: download/flash failed");
         disp("OTA FAILED", "");
         vTaskDelay(pdMS_TO_TICKS(10000));
@@ -2025,7 +1985,6 @@ static int otaCheck() {
         return -1;
     }
 
-    // Stage update: mark pending + record version. Applied on next power cycle.
     nvs_handle_t h;
     if (nvs_open("ota", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_str(h, "ota_status", "pending");
@@ -2033,7 +1992,7 @@ static int otaCheck() {
         nvs_close(h);
     }
 
-    log_write("OTA: v%s downloaded — ready to apply", newVer.c_str());
+    log_write("OTA: v%s downloaded — ready to apply", ota.newVersion);
     g_otaActive = false;
     return 1;
 }
@@ -3377,127 +3336,19 @@ static void doHarvest() {
         return;
     }
 
-    // Ensure /harvested directory exists
+    // Harvest files using shared harvestFiles() from airbridge_harvest.h
     char harvDir[64];
     snprintf(harvDir, sizeof(harvDir), "%s/harvested", SD_MOUNT);
-    mkdir(harvDir, 0755);
-
-    // Walk root directory, copy new files to /harvested/
-    // Flattens paths: /logs/data.bin -> /harvested/logs__data.bin
-    uint16_t count = 0; float usedMb = 0.0f;
-
-    // Stack-based directory walk
-    struct DirFrame { DIR* dir; char prefix[80]; char dirpath[80]; };
-    DirFrame stack[4];
-    int depth = 0;
-    snprintf(stack[0].dirpath, sizeof(stack[0].dirpath), "%s", SD_MOUNT);
-    stack[0].dir = opendir(stack[0].dirpath);
-    stack[0].prefix[0] = '\0';
-
-    cdc_printf("doHarvest: opendir(%s) = %s\r\n", stack[0].dirpath, stack[0].dir ? "ok" : "FAIL");
-    if (!stack[0].dir) {
-        cdc_printf("doHarvest: can't open root dir\r\n");
-        xSemaphoreGive(g_sd_mutex);
-        g_writeDetected = false; g_lastWriteMs = 0;
-        g_hostWasConnected = false; g_hostConnected = false;
-        g_harvesting = false;
-        g_msc_ejected = false;
-        return;
-    }
-
-    while (depth >= 0) {
-        struct dirent* ent = readdir(stack[depth].dir);
-        if (!ent) {
-            closedir(stack[depth].dir);
-            depth--;
-            continue;
-        }
-
-        const char* name = ent->d_name;
-
-        if (isSkipped(name)) continue;
-
-        char fullpath[160];
-        snprintf(fullpath, sizeof(fullpath), "%s/%s", stack[depth].dirpath, name);
-
-        struct stat st;
-        if (stat(fullpath, &st) != 0) continue;
-
-        cdc_printf("doHarvest: found '%s' %lu bytes %s\r\n", name, (unsigned long)st.st_size,
-                   S_ISDIR(st.st_mode) ? "DIR" : "FILE");
-
-        if (S_ISDIR(st.st_mode)) {
-            if (depth < 3) {
-                depth++;
-                snprintf(stack[depth].dirpath, sizeof(stack[depth].dirpath),
-                         "%s/%s", stack[depth-1].dirpath, name);
-                stack[depth].dir = opendir(stack[depth].dirpath);
-                if (!stack[depth].dir) { depth--; continue; }
-                if (stack[depth-1].prefix[0])
-                    snprintf(stack[depth].prefix, sizeof(stack[depth].prefix),
-                             "%s__%s", stack[depth-1].prefix, name);
-                else
-                    strlcpy(stack[depth].prefix, name, sizeof(stack[depth].prefix));
-            }
-            continue;
-        }
-
-        uint32_t fileBytes = st.st_size;
-        float fileMb = (float)fileBytes / 1e6f;
-        if (fileBytes == 0) continue;
-
-        // Build destination name (flatten subdirs with __)
-        char dstName[128];
-        flattenPath(stack[depth].prefix, name, dstName, sizeof(dstName));
-
-        // Skip if already uploaded (.done marker exists)
-        char donePath[192];
-        snprintf(donePath, sizeof(donePath), "%s/harvested/.done__%s", SD_MOUNT, dstName);
-        struct stat donestat;
-        if (stat(donePath, &donestat) == 0) continue;
-
-        // Skip if already pending upload (same-size copy in /harvested/)
-        char dst[192];
-        snprintf(dst, sizeof(dst), "%s/harvested/%s", SD_MOUNT, dstName);
-        struct stat dststat;
-        if (stat(dst, &dststat) == 0) {
-            if ((uint32_t)dststat.st_size == fileBytes) continue;
-            remove(dst);  // stale/wrong size — replace
-        }
-
-        // Copy file
-        FILE* sf = fopen(fullpath, "rb");
-        FILE* df = fopen(dst, "wb");
-        bool copied = false;
-        if (sf && df) {
-            static uint8_t cpbuf[8192];
-            uint32_t rem = fileBytes;
-            copied = true;
-            while (rem > 0) {
-                size_t toRead = (rem < sizeof(cpbuf)) ? rem : sizeof(cpbuf);
-                size_t n = fread(cpbuf, 1, toRead, sf);
-                if (n == 0 || fwrite(cpbuf, 1, n, df) != n) { copied = false; break; }
-                rem -= n;
-            }
-        }
-        if (sf) fclose(sf);
-        if (df) fclose(df);
-        if (!copied) { remove(dst); }
-
-        if (copied) {
-            ESP_LOGI(TAG, "Harvested: %s -> %s (%.1f MB)", fullpath, dstName, fileMb);
-            usedMb += fileMb; count++;
-        } else {
-            ESP_LOGE(TAG, "Harvest copy failed: %s", fullpath);
-        }
-    }
+    HarvestResult hr = harvestFiles(SD_MOUNT, harvDir);
+    uint16_t count = hr.count;
+    float usedMb = hr.usedMb;
 
     xSemaphoreGive(g_sd_mutex);
 
     g_filesQueued += count;
     if (count > 0) g_mbQueued += usedMb;
 
-    // Update SD used space while we have exclusive access
+    // Update SD used space
     {
         FATFS* fs;
         DWORD freeClusters;
@@ -3510,52 +3361,20 @@ static void doHarvest() {
 
     cdc_printf("doHarvest: done %u file(s) (%.1f MB)\r\n", count, usedMb);
     log_write("Harvest: %u file(s), %.1f MB", count, usedMb);
-
-    // Flush log buffer to SD while we have exclusive FATFS access
     log_flush_to_sd();
 
-    // ── Write DSU cookie (.easdf) after successful harvest ──────────────
-    // Skip if an S3 cookie override is active this session.
-    // Parse the highest flight number from harvested .eaofh filenames,
-    // then write dsuCookie.easdf so the DSU knows where to resume.
-    // Filename format: EA500.000243_01218_20260406.eaofh
-    if (count > 0 && !g_s3CookieActive) {
-        uint32_t maxFlight = 0;
-        char dsuSerial[44] = "";
-        char harvestDir[64];
-        snprintf(harvestDir, sizeof(harvestDir), "%s/harvested", SD_MOUNT);
-        DIR* hdir = opendir(harvestDir);
-        if (hdir) {
-            struct dirent* ent;
-            while ((ent = readdir(hdir)) != nullptr) {
-                const char* ext = strrchr(ent->d_name, '.');
-                if (!ext || strcmp(ext, ".eaofh") != 0) continue;
-                // Parse: flightHistory__EA500.000243_01218_20260406.eaofh
-                // or: EA500.000243_01218_20260406.eaofh
-                char serial[44] = "";
-                uint32_t fnum = 0;
-                if (parseDsuFilename(ent->d_name, serial, sizeof(serial), &fnum) && fnum > maxFlight) {
-                    maxFlight = fnum;
-                    strlcpy(dsuSerial, serial, sizeof(dsuSerial));
-                }
-            }
-            closedir(hdir);
-        }
-
-        if (maxFlight > 0 && dsuSerial[0]) {
-            uint8_t cookie[78];
-            buildDsuCookie(dsuSerial, maxFlight, cookie);
-
-            // Write to SD root
-            char cookiePath[64];
-            snprintf(cookiePath, sizeof(cookiePath), "%s/dsuCookie.easdf", SD_MOUNT);
-            FILE* cf = fopen(cookiePath, "wb");
-            if (cf) {
-                fwrite(cookie, 1, 78, cf);
-                fclose(cf);
-                log_write("Cookie: %s flight %lu", dsuSerial, (unsigned long)maxFlight);
-                cdc_printf("Cookie: %s flight %lu\r\n", dsuSerial, (unsigned long)maxFlight);
-            }
+    // Write DSU cookie using shared buildDsuCookie() from airbridge_proto.h
+    if (count > 0 && !g_s3CookieActive && hr.maxFlight > 0 && hr.dsuSerial[0]) {
+        uint8_t cookie[78];
+        buildDsuCookie(hr.dsuSerial, hr.maxFlight, cookie);
+        char cookiePath[64];
+        snprintf(cookiePath, sizeof(cookiePath), "%s/dsuCookie.easdf", SD_MOUNT);
+        FILE* cf = fopen(cookiePath, "wb");
+        if (cf) {
+            fwrite(cookie, 1, 78, cf);
+            fclose(cf);
+            log_write("Cookie: %s flight %lu", hr.dsuSerial, (unsigned long)hr.maxFlight);
+            cdc_printf("Cookie: %s flight %lu\r\n", hr.dsuSerial, (unsigned long)hr.maxFlight);
         }
     }
 
@@ -4229,53 +4048,10 @@ extern "C" void app_main(void) {
         }
     }
 
-    // ── Boot splash (10s) ──────────────────────────────────────────────
+    // ── Boot splash (10s) — uses shared dispBootSplash() ──────────────
     if (g_hal->display->ok()) {
-        // Load device ID for display
         s3LoadCreds();
-
-        oled_clear();
-        // "AirBridge" 2x: 9 chars * 12px = 108px, center: (128-108)/2 = 10
-        oled_text(10, 0, "AirBridge", 2);
-
-        // SD capacity
-        char sdLine[22];
-        char usedStr[10], totalStr[10];
-        _fmtSize(usedStr, sizeof(usedStr), g_sdUsedMb);
-        float visMb = msc_visible_sectors() * 512.0f / 1e6f;
-        _fmtSize(totalStr, sizeof(totalStr), visMb);
-        snprintf(sdLine, sizeof(sdLine), "SD %s / %s", usedStr, totalStr);
-        int sdW = strlen(sdLine) * 6;
-        oled_text((128 - sdW) / 2, 22, sdLine);
-
-        // Pending uploads
-        if (g_filesQueued > 0) {
-            char pendLine[22];
-            char qStr[10];
-            _fmtSize(qStr, sizeof(qStr), g_mbQueued);
-            snprintf(pendLine, sizeof(pendLine), "%u file(s) %s queued", g_filesQueued, qStr);
-            int pW = strlen(pendLine) * 6;
-            oled_text((128 - pW) / 2, 34, pendLine);
-        }
-
-        // Device ID
-        if (g_deviceId[0]) {
-            char idLine[22];
-            snprintf(idLine, sizeof(idLine), "ID:%s", g_deviceId);
-            int idW = strlen(idLine) * 6;
-            oled_text((128 - idW) / 2, 46, idLine);
-        }
-
-        // USB mode + firmware version
-        {
-            char modeLine[28];
-            snprintf(modeLine, sizeof(modeLine), "%s v%s",
-                     g_msc_only ? "MSC" : "CDC+MSC", FW_VERSION);
-            int mW = strlen(modeLine) * 6;
-            oled_text((128 - mW) / 2, 56, modeLine);
-        }
-
-        oled_flush();
+        dispBootSplash(FW_VERSION, g_deviceId, g_msc_only ? "MSC" : "CDC+MSC");
         vTaskDelay(pdMS_TO_TICKS(10000));
     }
     g_splashActive = false;

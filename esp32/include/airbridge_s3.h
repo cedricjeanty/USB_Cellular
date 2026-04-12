@@ -196,7 +196,9 @@ inline bool halStreamFile(TlsHandle tls, void* fileHandle, uint32_t len,
         remaining -= n;
         sent += n;
         if (progress) progress(sent, len);
-        if (throttle > 0) usleep(n * 1000000 / throttle);
+        if (throttle > 0 && g_hal->clock) {
+            g_hal->clock->delay_ms(n * 1000 / throttle);
+        }
     }
     return true;
 }

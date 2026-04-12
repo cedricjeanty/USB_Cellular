@@ -159,12 +159,12 @@ void test_updateDisplay_progress_bar_half(void) {
     // total = 50 + 50 = 100, fill = 50/100 * 126 = 63
 
     updateDisplay(ds);
-    // Progress bar outline at y=41, h=9 (rows 41-49)
-    TEST_ASSERT_TRUE(s_display.pixel_at(0, 41));   // top-left corner
-    TEST_ASSERT_TRUE(s_display.pixel_at(127, 41));  // top-right corner
-    // Fill at y=42, from x=1
-    TEST_ASSERT_TRUE(s_display.pixel_at(1, 42));    // filled region
-    TEST_ASSERT_TRUE(s_display.pixel_at(50, 42));   // still filled
+    // Progress bar outline at y=50, h=5 (rows 50-54)
+    TEST_ASSERT_TRUE(s_display.pixel_at(0, 50));    // top-left corner
+    TEST_ASSERT_TRUE(s_display.pixel_at(127, 50));  // top-right corner
+    // Fill at y=51, from x=1
+    TEST_ASSERT_TRUE(s_display.pixel_at(1, 51));    // filled region
+    TEST_ASSERT_TRUE(s_display.pixel_at(50, 51));   // still filled
 }
 
 void test_updateDisplay_eta_shown(void) {
@@ -182,7 +182,7 @@ void test_updateDisplay_eta_shown(void) {
     // Just verify something was drawn in the ETA row area (y=52-58)
     bool eta_drawn = false;
     for (int x = 64; x < 128; x++)
-        if (s_display.pixel_at(x, 52)) { eta_drawn = true; break; }
+        if (s_display.pixel_at(x, 57)) { eta_drawn = true; break; }
     TEST_ASSERT_TRUE(eta_drawn);
 }
 
