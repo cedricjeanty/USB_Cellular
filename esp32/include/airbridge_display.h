@@ -70,7 +70,7 @@ inline void updateDisplay(DisplayState& ds) {
     // Row 11: labels
     g_hal->display->text(13, 11, "USB IN");
     g_hal->display->text(78, 11, "UPLOAD");
-    for (int y = 11; y < 37; y += 2) g_hal->display->rect(63, y, 1, 1, true);
+    for (int y = 11; y < 38; y += 2) g_hal->display->rect(63, y, 1, 1, true);
 
     // Row 20: speeds
     {
@@ -91,36 +91,33 @@ inline void updateDisplay(DisplayState& ds) {
         g_hal->display->text(65 + (62 - upW) / 2, 20, upSpd);
     }
 
-    // Row 29: totals
+    // Row 30: totals (shifted down to use freed space from removed divider)
     {
         char usbTot[12], upTot[12];
         _fmtSize(usbTot, sizeof(usbTot), usbSessionMb);
         _fmtSize(upTot, sizeof(upTot), uploaded);
         int usbW = strlen(usbTot) * 6;
         int upW  = strlen(upTot) * 6;
-        g_hal->display->text((62 - usbW) / 2, 29, usbTot);
-        g_hal->display->text(65 + (62 - upW) / 2, 29, upTot);
+        g_hal->display->text((62 - usbW) / 2, 30, usbTot);
+        g_hal->display->text(65 + (62 - upW) / 2, 30, upTot);
     }
 
-    // Row 38: divider
-    g_hal->display->hline(0, 127, 38);
-
-    // Row 41: progress bar
+    // Row 39: progress bar (thin — 5px tall, no divider above)
     {
         float totalMb = uploaded + remaining;
-        g_hal->display->rect(0, 41, 128, 9, false);
+        g_hal->display->rect(0, 39, 128, 5, false);
         if (totalMb > 0.001f) {
             int fill = (int)(uploaded / totalMb * 126);
             if (fill > 126) fill = 126;
-            if (fill > 0) g_hal->display->rect(1, 42, fill, 7, true);
+            if (fill > 0) g_hal->display->rect(1, 40, fill, 3, true);
         }
     }
 
-    // Row 52: remaining + ETA
+    // Row 46: remaining + ETA
     {
         char remStr[14], etaStr[14];
         snprintf(remStr, sizeof(remStr), "REM:"); _fmtSize(remStr + 4, sizeof(remStr) - 4, remaining);
-        g_hal->display->text(0, 52, remStr);
+        g_hal->display->text(0, 46, remStr);
 
         // Smoothed speed for stable ETA (EMA alpha=0.2)
         if (ds.uploadKBps > 0.5f)
@@ -137,7 +134,7 @@ inline void updateDisplay(DisplayState& ds) {
             strlcpy(etaStr, "ETA --:--", sizeof(etaStr));
         }
         int etaW = strlen(etaStr) * 6;
-        g_hal->display->text(128 - etaW, 52, etaStr);
+        g_hal->display->text(128 - etaW, 46, etaStr);
     }
 
     g_hal->display->flush();

@@ -179,7 +179,7 @@ static void modemInitThread(DisplayState* ds) {
                     system(cmd);
 
                     strlcpy(s_net.bindAddr, "10.64.64.2", sizeof(s_net.bindAddr));
-                    s_net.maxBytesPerSec = 0;  // no app-level throttle — PTY is the bottleneck
+                    s_net.maxBytesPerSec = 100 * 1024;  // 100 KB/s matching real cellular
                     printf("[Modem] PPP up — traffic routes through PPP tunnel\n");
                     s_log.write(0, "PPP tunnel up — all traffic via cellular sim");
                     break;
@@ -188,7 +188,7 @@ static void modemInitThread(DisplayState* ds) {
             if (!ds->pppConnected) {
                 printf("[Modem] PPP interface didn't come up — falling back to direct\n");
                 ds->pppConnected = true;
-                s_net.maxBytesPerSec = 60 * 1024;
+                s_net.maxBytesPerSec = 100 * 1024;  // 100 KB/s
             }
         }
     }
@@ -229,6 +229,7 @@ static void uploadThread(DisplayState* ds) {
             printf("[S3] Upload complete: %.0f KB/s\n", r.kbps);
             markFileUploaded(harvestDir, name);
             ds->mbUploaded += fileMb;
+            if (ds->mbQueued >= fileMb) ds->mbQueued -= fileMb; else ds->mbQueued = 0;
             s_log.write(g_hal->clock->millis(), "Uploaded %s %.0f KB/s", name, r.kbps);
         } else {
             printf("[S3] Upload failed: %s\n", r.error);
