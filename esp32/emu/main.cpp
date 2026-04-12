@@ -293,8 +293,8 @@ int main(int argc, char* argv[]) {
     printf("AirBridge Emulator — device_id=%s\n", deviceId);
     printf("Virtual SD card: %s/\n", SD_ROOT);
     printf("NVS storage:     ./emu_nvs.dat\n\n");
-    printf("Keys: C=cellular  H=harvest  P=upload  O=OTA-check  T=test-AT\n");
-    printf("      I=status  U=usb-write  S=step  R=reset  Q=quit\n\n");
+    printf("Auto: modem init → OTA check → file detect → harvest → upload\n");
+    printf("Keys: I=status  T=test-AT  C=toggle-net  R=reset  Q=quit\n\n");
     fflush(stdout);
     setbuf(stdout, nullptr);  // disable buffering for real-time output
     s_log.clear();
@@ -324,6 +324,10 @@ int main(int argc, char* argv[]) {
     if (!renderer)
         renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
 
+    // ── OTA check (like uploadTask does first after network) ────────
+    // Wait for modem init in a non-blocking way
+    static bool otaChecked = false;
+
     // Check for pending uploads from previous session (like real uploadTask does on boot)
     {
         char harvestDir[256];
@@ -352,7 +356,20 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Boot splash (same as firmware app_main — holds for 5s)
     bool running = true;
+    {
+        char devId[16] = "";
+        s_nvs.get_str("s3", "device_id", devId, sizeof(devId));
+        dispBootSplash(FW_VERSION, devId[0] ? devId : deviceId);
+        renderFramebuffer(renderer);
+        uint32_t splashEnd = SDL_GetTicks() + 5000;
+        while (SDL_GetTicks() < splashEnd && running) {
+            SDL_Event ev;
+            while (SDL_PollEvent(&ev)) { if (ev.type == SDL_QUIT) running = false; }
+            SDL_Delay(100);
+        }
+    }
     while (running) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
@@ -470,6 +487,30 @@ int main(int argc, char* argv[]) {
 
         // ── Automated pipeline (mirrors main_loop_task) ─────────────
         uint32_t now = g_hal->clock->millis();
+
+        // OTA check — runs once after modem connects (same as firmware uploadTask)
+        if (!otaChecked && s_modemInitDone && ds.pppConnected) {
+            otaChecked = true;
+            printf("[OTA] Checking for firmware update (current=%s)...\n", FW_VERSION);
+            dispOtaProgress("?.?.?", -1);  // show "Checking..." screen
+            renderFramebuffer(renderer);
+
+            OtaCheckResult ota = halOtaCheck(FW_VERSION);
+            if (ota.status == 1) {
+                printf("[OTA] Update available: v%s (%u bytes)\n", ota.newVersion, ota.size);
+                dispOtaProgress(ota.newVersion, 0);
+                renderFramebuffer(renderer);
+                s_log.write(now, "OTA: v%s available (%u bytes)", ota.newVersion, ota.size);
+                // Show for 3 seconds then continue (real device would download+flash)
+                SDL_Delay(3000);
+            } else if (ota.status == 0) {
+                printf("[OTA] Up to date\n");
+                s_log.write(now, "OTA: up to date");
+            } else {
+                printf("[OTA] Check failed (network error)\n");
+                s_log.write(now, "OTA: check failed");
+            }
+        }
 
         // Auto-upload pending files after modem connects (boot resume)
         static bool bootUploadChecked = false;

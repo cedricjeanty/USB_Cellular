@@ -140,6 +140,59 @@ inline void updateDisplay(DisplayState& ds) {
     g_hal->display->flush();
 }
 
+// Boot splash screen — shows version, device ID, pending uploads
+inline void dispBootSplash(const char* fwVersion, const char* deviceId,
+                            const char* usbMode = "CDC+MSC") {
+    g_hal->display->clear();
+    g_hal->display->text(10, 0, "AirBridge", 2);
+
+    // Device ID
+    if (deviceId && deviceId[0]) {
+        char idLine[22];
+        snprintf(idLine, sizeof(idLine), "ID:%s", deviceId);
+        int idW = strlen(idLine) * 6;
+        g_hal->display->text((128 - idW) / 2, 28, idLine);
+    }
+
+    // USB mode + version
+    {
+        char modeLine[28];
+        snprintf(modeLine, sizeof(modeLine), "%s v%s", usbMode, fwVersion);
+        int mW = strlen(modeLine) * 6;
+        g_hal->display->text((128 - mW) / 2, 46, modeLine);
+    }
+
+    g_hal->display->flush();
+}
+
+// OTA update display — shows version being downloaded + progress
+inline void dispOtaProgress(const char* newVersion, int pct) {
+    g_hal->display->clear();
+    g_hal->display->text(10, 0, "AirBridge", 2);
+    g_hal->display->hline(0, 127, 20);
+
+    char updLine[24];
+    snprintf(updLine, sizeof(updLine), "Update: v%s", newVersion);
+    int uw = g_hal->display->text_width(updLine);
+    g_hal->display->text((128 - uw) / 2, 24, updLine);
+
+    if (pct >= 0) {
+        // Progress bar
+        g_hal->display->rect(4, 38, 120, 8, false);
+        int fill = pct * 116 / 100;
+        if (fill > 0) g_hal->display->rect(6, 40, fill, 4, true);
+
+        char pctStr[8];
+        snprintf(pctStr, sizeof(pctStr), "%d%%", pct);
+        int pw = strlen(pctStr) * 6;
+        g_hal->display->text((128 - pw) / 2, 50, pctStr);
+    } else {
+        g_hal->display->text(22, 38, "Checking...");
+    }
+
+    g_hal->display->flush();
+}
+
 // Simple two-line splash/status display
 inline void dispSplash(const char* line1, const char* line2 = nullptr) {
     g_hal->display->clear();
