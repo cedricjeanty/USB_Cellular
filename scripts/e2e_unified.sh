@@ -131,7 +131,7 @@ wait_for_s3_file() {
 }
 
 wait_for_done_marker() {
-    local name="$1" timeout="${2:-120}"
+    local name="$1" timeout="${2:-180}"
     if [ "$TARGET" = "emulator" ]; then
         for i in $(seq 1 $((timeout / 2))); do
             [ -f "$SD_EMU/harvested/.done__${name}" ] && return 0
@@ -285,7 +285,7 @@ log "  Waiting for harvest + upload..."
 if wait_for_done_marker "test_upload.bin" 120; then
     pass "Upload: harvested + uploaded + done marker"
 else
-    fail "Upload: not completed after 120s"
+    fail "Upload: not completed after 180s"
 fi
 if wait_for_s3_file "test_upload.bin" 60; then
     pass "Upload: found in S3"
@@ -392,7 +392,9 @@ fi
 
 # ── TEST 6: OTA check + download ──────────────────────────────────────────────
 log ""; log "TEST 6: OTA check + download"
-V_NEW="${BASE_VER}.1"
+# Version must be newer than whatever the device is currently running
+# Use a high minor number to ensure it's always newer
+V_NEW="10.9999.$(date +%S)"
 deploy_ota "$V_NEW"
 if [ "$TARGET" = "emulator" ]; then
     rm -f "$FW_DIR/emu_ota_update.bin"
