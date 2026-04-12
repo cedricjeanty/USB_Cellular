@@ -334,6 +334,116 @@ void test_ppp_echo_reply(void) {
     teardownModem();
 }
 
+void test_ppp_full_negotiation(void) {
+    setupModem();
+    sendAT("ATD*99#");
+    usleep(500000);
+
+    // === LCP negotiation ===
+    // Send our LCP Conf-Req
+    uint8_t lcpReq[] = { PPP_CONF_REQ, 0x01, 0x00, 0x04 };
+    auto frame = ppp_build_frame(PPP_LCP, lcpReq, sizeof(lcpReq));
+    ::write(mdm->slave_fd, frame.data(), frame.size());
+    usleep(300000);
+
+    // Read and ACK SimModem's LCP Conf-Req
+    uint8_t buf[2048];
+    int total = 0;
+    for (int i = 0; i < 10; i++) {
+        struct pollfd pfd = { mdm->slave_fd, POLLIN, 0 };
+        if (poll(&pfd, 1, 100) > 0) {
+            int n = ::read(mdm->slave_fd, buf + total, sizeof(buf) - total);
+            if (n > 0) total += n;
+        }
+    }
+
+    // Find and ACK SimModem's LCP Conf-Req
+    for (int i = 0; i < total; i++) {
+        if (buf[i] == 0x7E) {
+            uint16_t proto;
+            std::vector<uint8_t> payload;
+            if (ppp_parse_frame(buf + i, total - i, &proto, &payload)) {
+                if (proto == PPP_LCP && payload.size() >= 1 && payload[0] == PPP_CONF_REQ) {
+                    auto ack = ppp_build_conf_ack(payload[1], payload.data() + 4, payload.size() - 4);
+                    auto ackFrame = ppp_build_frame(PPP_LCP, ack.data(), ack.size());
+                    ::write(mdm->slave_fd, ackFrame.data(), ackFrame.size());
+                }
+            }
+        }
+    }
+    usleep(200000);
+
+    // === IPCP negotiation ===
+    // Request IP 0.0.0.0 → SimModem NAKs with 10.64.64.2
+    uint8_t ipcpReq1[] = { PPP_CONF_REQ, 0x01, 0x00, 0x0A,
+                           IPCP_OPT_IP_ADDR, 6, 0, 0, 0, 0 };
+    auto ipcpFrame1 = ppp_build_frame(PPP_IPCP, ipcpReq1, sizeof(ipcpReq1));
+    ::write(mdm->slave_fd, ipcpFrame1.data(), ipcpFrame1.size());
+    usleep(300000);
+
+    // Drain NAK + SimModem's IPCP Conf-Req
+    total = 0;
+    for (int i = 0; i < 10; i++) {
+        struct pollfd pfd = { mdm->slave_fd, POLLIN, 0 };
+        if (poll(&pfd, 1, 100) > 0) {
+            int n = ::read(mdm->slave_fd, buf + total, sizeof(buf) - total);
+            if (n > 0) total += n;
+        }
+    }
+
+    // ACK SimModem's IPCP Conf-Req
+    for (int i = 0; i < total; i++) {
+        if (buf[i] == 0x7E) {
+            uint16_t proto;
+            std::vector<uint8_t> payload;
+            if (ppp_parse_frame(buf + i, total - i, &proto, &payload)) {
+                if (proto == PPP_IPCP && payload.size() >= 1 && payload[0] == PPP_CONF_REQ) {
+                    auto ack = ppp_build_conf_ack(payload[1], payload.data() + 4, payload.size() - 4);
+                    auto ackFrame = ppp_build_frame(PPP_IPCP, ack.data(), ack.size());
+                    ::write(mdm->slave_fd, ackFrame.data(), ackFrame.size());
+                }
+            }
+        }
+    }
+    usleep(200000);
+
+    // Now send Conf-Req with the assigned IP (10.64.64.2)
+    uint8_t ipcpReq2[] = { PPP_CONF_REQ, 0x02, 0x00, 0x0A,
+                           IPCP_OPT_IP_ADDR, 6, 10, 64, 64, 2 };
+    auto ipcpFrame2 = ppp_build_frame(PPP_IPCP, ipcpReq2, sizeof(ipcpReq2));
+    ::write(mdm->slave_fd, ipcpFrame2.data(), ipcpFrame2.size());
+    usleep(300000);
+
+    // Read response — should be IPCP Conf-Ack
+    total = 0;
+    for (int i = 0; i < 10; i++) {
+        struct pollfd pfd = { mdm->slave_fd, POLLIN, 0 };
+        if (poll(&pfd, 1, 100) > 0) {
+            int n = ::read(mdm->slave_fd, buf + total, sizeof(buf) - total);
+            if (n > 0) total += n;
+        }
+    }
+
+    bool gotIpcpAck = false;
+    for (int i = 0; i < total; i++) {
+        if (buf[i] == 0x7E) {
+            uint16_t proto;
+            std::vector<uint8_t> payload;
+            if (ppp_parse_frame(buf + i, total - i, &proto, &payload)) {
+                if (proto == PPP_IPCP && payload.size() >= 1 && payload[0] == PPP_CONF_ACK) {
+                    gotIpcpAck = true;
+                }
+            }
+        }
+    }
+    TEST_ASSERT_TRUE(gotIpcpAck);
+
+    // Verify PPP link is fully up
+    TEST_ASSERT_TRUE(mdm->pppUp);
+
+    teardownModem();
+}
+
 // ── Test runner ─────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -361,6 +471,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_ppp_lcp_negotiation);
     RUN_TEST(test_ppp_ipcp_assigns_ip);
     RUN_TEST(test_ppp_echo_reply);
+    RUN_TEST(test_ppp_full_negotiation);
 
     return UNITY_END();
 }

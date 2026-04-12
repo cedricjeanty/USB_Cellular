@@ -17,6 +17,10 @@
 #include <termios.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <net/if.h>
+#include <linux/if_tun.h>
+#include <sys/ioctl.h>
+#include <arpa/inet.h>
 
 #if !defined(ESP_PLATFORM)
 #include <pty.h>
@@ -75,6 +79,7 @@ public:
     void stop() {
         running_ = false;
         if (thread_.joinable()) thread_.join();
+        closeTun();
         if (master_fd >= 0) { close(master_fd); master_fd = -1; }
         if (slave_fd >= 0) { close(slave_fd); slave_fd = -1; }
     }
@@ -94,6 +99,41 @@ private:
     // PPP frame accumulator
     std::vector<uint8_t> pppBuf_;
     bool inFrame_ = false;
+
+    // TUN device for IP routing
+    int tun_fd_ = -1;
+    char tunName_[IFNAMSIZ] = "";
+
+    bool openTun() {
+        tun_fd_ = open("/dev/net/tun", O_RDWR | O_NONBLOCK);
+        if (tun_fd_ < 0) { perror("[SimModem] open /dev/net/tun"); return false; }
+
+        struct ifreq ifr = {};
+        ifr.ifr_flags = IFF_TUN | IFF_NO_PI;  // TUN device, no packet info header
+        if (ioctl(tun_fd_, TUNSETIFF, &ifr) < 0) {
+            perror("[SimModem] TUNSETIFF");
+            close(tun_fd_); tun_fd_ = -1;
+            return false;
+        }
+        strlcpy(tunName_, ifr.ifr_name, sizeof(tunName_));
+
+        // Configure the TUN interface: assign IP, bring up, add route
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "sudo ip addr add 10.64.64.1/24 dev %s 2>/dev/null", tunName_);
+        system(cmd);
+        snprintf(cmd, sizeof(cmd), "sudo ip link set %s up", tunName_);
+        system(cmd);
+        // NAT: masquerade traffic from TUN to the internet
+        system("sudo iptables -t nat -C POSTROUTING -s 10.64.64.0/24 -j MASQUERADE 2>/dev/null || "
+               "sudo iptables -t nat -A POSTROUTING -s 10.64.64.0/24 -j MASQUERADE");
+
+        printf("[SimModem] TUN device %s created (10.64.64.1/24)\n", tunName_);
+        return true;
+    }
+
+    void closeTun() {
+        if (tun_fd_ >= 0) { close(tun_fd_); tun_fd_ = -1; }
+    }
 
     // AT command buffer
     std::string cmdBuf_;
@@ -325,6 +365,8 @@ private:
         } else if (code == PPP_CONF_ACK) {
             ipcpUp_ = true;
             printf("[SimModem] IPCP up — PPP link established\n");
+            // Open TUN device for IP routing
+            if (tun_fd_ < 0) openTun();
         } else if (code == PPP_CONF_NAK) {
             // Peer NAKed our config — update and retry
             // (usually means peer wants different IP options)
@@ -333,9 +375,10 @@ private:
     }
 
     void handleIpPacket(const std::vector<uint8_t>& payload) {
-        // IP data received from peer. In Step 2, this goes to a TUN device.
-        // For now, just count bytes.
-        (void)payload;
+        // Write IP packet to TUN device for routing to the internet
+        if (tun_fd_ >= 0 && payload.size() > 0) {
+            ::write(tun_fd_, payload.data(), payload.size());
+        }
     }
 
     // ── Main loop ───────────────────────────────────────────────────────
@@ -367,10 +410,20 @@ private:
                         }
                     }
                 }
+                // Read IP packets from TUN → wrap in PPP → send to firmware
+                if (tun_fd_ >= 0 && ipcpUp_) {
+                    uint8_t tunBuf[1500];
+                    int tn = ::read(tun_fd_, tunBuf, sizeof(tunBuf));
+                    if (tn > 0) {
+                        sendPppFrame(PPP_IP, std::vector<uint8_t>(tunBuf, tunBuf + tn));
+                    }
+                }
+
                 if (gotEscapePlus_ && (now_ms() - lastPlusMs_) > 500) {
                     dataMode_ = false;
                     lcpUp_ = false;
                     ipcpUp_ = false;
+                    closeTun();
                     gotEscapePlus_ = false;
                     plusCount_ = 0;
                     respond("OK");
