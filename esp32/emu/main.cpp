@@ -179,11 +179,20 @@ static void modemInitThread(DisplayState* ds) {
                         "sudo ip rule add from 10.64.64.2 table 100 priority 100");
                     int rc = system(cmd);
 
-                    // Don't bind to PPP IP — SimModem TUN can't relay real traffic.
-                    // The PPP sim is for protocol testing; uploads use default interface.
                     (void)rc;
                     s_net.maxBytesPerSec = 100 * 1024;  // 100 KB/s matching real cellular
-                    printf("[Modem] PPP up — uploads via default interface (throttled to cellular speed)\n");
+
+                    // Wait briefly for SimModem TUN to be ready (IPCP triggers openTun)
+                    for (int t = 0; t < 20 && s_modem && !s_modem->tunReady(); t++)
+                        usleep(100000);
+
+                    if (s_modem && s_modem->tunReady()) {
+                        // Route uploads through PPP → SimModem → TUN → internet
+                        strlcpy(s_net.bindAddr, "10.64.64.2", sizeof(s_net.bindAddr));
+                        printf("[Modem] PPP up — uploads route through SimModem TUN\n");
+                    } else {
+                        printf("[Modem] PPP up — TUN not available, uploads via direct internet\n");
+                    }
                     s_log.write(0, "PPP tunnel up — all traffic via cellular sim");
                     break;
                 }

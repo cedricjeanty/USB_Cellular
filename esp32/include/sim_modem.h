@@ -47,6 +47,9 @@ public:
     std::atomic<bool> pppUp{false};
     char slavePath[64] = "";  // PTY slave path for firmware-side pppd
 
+    // TUN state (check after IPCP completes)
+    bool tunReady() const { return tun_fd_ >= 0; }
+
     const char* nvsPath = nullptr;  // optional file to persist modem state (baud rate)
 
     SimModem() {}
@@ -109,11 +112,18 @@ private:
     char tunName_[IFNAMSIZ] = "";
 
     bool openTun() {
+        // Create persistent TUN device owned by current user (requires sudo)
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd),
+            "sudo ip tuntap add dev tun_emu mode tun user %d 2>/dev/null", getuid());
+        system(cmd);
+
         tun_fd_ = open("/dev/net/tun", O_RDWR | O_NONBLOCK);
         if (tun_fd_ < 0) { perror("[SimModem] open /dev/net/tun"); return false; }
 
         struct ifreq ifr = {};
-        ifr.ifr_flags = IFF_TUN | IFF_NO_PI;  // TUN device, no packet info header
+        ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+        strncpy(ifr.ifr_name, "tun_emu", IFNAMSIZ);
         if (ioctl(tun_fd_, TUNSETIFF, &ifr) < 0) {
             perror("[SimModem] TUNSETIFF");
             close(tun_fd_); tun_fd_ = -1;
@@ -121,22 +131,20 @@ private:
         }
         strlcpy(tunName_, ifr.ifr_name, sizeof(tunName_));
 
-        // Configure the TUN interface: assign IP, bring up, add route
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "sudo ip addr add 10.64.64.1/24 dev %s 2>/dev/null", tunName_);
-        system(cmd);
-        snprintf(cmd, sizeof(cmd), "sudo ip link set %s up", tunName_);
-        system(cmd);
-        // NAT: masquerade traffic from TUN to the internet
+        // Configure IP, bring up, enable forwarding, NAT
+        system("sudo ip addr add 10.64.64.1/24 dev tun_emu 2>/dev/null");
+        system("sudo ip link set tun_emu up");
+        system("sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1");
         system("sudo iptables -t nat -C POSTROUTING -s 10.64.64.0/24 -j MASQUERADE 2>/dev/null || "
                "sudo iptables -t nat -A POSTROUTING -s 10.64.64.0/24 -j MASQUERADE");
 
-        printf("[SimModem] TUN device %s created (10.64.64.1/24)\n", tunName_);
+        printf("[SimModem] TUN device %s created (10.64.64.1/24, NAT enabled)\n", tunName_);
         return true;
     }
 
     void closeTun() {
         if (tun_fd_ >= 0) { close(tun_fd_); tun_fd_ = -1; }
+        system("sudo ip tuntap del dev tun_emu mode tun 2>/dev/null");
     }
 
     // AT command buffer
