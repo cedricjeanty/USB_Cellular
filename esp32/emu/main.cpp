@@ -17,7 +17,7 @@
 //   R       Reset display state
 //   Q/Esc   Quit
 
-#define FW_VERSION "10.2001.7"
+#define FW_VERSION "20260412160000"
 
 #include <SDL2/SDL.h>
 #include <cstdio>
@@ -177,11 +177,13 @@ static void modemInitThread(DisplayState* ds) {
                         "PPP_IF=$(ip -o addr show | grep 10.64.64.2 | awk '{print $2}') && "
                         "sudo ip route add default dev $PPP_IF table 100 && "
                         "sudo ip rule add from 10.64.64.2 table 100 priority 100");
-                    system(cmd);
+                    int rc = system(cmd);
 
-                    strlcpy(s_net.bindAddr, "10.64.64.2", sizeof(s_net.bindAddr));
+                    // Don't bind to PPP IP — SimModem TUN can't relay real traffic.
+                    // The PPP sim is for protocol testing; uploads use default interface.
+                    (void)rc;
                     s_net.maxBytesPerSec = 100 * 1024;  // 100 KB/s matching real cellular
-                    printf("[Modem] PPP up — traffic routes through PPP tunnel\n");
+                    printf("[Modem] PPP up — uploads via default interface (throttled to cellular speed)\n");
                     s_log.write(0, "PPP tunnel up — all traffic via cellular sim");
                     break;
                 }
@@ -214,27 +216,27 @@ static void uploadThread(DisplayState* ds) {
     snprintf(harvestDir, sizeof(harvestDir), "%s/harvested", SD_ROOT);
     printf("[S3] Upload thread started — %s\n", harvestDir);
 
-    char name[64];
-    while (findNextUploadFile(harvestDir, name, sizeof(name))) {
-        char fullpath[192];
-        snprintf(fullpath, sizeof(fullpath), "%s/%s", harvestDir, name);
+    char relPath[128];
+    while (findNextUploadFile(harvestDir, relPath, sizeof(relPath))) {
+        char fullpath[256];
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", harvestDir, relPath);
         uint32_t sz = 0; bool isDir = false;
         g_hal->filesys->stat(fullpath, &sz, &isDir);
         float fileMb = sz / 1e6f;
-        printf("[S3] Uploading %s (%.1f MB)...\n", name, fileMb);
+        printf("[S3] Uploading %s (%.1f MB)...\n", relPath, fileMb);
         ds->uploadingMb = 0;
 
-        UploadResult r = halS3UploadFile(fullpath, name, uploadProgressCb);
+        UploadResult r = halS3UploadFile(fullpath, relPath, uploadProgressCb);
         ds->uploadingMb = 0;
         if (r.success) {
             printf("[S3] Upload complete: %.0f KB/s\n", r.kbps);
-            markFileUploaded(harvestDir, name);
+            markFileUploaded(harvestDir, relPath);
             ds->mbUploaded += fileMb;
             if (ds->mbQueued >= fileMb) ds->mbQueued -= fileMb; else ds->mbQueued = 0;
-            s_log.write(g_hal->clock->millis(), "Uploaded %s %.0f KB/s", name, r.kbps);
+            s_log.write(g_hal->clock->millis(), "Uploaded %s %.0f KB/s", relPath, r.kbps);
         } else {
             printf("[S3] Upload failed: %s\n", r.error);
-            s_log.write(g_hal->clock->millis(), "Upload FAIL %s: %s", name, r.error);
+            s_log.write(g_hal->clock->millis(), "Upload FAIL %s: %s", relPath, r.error);
             break;
         }
     }
@@ -329,30 +331,35 @@ int main(int argc, char* argv[]) {
     // Wait for modem init in a non-blocking way
     static bool otaChecked = false;
 
-    // Check for pending uploads from previous session (like real uploadTask does on boot)
+    // Check for pending uploads from previous session (scan subfolders)
     {
         char harvestDir[256];
         snprintf(harvestDir, sizeof(harvestDir), "%s/harvested", SD_ROOT);
-        char pendingName[64];
-        if (findNextUploadFile(harvestDir, pendingName, sizeof(pendingName))) {
-            printf("[Boot] Found pending upload: %s — will upload after modem init\n", pendingName);
+        char pendingRel[128];
+        if (findNextUploadFile(harvestDir, pendingRel, sizeof(pendingRel))) {
+            printf("[Boot] Found pending upload: %s — will upload after modem init\n", pendingRel);
             ds.mbQueued = 0;
-            // Count pending files
-            void* dir = g_hal->filesys->opendir(harvestDir);
-            if (dir) {
-                FsDirEntry ent;
-                while (g_hal->filesys->readdir(dir, &ent)) {
-                    if (ent.name[0] == '.') continue;
-                    char dp[256];
-                    snprintf(dp, sizeof(dp), "%s/.done__%s", harvestDir, ent.name);
-                    if (!g_hal->filesys->exists(dp)) {
+            // Count pending files across all subfolders
+            void* topDir = g_hal->filesys->opendir(harvestDir);
+            if (topDir) {
+                FsDirEntry subEnt;
+                while (g_hal->filesys->readdir(topDir, &subEnt)) {
+                    if (!subEnt.is_dir || subEnt.name[0] == '.') continue;
+                    char subPath[256];
+                    snprintf(subPath, sizeof(subPath), "%s/%s", harvestDir, subEnt.name);
+                    void* subDir = g_hal->filesys->opendir(subPath);
+                    if (!subDir) continue;
+                    FsDirEntry ent;
+                    while (g_hal->filesys->readdir(subDir, &ent)) {
+                        if (ent.is_dir || ent.name[0] == '.') continue;
                         uint32_t sz = 0; bool isDir = false;
-                        char fp[256]; snprintf(fp, sizeof(fp), "%s/%s", harvestDir, ent.name);
+                        char fp[256]; snprintf(fp, sizeof(fp), "%s/%s", subPath, ent.name);
                         if (g_hal->filesys->stat(fp, &sz, &isDir) && !isDir)
                             ds.mbQueued += sz / 1e6f;
                     }
+                    g_hal->filesys->closedir(subDir);
                 }
-                g_hal->filesys->closedir(dir);
+                g_hal->filesys->closedir(topDir);
             }
         }
     }
@@ -392,8 +399,12 @@ int main(int argc, char* argv[]) {
                     printf("Harvesting from %s/ ...\n", SD_ROOT);
                     char destDir[256];
                     snprintf(destDir, sizeof(destDir), "%s/harvested", SD_ROOT);
-                    HarvestResult r = harvestFiles(SD_ROOT, destDir);
-                    printf("Harvested: %u file(s), %.1f MB\n", r.count, r.usedMb);
+                    uint32_t hnum = 0;
+                    g_hal->nvs->get_u32("harvest", "count", &hnum);
+                    hnum++;
+                    g_hal->nvs->set_u32("harvest", "count", hnum);
+                    HarvestResult r = harvestFiles(SD_ROOT, destDir, (uint16_t)hnum);
+                    printf("Harvested: %u file(s), %.1f MB → %s\n", r.count, r.usedMb, r.folder);
                     ds.mbQueued += r.usedMb;
                     break;
                 }
@@ -545,7 +556,7 @@ int main(int argc, char* argv[]) {
 
         // Auto-upload pending files after modem connects (boot resume)
         static bool bootUploadChecked = false;
-        if (!bootUploadChecked && s_modemInitDone && ds.pppConnected && ds.mbQueued > 0.001f && !s_uploading) {
+        if (!bootUploadChecked && s_modemInitDone && ds.pppConnected && ds.mbQueued > 0.0f && !s_uploading) {
             bootUploadChecked = true;
             printf("[Boot] Starting upload of pending files (%.1f MB)\n", ds.mbQueued);
             s_uploading = true;
@@ -628,8 +639,12 @@ int main(int argc, char* argv[]) {
 
             char destDir[256];
             snprintf(destDir, sizeof(destDir), "%s/harvested", SD_ROOT);
-            HarvestResult r = harvestFiles(SD_ROOT, destDir);
-            printf("[Harvest] Done: %u file(s), %.1f MB\n", r.count, r.usedMb);
+            uint32_t hnum = 0;
+            g_hal->nvs->get_u32("harvest", "count", &hnum);
+            hnum++;
+            g_hal->nvs->set_u32("harvest", "count", hnum);
+            HarvestResult r = harvestFiles(SD_ROOT, destDir, (uint16_t)hnum);
+            printf("[Harvest] Done: %u file(s), %.1f MB → %s\n", r.count, r.usedMb, r.folder);
             ds.mbQueued += r.usedMb;
 
             // Write DSU cookie if flight history files were harvested

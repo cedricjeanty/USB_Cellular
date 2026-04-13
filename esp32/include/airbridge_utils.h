@@ -26,6 +26,13 @@ inline size_t strlcpy(char* dst, const char* src, size_t sz) {
 
 // ── Version comparison ──────────────────────────────────────────────────────
 inline bool versionNewer(const char* available, const char* current) {
+    // YYYYMMDDHHMMSS format (14+ digits) — compare as integer
+    if (strlen(available) >= 14 && strlen(current) >= 14 &&
+        available[0] >= '0' && available[0] <= '9' &&
+        current[0] >= '0' && current[0] <= '9') {
+        return strtoull(available, nullptr, 10) > strtoull(current, nullptr, 10);
+    }
+    // Legacy X.Y.Z semver fallback
     int av[3] = {0,0,0}, cv[3] = {0,0,0};
     sscanf(available, "%d.%d.%d", &av[0], &av[1], &av[2]);
     sscanf(current,   "%d.%d.%d", &cv[0], &cv[1], &cv[2]);
@@ -42,10 +49,16 @@ inline std::string jsonStr(const std::string& json, const char* key) {
     if (pos == std::string::npos) return "";
     size_t colon = json.find(':', pos);
     if (colon == std::string::npos) return "";
-    size_t q1 = json.find('"', colon + 1);
-    if (q1 == std::string::npos) {
-        if (json.find("null", colon + 1) != std::string::npos) return "";
-        return "";
+    // Skip whitespace after colon
+    size_t valStart = colon + 1;
+    while (valStart < json.size() && json[valStart] == ' ') valStart++;
+    // Check for null before looking for quotes
+    if (json.compare(valStart, 4, "null") == 0) return "";
+    size_t q1 = json.find('"', valStart);
+    if (q1 == std::string::npos) return "";
+    // Make sure the quote is the value, not the next key (no comma between colon and quote)
+    for (size_t i = valStart; i < q1; i++) {
+        if (json[i] == ',' || json[i] == '}') return "";
     }
     size_t q2 = json.find('"', q1 + 1);
     if (q2 == std::string::npos) return "";
@@ -134,7 +147,7 @@ namespace {
 const char* const SKIP_NAMES[] = {
     "System Volume Information", "desktop.ini", "Thumbs.db",
     ".Spotlight-V100", ".Trashes", ".fseventsd", "harvested",
-    "airbridge.log", nullptr
+    "airbridge.log", "dsuCookie.easdf", nullptr
 };
 }
 

@@ -16,6 +16,7 @@ inline std::string halHttpReadResponse(TlsHandle tls, char* etag = nullptr, size
     bool chunked = false;
     char linebuf[512];
 
+    int statusCode = 0;
     // Read headers line by line
     while (true) {
         int pos = 0;
@@ -27,6 +28,12 @@ inline std::string halHttpReadResponse(TlsHandle tls, char* etag = nullptr, size
             if (c == '\n') break;
         }
         linebuf[pos] = '\0';
+
+        // Parse HTTP status code from first line
+        if (statusCode == 0 && strncmp(linebuf, "HTTP/", 5) == 0) {
+            const char* sp = strchr(linebuf, ' ');
+            if (sp) statusCode = atoi(sp + 1);
+        }
 
         if (strstr(linebuf, "chunked")) chunked = true;
 
@@ -47,6 +54,7 @@ inline std::string halHttpReadResponse(TlsHandle tls, char* etag = nullptr, size
         if (pos <= 2 && (linebuf[0] == '\r' || linebuf[0] == '\n')) break;
     }
 done_headers:
+    (void)statusCode;
 
     // Read body
     std::string raw;

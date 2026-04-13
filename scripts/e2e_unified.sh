@@ -48,7 +48,8 @@ start_device() {
         mkdir -p "$SD_EMU"
         rm -f "$FW_DIR/emu_ota_update.bin"  # prevent stale OTA downloads
         cd "$FW_DIR"
-        : >> /tmp/emu_e2e.log
+        # Truncate log before each start so we don't match old "Init complete"
+        : > /tmp/emu_e2e.log
         $EMU "$DEVICE" >>/tmp/emu_e2e.log 2>&1 &
         EMU_PID=$!
         for i in $(seq 1 30); do
@@ -132,7 +133,6 @@ write_test_file() {
         done
         [ -n "$sddev" ] || { log "  WARN: no USB drive"; return 1; }
         sudo mount -o noatime "$sddev" /mnt 2>/dev/null || return 1
-        sudo rm -f "/mnt/harvested/.done__$name" "/mnt/harvested/$name" 2>/dev/null
         sudo dd if=/dev/urandom of="/mnt/$name" bs=1M count="$size_mb" 2>/dev/null
         sync; sudo umount /mnt 2>/dev/null
         log "  Wrote $name (${size_mb}MB) to USB drive"
@@ -144,23 +144,25 @@ wait_for_s3_file() {
     local t=0
     while [ $t -lt $timeout ]; do
         sleep 5; t=$((t + 5))
-        if aws s3 ls "s3://$BUCKET/$DEVICE/$key" 2>/dev/null | grep -q "20"; then return 0; fi
+        if aws s3 ls "s3://$BUCKET/$DEVICE/" --recursive 2>/dev/null | grep -q "$key"; then return 0; fi
         [ $((t % 30)) -eq 0 ] && log "  ${t}s: waiting for $key..."
     done
     return 1
 }
 
-wait_for_done_marker() {
-    local name="$1" timeout="${2:-180}"
-    if [ "$TARGET" = "emulator" ]; then
-        for i in $(seq 1 $((timeout / 2))); do
-            [ -f "$SD_EMU/harvested/.done__${name}" ] && return 0
-            sleep 2
-        done
-        return 1
-    else
-        wait_for_s3_file "$name" "$timeout"
-    fi
+# Wait for a file to be uploaded: check S3 for the key pattern (recursive).
+# S3 keys are now DEVICE/NNNN/filename due to subfolder harvest.
+wait_for_upload() {
+    local s3_pattern="$1" timeout="${2:-180}"
+    local t=0
+    while [ $t -lt $timeout ]; do
+        sleep 5; t=$((t + 5))
+        if aws s3 ls "s3://$BUCKET/$DEVICE/" --recursive 2>/dev/null | grep -q "$s3_pattern"; then
+            return 0
+        fi
+        [ $((t % 30)) -eq 0 ] && log "  ${t}s: waiting for $s3_pattern in S3..."
+    done
+    return 1
 }
 
 get_fw_version() {
@@ -178,7 +180,7 @@ for port in ports:
         s = serial.Serial(port, 115200, timeout=3)
         s.write(b'STATUS\r\n'); time.sleep(2)
         data = s.read(4096).decode(errors='replace'); s.close()
-        m = re.search(r'fw=([0-9]+\.[0-9]+\.[0-9]+)', data)
+        m = re.search(r'fw=(\S+)', data)
         if m: print(m.group(1)); break
     except: pass
 " 2>/dev/null)
@@ -187,7 +189,7 @@ for port in ports:
         local latest
         latest=$(aws s3 ls "s3://$BUCKET/$DEVICE/logs/" 2>/dev/null | sort | tail -1 | awk '{print $4}')
         [ -n "$latest" ] && aws s3 cp "s3://$BUCKET/$DEVICE/logs/$latest" - 2>/dev/null | \
-            grep -oP 'fw=\K[0-9]+\.[0-9]+\.[0-9]+' | head -1
+            grep -oP 'fw=\K\S+' | head -1
     fi
 }
 
@@ -209,7 +211,7 @@ wait_for_ota() {
         if [ -n "$latest" ]; then
             local log_ver
             log_ver=$(aws s3 cp "s3://$BUCKET/$DEVICE/logs/$latest" - 2>/dev/null | \
-                grep -oP 'fw=\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+                grep -oP 'fw=\K\S+' | head -1)
             [ "$log_ver" = "$expected" ] && { OTA_RESULT="$log_ver"; return 0; }
             OTA_RESULT="$log_ver"
         fi
@@ -228,7 +230,7 @@ deploy_ota() {
         (cd "$FW_DIR" && ~/.local/bin/pio run 2>&1 | tail -1)
         size=$(stat -c%s "$FW_DIR/.pio/build/esp32s3/firmware.bin")
         aws s3 cp "$FW_DIR/.pio/build/esp32s3/firmware.bin" "s3://$BUCKET/firmware/latest.bin" >/dev/null 2>&1
-        sed -i 's/#define FW_VERSION "[^"]*"/#define FW_VERSION "10.2001.7"/' "$FW_DIR/src/main.cpp"
+        sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$FW_CURRENT\"/" "$FW_DIR/src/main.cpp"
     else
         size=824480
     fi
@@ -295,20 +297,16 @@ fi
 start_device 5
 write_dsu_file "01501" 500
 log "  Waiting for harvest + upload..."
-if wait_for_done_marker "flightHistory__${SERIAL}_01501_$(date +%Y%m%d).eaofh" 180; then
+# S3 key now includes subfolder: DEVICE/NNNN/flightHistory__SERIAL_flight_date.eaofh
+if wait_for_upload "flightHistory__${SERIAL}_01501" 180; then
     pass "DSU upload: flight file harvested + uploaded"
 else
-    # Check S3 directly
-    if wait_for_s3_file "flightHistory__${SERIAL}_01501" 30; then
-        pass "DSU upload: found in S3"
-    else
-        fail "DSU upload: not completed"
-    fi
+    fail "DSU upload: not completed"
 fi
 stop_device
 
 # ── TEST 3: Upload + power cut ────────────────────────────────────────────────
-log ""; log "TEST 3: Upload + power cut (500KB)"
+log ""; log "TEST 3: Upload + power cut (2MB)"
 cleanup_s3
 if [ "$TARGET" = "emulator" ]; then
     rm -rf "$SD_EMU/harvested" "$SD_EMU/flightHistory" "$SD_EMU/metrics"
@@ -321,14 +319,10 @@ sleep 20
 power_cut 5
 log "  Restarting..."
 start_device 5
-if wait_for_done_marker "flightHistory__${SERIAL}_01502_$(date +%Y%m%d).eaofh" 180; then
+if wait_for_upload "flightHistory__${SERIAL}_01502" 180; then
     pass "Power cut resume: uploaded after restart"
 else
-    if wait_for_s3_file "flightHistory__${SERIAL}_01502" 30; then
-        pass "Power cut resume: found in S3"
-    else
-        fail "Power cut resume: not completed"
-    fi
+    fail "Power cut resume: not completed"
 fi
 stop_device
 
@@ -345,8 +339,7 @@ write_dsu_file "01505" 200
 log "  3 flight files, waiting..."
 ALL_DONE=true
 for f in 01503 01504 01505; do
-    FNAME="flightHistory__${SERIAL}_${f}_$(date +%Y%m%d).eaofh"
-    if ! wait_for_done_marker "$FNAME" 180; then
+    if ! wait_for_upload "flightHistory__${SERIAL}_${f}" 180; then
         ALL_DONE=false
         fail "Multi-file: flight $f not completed"
     fi
@@ -362,8 +355,14 @@ if [ "$TARGET" = "emulator" ]; then
     echo "skip" > "$SD_EMU/.hidden"
     start_device 5
     write_dsu_file "01506" 100
-    wait_for_done_marker "flightHistory__${SERIAL}_01506_$(date +%Y%m%d).eaofh" 60
-    if [ ! -f "$SD_EMU/harvested/Thumbs.db" ] && [ ! -f "$SD_EMU/harvested/.hidden" ]; then
+    wait_for_upload "flightHistory__${SERIAL}_01506" 60
+    # System files should NOT appear in any harvested subfolder
+    FOUND_SYSTEM=false
+    for sub in "$SD_EMU"/harvested/*/; do
+        [ -f "${sub}Thumbs.db" ] && FOUND_SYSTEM=true
+        [ -f "${sub}.hidden" ] && FOUND_SYSTEM=true
+    done
+    if ! $FOUND_SYSTEM; then
         pass "System files skipped"
     else
         fail "System files not skipped"
@@ -401,7 +400,7 @@ fi
 
 # ── TEST 6: OTA check + download ─────────────────────────────────────────────
 log ""; log "TEST 6: OTA check + download"
-V_NEW="10.9999.$(date +%S)"
+V_NEW="$(date +%Y%m%d%H%M%S)"
 deploy_ota "$V_NEW"
 if [ "$TARGET" = "emulator" ]; then
     rm -f "$FW_DIR/emu_ota_update.bin"
@@ -429,7 +428,7 @@ else
     stop_device
 fi
 # Reset OTA
-deploy_ota "$(get_fw_version 2>/dev/null || echo $V_NEW)"
+deploy_ota "$(get_fw_version 2>/dev/null || echo $FW_CURRENT)"
 
 # ── TEST 7: Persistence ──────────────────────────────────────────────────────
 log ""; log "TEST 7: State persistence"

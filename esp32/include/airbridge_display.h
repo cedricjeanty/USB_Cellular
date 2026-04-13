@@ -150,8 +150,15 @@ inline void dispBootSplash(const char* fwVersion, const char* deviceId,
 
     // USB mode + version
     {
+        // Abbreviate YYYYMMDDHHMMSS to MMDD.HHMM for display
+        char verShort[16];
+        if (strlen(fwVersion) >= 14 && fwVersion[0] >= '2') {
+            snprintf(verShort, sizeof(verShort), "%.4s.%.4s", fwVersion + 4, fwVersion + 8);
+        } else {
+            strlcpy(verShort, fwVersion, sizeof(verShort));
+        }
         char modeLine[28];
-        snprintf(modeLine, sizeof(modeLine), "%s v%s", usbMode, fwVersion);
+        snprintf(modeLine, sizeof(modeLine), "%s v%s", usbMode, verShort);
         int mW = strlen(modeLine) * 6;
         g_hal->display->text((128 - mW) / 2, 46, modeLine);
     }

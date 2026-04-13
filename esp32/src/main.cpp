@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "10.2001.7"
+#define FW_VERSION "20260412160000"
 
 #include <cstring>
 #include <ctime>
@@ -264,6 +264,7 @@ public:
         return true;
     }
     bool mkdir(const char* path) override { return ::mkdir(path, 0755) == 0 || errno == EEXIST; }
+    bool rmdir(const char* path) override { return ::rmdir(path) == 0; }
     bool remove(const char* path) override { return ::remove(path) == 0; }
     bool exists(const char* path) override {
         struct ::stat st;
@@ -1997,14 +1998,15 @@ static int otaCheck() {
     return 1;
 }
 
-// Upload a file from /sdcard/harvested/<name> to S3 using pre-signed URLs.
-static bool s3UploadFile(const char* name) {
+// Upload a file from /sdcard/harvested/<relPath> to S3 using pre-signed URLs.
+// relPath is "NNNN/filename" (e.g. "0001/data.csv")
+static bool s3UploadFile(const char* relPath) {
     if (!g_netConnected && !g_pppConnected) { cdc_printf("S3: no network\r\n"); return false; }
     if (!s3LoadCreds()) return false;
     g_tlsActive = true;  // suppress +++ for entire upload session
 
     char fpath[128];
-    snprintf(fpath, sizeof(fpath), "%s/harvested/%s", SD_MOUNT, name);
+    snprintf(fpath, sizeof(fpath), "%s/harvested/%s", SD_MOUNT, relPath);
 
     xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
     FILE* f = fopen(fpath, "rb");
@@ -2025,7 +2027,7 @@ static bool s3UploadFile(const char* name) {
 
     // ── Small file: single pre-signed PUT ────────────────────────────────
     if (fileSize <= S3_CHUNK_SIZE) {
-        std::string enc = urlEncode(name);
+        std::string enc = urlEncode(relPath);
         char query[512];
         snprintf(query, sizeof(query), "file=%s&size=%u&device=%s", enc.c_str(), fileSize, g_deviceId);
         std::string resp = s3ApiGet(query);
@@ -2077,8 +2079,8 @@ static bool s3UploadFile(const char* name) {
         tls_destroy(tls);
         float elapsed = (millis() - xfrStart) / 1000.0f;
         g_lastUploadKBps = elapsed > 0 ? fileSize / 1024.0f / elapsed : 0;
-        cdc_printf("S3: uploaded '%s' OK (%u bytes, %.0f KB/s)\r\n", name, fileSize, g_lastUploadKBps);
-        log_write("Upload OK: %s %u bytes %.0f KB/s", name, fileSize, g_lastUploadKBps);
+        cdc_printf("S3: uploaded '%s' OK (%u bytes, %.0f KB/s)\r\n", relPath, fileSize, g_lastUploadKBps);
+        log_write("Upload OK: %s %u bytes %.0f KB/s", relPath, fileSize, g_lastUploadKBps);
         return true;
     }
 
@@ -2094,12 +2096,12 @@ static bool s3UploadFile(const char* name) {
         if (nvs_open("s3up", NVS_READWRITE, &h) == ESP_OK) {
             char storedName[64] = "";
             nvs_get_string(h, "name", storedName, sizeof(storedName));
-            if (strcmp(storedName, name) == 0) {
+            if (strcmp(storedName, relPath) == 0) {
                 uint32_t retries = 0;
                 nvs_get_u32(h, "retries", &retries);
                 if (retries >= 3) {
                     // Too many resume failures — start fresh
-                    log_write("S3: stale session for %s (retries=%lu), clearing", name, (unsigned long)retries);
+                    log_write("S3: stale session for %s (retries=%lu), clearing", relPath, (unsigned long)retries);
                     nvs_erase_all(h); nvs_commit(h);
                 } else {
                     nvs_get_string(h, "uid", uploadId, sizeof(uploadId));
@@ -2116,7 +2118,7 @@ static bool s3UploadFile(const char* name) {
 
     // Start new multipart upload if no session
     if (!uploadId[0]) {
-        std::string enc = urlEncode(name);
+        std::string enc = urlEncode(relPath);
         char query[512];
         snprintf(query, sizeof(query), "file=%s&size=%u&device=%s", enc.c_str(), fileSize, g_deviceId);
         std::string resp = s3ApiGet(query);
@@ -2138,7 +2140,7 @@ static bool s3UploadFile(const char* name) {
         // Persist session
         nvs_handle_t h;
         if (nvs_open("s3up", NVS_READWRITE, &h) == ESP_OK) {
-            nvs_set_str(h, "name", name);
+            nvs_set_str(h, "name", relPath);
             nvs_set_str(h, "uid", uploadId);
             nvs_set_str(h, "key", s3Key);
             nvs_set_u32(h, "part", 1);
@@ -2281,9 +2283,9 @@ static bool s3UploadFile(const char* name) {
 
     float elapsed = (millis() - xfrStart) / 1000.0f;
     g_lastUploadKBps = elapsed > 0 ? fileSize / 1024.0f / elapsed : 0;
-    log_write("Upload OK: %s %u bytes %u parts %.0f KB/s", name, fileSize, totalParts, g_lastUploadKBps);
+    log_write("Upload OK: %s %u bytes %u parts %.0f KB/s", relPath, fileSize, totalParts, g_lastUploadKBps);
     cdc_printf("S3: uploaded '%s' OK (%u bytes, %u parts, %.0f KB/s)\r\n",
-             name, fileSize, totalParts, g_lastUploadKBps);
+             relPath, fileSize, totalParts, g_lastUploadKBps);
     return true;
 }
 
@@ -3145,42 +3147,62 @@ static void uploadTask(void* param) {
         g_tlsActive = false;
     }
 
-    // ── Upload loop ─────────────────────────────────────────────────
+    // ── Upload loop — scan /harvested/NNNN/ subfolders ──────────────
     for (;;) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));  // wake on notify or every 15s
 
         for (;;) {
             if (g_harvesting) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
 
-            char name[64] = "";
+            // Find next file in oldest subfolder
+            char relPath[128] = "";  // "NNNN/filename"
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
             {
-                char dirpath[64];
-                snprintf(dirpath, sizeof(dirpath), "%s/harvested", SD_MOUNT);
-                DIR* dir = opendir(dirpath);
-                if (dir) {
+                char harvBase[64];
+                snprintf(harvBase, sizeof(harvBase), "%s/harvested", SD_MOUNT);
+                // Scan subfolders for oldest numeric dir
+                DIR* topDir = opendir(harvBase);
+                char bestSub[16] = "";
+                if (topDir) {
                     struct dirent* ent;
-                    while ((ent = readdir(dir)) != nullptr) {
-                        if (ent->d_type == DT_DIR) continue;
-                        if (ent->d_name[0] == '.') continue;
-                        if (strcmp(ent->d_name, "airbridge.log") == 0) continue;
-                        // Skip 0-byte files
-                        char fullpath[128];
-                        snprintf(fullpath, sizeof(fullpath), "%s/%s", dirpath, ent->d_name);
-                        struct stat st;
-                        if (stat(fullpath, &st) == 0 && st.st_size == 0) continue;
-                        strlcpy(name, ent->d_name, sizeof(name));
-                        break;
+                    while ((ent = readdir(topDir)) != nullptr) {
+                        if (ent->d_type != DT_DIR) continue;
+                        if (ent->d_name[0] == '.' || ent->d_name[0] == '\0') continue;
+                        bool numeric = true;
+                        for (const char* p = ent->d_name; *p && numeric; p++)
+                            if (*p < '0' || *p > '9') numeric = false;
+                        if (!numeric) continue;
+                        if (bestSub[0] == '\0' || strcmp(ent->d_name, bestSub) < 0)
+                            strlcpy(bestSub, ent->d_name, sizeof(bestSub));
                     }
-                    closedir(dir);
+                    closedir(topDir);
+                }
+                if (bestSub[0]) {
+                    char subPath[96];
+                    snprintf(subPath, sizeof(subPath), "%s/%s", harvBase, bestSub);
+                    DIR* subDir = opendir(subPath);
+                    if (subDir) {
+                        struct dirent* ent;
+                        while ((ent = readdir(subDir)) != nullptr) {
+                            if (ent->d_type == DT_DIR) continue;
+                            if (ent->d_name[0] == '.') continue;
+                            char fullpath[192];
+                            snprintf(fullpath, sizeof(fullpath), "%s/%s", subPath, ent->d_name);
+                            struct stat st;
+                            if (stat(fullpath, &st) == 0 && st.st_size == 0) continue;
+                            snprintf(relPath, sizeof(relPath), "%s/%s", bestSub, ent->d_name);
+                            break;
+                        }
+                        closedir(subDir);
+                    }
                 }
             }
             xSemaphoreGive(g_sd_mutex);
 
-            if (!name[0]) { cdc_printf("Upload: no files in /harvested/\r\n"); break; }
+            if (!relPath[0]) { cdc_printf("Upload: no files in /harvested/\r\n"); break; }
 
-            char path[128];
-            snprintf(path, sizeof(path), "%s/harvested/%s", SD_MOUNT, name);
+            char path[192];
+            snprintf(path, sizeof(path), "%s/harvested/%s", SD_MOUNT, relPath);
             cdc_printf("Upload: found %s\r\n", path);
 
             // Get file size before upload
@@ -3206,29 +3228,36 @@ static void uploadTask(void* param) {
             }
 
             cdc_printf("Uploading: %s (%.1f MB) heap=%lu min=%lu\r\n",
-                     name, fileMb,
+                     relPath, fileMb,
                      (unsigned long)esp_get_free_heap_size(),
                      (unsigned long)esp_get_minimum_free_heap_size());
             g_uploadingMb = 0.0f;
             g_uploadBaseMb = 0.0f;
-            bool uploaded = s3UploadFile(name);
+            bool uploaded = s3UploadFile(relPath);
             g_tlsActive = false;  // re-enable +++ after upload
             g_uploadingMb = 0.0f;
             g_uploadBaseMb = 0.0f;
             if (!uploaded) {
-                cdc_printf("Upload failed for %s — retrying in 30s\r\n", name);
-                log_write("Upload FAIL: %s", name);
+                cdc_printf("Upload failed for %s — retrying in 30s\r\n", relPath);
+                log_write("Upload FAIL: %s", relPath);
                 vTaskDelay(pdMS_TO_TICKS(30000)); continue;
             }
 
-            // Delete the /harvested/ copy and create .done marker
+            // Delete uploaded file and remove subfolder if empty
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
             remove(path);
-            char donePath[192];
-            snprintf(donePath, sizeof(donePath), "%s/harvested/.done__%s", SD_MOUNT, name);
-            { FILE* m = fopen(donePath, "w"); if (m) fclose(m); }
+            // Extract subfolder path and try rmdir (only succeeds if empty)
+            {
+                const char* slash = strchr(relPath, '/');
+                if (slash) {
+                    char subDir[96];
+                    snprintf(subDir, sizeof(subDir), "%s/harvested/%.*s",
+                             SD_MOUNT, (int)(slash - relPath), relPath);
+                    rmdir(subDir);
+                }
+            }
             xSemaphoreGive(g_sd_mutex);
-            ESP_LOGI(TAG, "Uploaded & marked done: %s", name);
+            ESP_LOGI(TAG, "Uploaded & deleted: %s", relPath);
             if (g_filesQueued > 0) g_filesQueued--;
             g_filesUploaded++;
             g_mbUploaded += fileMb;
@@ -3275,7 +3304,11 @@ static void doHarvest() {
     // Harvest files using shared harvestFiles() from airbridge_harvest.h
     char harvDir[64];
     snprintf(harvDir, sizeof(harvDir), "%s/harvested", SD_MOUNT);
-    HarvestResult hr = harvestFiles(SD_MOUNT, harvDir);
+    uint32_t harvestNum = 0;
+    g_hal->nvs->get_u32("harvest", "count", &harvestNum);
+    harvestNum++;
+    g_hal->nvs->set_u32("harvest", "count", harvestNum);
+    HarvestResult hr = harvestFiles(SD_MOUNT, harvDir, (uint16_t)harvestNum);
     uint16_t count = hr.count;
     float usedMb = hr.usedMb;
 
@@ -3533,13 +3566,16 @@ static void processCLI(const char* cmd) {
             xTaskCreatePinnedToCore([](void*) {
                 const uint32_t TEST_SIZE = 10UL * 1024 * 1024;
                 const char* testName = "celltest_10mb.bin";
+                const char* testRelPath = "celltest/celltest_10mb.bin";
 
-                // Create 10 MB test file on SD
+                // Create 10 MB test file on SD in a temp subfolder
                 cdc_printf("CellTest: creating %lu byte test file...\r\n", (unsigned long)TEST_SIZE);
-                char filepath[80];
-                snprintf(filepath, sizeof(filepath), "%s/harvested/%s", SD_MOUNT, testName);
+                char testDir[80], filepath[128];
+                snprintf(testDir, sizeof(testDir), "%s/harvested/celltest", SD_MOUNT);
+                snprintf(filepath, sizeof(filepath), "%s/%s", testDir, testName);
 
                 xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                mkdir(testDir, 0775);
                 FILE* f = fopen(filepath, "wb");
                 if (f) {
                     static uint8_t block[4096];
@@ -3561,7 +3597,7 @@ static void processCLI(const char* cmd) {
 
                 // Upload using existing S3 multipart infrastructure
                 uint32_t startMs = millis();
-                bool ok = s3UploadFile(testName);
+                bool ok = s3UploadFile(testRelPath);
                 uint32_t elapsed = millis() - startMs;
                 float kbps = (elapsed > 0) ? (TEST_SIZE / 1024.0f) / (elapsed / 1000.0f) : 0;
 
@@ -3572,11 +3608,9 @@ static void processCLI(const char* cmd) {
                     cdc_printf("CellTest: FAILED after %.1fs\r\n", elapsed / 1000.0f);
                 }
 
-                // Clean up test file and marker
+                // Clean up test file and folder
                 remove(filepath);
-                char marker[96];
-                snprintf(marker, sizeof(marker), "%s/harvested/.done__%s", SD_MOUNT, testName);
-                remove(marker);
+                rmdir(testDir);
 
                 s3ClearSession();
                 vTaskDelete(nullptr);
@@ -3927,25 +3961,33 @@ extern "C" void app_main(void) {
     xTaskCreatePinnedToCore(modemTask,     "modem",     16384, nullptr, 2, &g_modem_task,   0);  // core 0, 16KB stack for reconnection
     xTaskCreatePinnedToCore(main_loop_task, "main_loop", 4096, nullptr, 1, nullptr,         0);
 
-    // ── Scan /harvested/ for leftover files from before last reboot ─────
+    // ── Scan /harvested/ subfolders for leftover files from before last reboot ──
     if (g_fatfs_mounted) {
-        char dirpath[64];
-        snprintf(dirpath, sizeof(dirpath), "%s/harvested", SD_MOUNT);
-        DIR* dir = opendir(dirpath);
-        if (dir) {
-            struct dirent* ent;
-            while ((ent = readdir(dir)) != nullptr) {
-                if (ent->d_type == DT_DIR) continue;
-                if (ent->d_name[0] == '.') continue;
-                char fullpath[128];
-                snprintf(fullpath, sizeof(fullpath), "%s/%s", dirpath, ent->d_name);
-                struct stat st;
-                if (stat(fullpath, &st) == 0 && st.st_size > 0) {
-                    g_filesQueued++;
-                    g_mbQueued += (float)st.st_size / 1e6f;
+        char harvBase[64];
+        snprintf(harvBase, sizeof(harvBase), "%s/harvested", SD_MOUNT);
+        DIR* topDir = opendir(harvBase);
+        if (topDir) {
+            struct dirent* sub;
+            while ((sub = readdir(topDir)) != nullptr) {
+                if (sub->d_type != DT_DIR || sub->d_name[0] == '.') continue;
+                char subPath[96];
+                snprintf(subPath, sizeof(subPath), "%s/%s", harvBase, sub->d_name);
+                DIR* subDir = opendir(subPath);
+                if (!subDir) continue;
+                struct dirent* ent;
+                while ((ent = readdir(subDir)) != nullptr) {
+                    if (ent->d_type == DT_DIR || ent->d_name[0] == '.') continue;
+                    char fullpath[192];
+                    snprintf(fullpath, sizeof(fullpath), "%s/%s", subPath, ent->d_name);
+                    struct stat st;
+                    if (stat(fullpath, &st) == 0 && st.st_size > 0) {
+                        g_filesQueued++;
+                        g_mbQueued += (float)st.st_size / 1e6f;
+                    }
                 }
+                closedir(subDir);
             }
-            closedir(dir);
+            closedir(topDir);
             if (g_filesQueued > 0) {
                 ESP_LOGI(TAG, "Boot: found %u file(s) in /harvested/ — notifying upload", g_filesQueued);
                 xTaskNotifyGive(g_upload_task);
@@ -3954,7 +3996,6 @@ extern "C" void app_main(void) {
     }
 
     // ── Scan SD root for unharvested files (from previous session) ─────
-    // Use g_fatfs_mounted not g_sd_ready (USB delayed 60s, but SD is ready)
     if (g_fatfs_mounted && g_filesQueued == 0) {
         DIR* rootDir = opendir(SD_MOUNT);
         if (rootDir) {
@@ -3964,12 +4005,7 @@ extern "C" void app_main(void) {
                 if (ent->d_type == DT_DIR) continue;
                 if (ent->d_name[0] == '.') continue;
                 if (strcmp(ent->d_name, "airbridge.log") == 0) continue;
-                // Check if already uploaded (.done marker exists)
-                char donePath[192];
-                snprintf(donePath, sizeof(donePath), "%s/harvested/.done__%s",
-                         SD_MOUNT, ent->d_name);
-                struct stat ds;
-                if (stat(donePath, &ds) == 0) continue;  // already uploaded
+                if (strcmp(ent->d_name, "dsuCookie.easdf") == 0) continue;
                 found = true;
                 ESP_LOGI(TAG, "Boot: unharvested file in root: %s", ent->d_name);
                 break;

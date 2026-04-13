@@ -114,6 +114,7 @@ public:
         return true;
     }
     bool mkdir(const char* path) override { return ::mkdir(path, 0755) == 0 || errno == EEXIST; }
+    bool rmdir(const char* path) override { return ::rmdir(path) == 0; }
     bool remove(const char* path) override { return ::remove(path) == 0; }
     bool exists(const char* path) override {
         struct ::stat st;

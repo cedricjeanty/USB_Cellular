@@ -244,6 +244,15 @@ public:
         return true;
     }
     bool mkdir(const char* path) override { dirs[path] = true; return true; }
+    bool rmdir(const char* path) override {
+        // Only succeeds if directory has no files/subdirs
+        std::string pfx = std::string(path) + "/";
+        for (auto& kv : files)
+            if (kv.first.substr(0, pfx.size()) == pfx) return false;
+        for (auto& kv : dirs)
+            if (kv.first.substr(0, pfx.size()) == pfx) return false;
+        return dirs.erase(path) > 0;
+    }
     bool remove(const char* path) override { return files.erase(path) > 0; }
     bool exists(const char* path) override { return files.count(path) > 0 || dirs.count(path) > 0; }
 };
@@ -262,6 +271,7 @@ public:
     void closedir(void*) override {}
     bool stat(const char*, uint32_t*, bool*) override { return false; }
     bool mkdir(const char*) override { return false; }
+    bool rmdir(const char*) override { return false; }
     bool remove(const char*) override { return false; }
     bool exists(const char*) override { return false; }
 };

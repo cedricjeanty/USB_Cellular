@@ -25,9 +25,22 @@ void test_versionNewer_older_minor(void) {
     TEST_ASSERT_FALSE(versionNewer("1.0.0", "1.1.0"));
 }
 void test_versionNewer_real_firmware(void) {
+    // Legacy semver
     TEST_ASSERT_TRUE(versionNewer("10.2002.0", "10.2001.7"));
     TEST_ASSERT_FALSE(versionNewer("10.2001.7", "10.2001.7"));
     TEST_ASSERT_FALSE(versionNewer("10.2001.6", "10.2001.7"));
+}
+void test_versionNewer_timestamp(void) {
+    // YYYYMMDDHHMMSS format
+    TEST_ASSERT_TRUE(versionNewer("20260412160000", "20260412150000"));
+    TEST_ASSERT_FALSE(versionNewer("20260412150000", "20260412150000"));
+    TEST_ASSERT_FALSE(versionNewer("20260411235959", "20260412000000"));
+    TEST_ASSERT_TRUE(versionNewer("20260501000000", "20260412235959"));
+}
+void test_versionNewer_timestamp_real(void) {
+    // Realistic OTA scenario
+    TEST_ASSERT_TRUE(versionNewer("20260412161500", "20260412160000"));
+    TEST_ASSERT_FALSE(versionNewer("20260412160000", "20260412161500"));
 }
 
 // ── jsonStr ─────────────────────────────────────────────────────────────────
@@ -40,6 +53,12 @@ void test_jsonStr_missing_key(void) {
 }
 void test_jsonStr_null_value(void) {
     TEST_ASSERT_EQUAL_STRING("", jsonStr("{\"foo\":null}", "foo").c_str());
+}
+void test_jsonStr_null_before_key(void) {
+    // Regression: null value followed by another key should not return the next key name
+    std::string json = "{\"upload_id\": null, \"parts\": 1, \"key\": \"DEV/file.bin\"}";
+    TEST_ASSERT_EQUAL_STRING("", jsonStr(json, "upload_id").c_str());
+    TEST_ASSERT_EQUAL_STRING("DEV/file.bin", jsonStr(json, "key").c_str());
 }
 void test_jsonStr_with_spaces(void) {
     TEST_ASSERT_EQUAL_STRING("hello", jsonStr("{\"key\" : \"hello\"}", "key").c_str());
@@ -182,6 +201,7 @@ void test_isSkipped_known_names(void) {
     TEST_ASSERT_TRUE(isSkipped("System Volume Information"));
     TEST_ASSERT_TRUE(isSkipped("harvested"));
     TEST_ASSERT_TRUE(isSkipped("airbridge.log"));
+    TEST_ASSERT_TRUE(isSkipped("dsuCookie.easdf"));
 }
 void test_isSkipped_normal_files(void) {
     TEST_ASSERT_FALSE(isSkipped("data.csv"));
@@ -231,11 +251,14 @@ int main(int argc, char** argv) {
     RUN_TEST(test_versionNewer_older_major);
     RUN_TEST(test_versionNewer_older_minor);
     RUN_TEST(test_versionNewer_real_firmware);
+    RUN_TEST(test_versionNewer_timestamp);
+    RUN_TEST(test_versionNewer_timestamp_real);
 
     // jsonStr
     RUN_TEST(test_jsonStr_simple);
     RUN_TEST(test_jsonStr_missing_key);
     RUN_TEST(test_jsonStr_null_value);
+    RUN_TEST(test_jsonStr_null_before_key);
     RUN_TEST(test_jsonStr_with_spaces);
     RUN_TEST(test_jsonStr_nested);
 

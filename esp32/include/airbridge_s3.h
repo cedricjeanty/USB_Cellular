@@ -111,48 +111,73 @@ typedef void (*UploadProgressFn)(uint32_t bytesSent, uint32_t totalBytes);
 
 // ── Find next file to upload ─────────────────────────────────────────────────
 
-// Scan harvestDir for the next file that needs uploading (no .done__ marker).
-// Returns filename in `out`, or empty string if nothing to upload.
+// Scan harvestDir for numbered subfolders (0001, 0002, ...), return the first
+// file from the oldest subfolder.  `out` receives "NNNN/filename" relative path.
 inline bool findNextUploadFile(const char* harvestDir, char* out, size_t outSz) {
     out[0] = '\0';
     if (!g_hal || !g_hal->filesys) return false;
 
-    void* dir = g_hal->filesys->opendir(harvestDir);
-    if (!dir) return false;
+    // Collect numeric subfolder names
+    void* topDir = g_hal->filesys->opendir(harvestDir);
+    if (!topDir) return false;
 
+    char bestSub[16] = "";
     FsDirEntry ent;
-    while (g_hal->filesys->readdir(dir, &ent)) {
+    while (g_hal->filesys->readdir(topDir, &ent)) {
+        if (!ent.is_dir) continue;
+        if (ent.name[0] == '.') continue;
+        // Only numeric folder names
+        bool numeric = true;
+        for (const char* p = ent.name; *p && numeric; p++)
+            if (*p < '0' || *p > '9') numeric = false;
+        if (!numeric || ent.name[0] == '\0') continue;
+        // Pick lowest (oldest) subfolder
+        if (bestSub[0] == '\0' || strcmp(ent.name, bestSub) < 0)
+            strlcpy(bestSub, ent.name, sizeof(bestSub));
+    }
+    g_hal->filesys->closedir(topDir);
+
+    if (bestSub[0] == '\0') return false;
+
+    // Scan that subfolder for the first file
+    char subPath[256];
+    snprintf(subPath, sizeof(subPath), "%s/%s", harvestDir, bestSub);
+    void* subDir = g_hal->filesys->opendir(subPath);
+    if (!subDir) return false;
+
+    while (g_hal->filesys->readdir(subDir, &ent)) {
         if (ent.is_dir) continue;
         if (ent.name[0] == '.') continue;
-        if (strcmp(ent.name, "airbridge.log") == 0) continue;
 
         // Skip 0-byte files
-        char fullpath[192];
-        snprintf(fullpath, sizeof(fullpath), "%s/%s", harvestDir, ent.name);
+        char fullpath[256];
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", subPath, ent.name);
         uint32_t sz = 0; bool isDir = false;
         if (g_hal->filesys->stat(fullpath, &sz, &isDir) && sz == 0) continue;
 
-        // Skip if .done__ marker exists
-        char donePath[256];
-        snprintf(donePath, sizeof(donePath), "%s/.done__%s", harvestDir, ent.name);
-        if (g_hal->filesys->exists(donePath)) continue;
-
-        strlcpy(out, ent.name, outSz);
+        snprintf(out, outSz, "%s/%s", bestSub, ent.name);
         break;
     }
-    g_hal->filesys->closedir(dir);
+    g_hal->filesys->closedir(subDir);
     return out[0] != '\0';
 }
 
-// Mark a file as uploaded: delete the harvested copy and create .done__ marker.
-inline void markFileUploaded(const char* harvestDir, const char* filename) {
+// Delete an uploaded file and remove its subfolder if empty.
+// relPath is "NNNN/filename" as returned by findNextUploadFile.
+inline void markFileUploaded(const char* harvestDir, const char* relPath) {
     if (!g_hal || !g_hal->filesys) return;
-    char path[192], donePath[256];
-    snprintf(path, sizeof(path), "%s/%s", harvestDir, filename);
-    snprintf(donePath, sizeof(donePath), "%s/.done__%s", harvestDir, filename);
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", harvestDir, relPath);
     g_hal->filesys->remove(path);
-    void* f = g_hal->filesys->open(donePath, "w");
-    if (f) g_hal->filesys->close(f);
+
+    // Extract subfolder path and try to remove it (succeeds only if empty)
+    const char* slash = strchr(relPath, '/');
+    if (slash) {
+        char sub[256];
+        size_t subLen = slash - relPath;
+        snprintf(sub, sizeof(sub), "%s/%.*s", harvestDir, (int)subLen, relPath);
+        g_hal->filesys->rmdir(sub);
+    }
 }
 
 // ── S3 credentials ──────────────────────────────────────────────────────────
@@ -285,10 +310,15 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
 
         bool ok = halStreamFile(tls, f, fileSize, progress);
         g_hal->filesys->close(f);
-        halHttpReadResponse(tls);
+        std::string putResp = halHttpReadResponse(tls);
         g_hal->network->destroy(tls);
 
         if (!ok) { strlcpy(res.error, "Stream failed", sizeof(res.error)); return res; }
+        // Check for S3 error in response
+        if (putResp.find("Error") != std::string::npos || putResp.find("error") != std::string::npos) {
+            snprintf(res.error, sizeof(res.error), "S3 error: %.100s", putResp.c_str());
+            return res;
+        }
 
         uint32_t elapsed = g_hal->clock->millis() - startMs;
         res.success = true;
@@ -390,16 +420,18 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
 // ── Upload all pending files ────────────────────────────────────────────────
 
 // Upload all pending files from harvestDir. Returns count of files uploaded.
+// findNextUploadFile returns "NNNN/filename" relative paths.
 inline int uploadAllFiles(const char* harvestDir, UploadProgressFn progress = nullptr) {
     int count = 0;
-    char name[64];
-    while (findNextUploadFile(harvestDir, name, sizeof(name))) {
-        char fullpath[192];
-        snprintf(fullpath, sizeof(fullpath), "%s/%s", harvestDir, name);
+    char relPath[128];
+    while (findNextUploadFile(harvestDir, relPath, sizeof(relPath))) {
+        char fullpath[256];
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", harvestDir, relPath);
 
-        UploadResult r = halS3UploadFile(fullpath, name, progress);
+        // Use the relative path (NNNN/filename) as the S3 key component
+        UploadResult r = halS3UploadFile(fullpath, relPath, progress);
         if (r.success) {
-            markFileUploaded(harvestDir, name);
+            markFileUploaded(harvestDir, relPath);
             count++;
         } else {
             break;

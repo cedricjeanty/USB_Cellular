@@ -31,6 +31,7 @@ public:
     // Metadata
     virtual bool   stat(const char* path, uint32_t* size_out, bool* is_dir_out) = 0;
     virtual bool   mkdir(const char* path) = 0;
+    virtual bool   rmdir(const char* path) = 0;
     virtual bool   remove(const char* path) = 0;
     virtual bool   exists(const char* path) = 0;
 };

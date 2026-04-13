@@ -1,5 +1,5 @@
 #pragma once
-// AirBridge harvest logic — directory walking, file copying, skip detection
+// AirBridge harvest logic — directory walking, file moving to sequential folders
 // Uses g_hal->filesys for all I/O. Extracted from doHarvest() in main.cpp.
 
 #include "hal/hal.h"
@@ -13,15 +13,22 @@ struct HarvestResult {
     float    usedMb;
     uint32_t maxFlight;
     char     dsuSerial[44];
+    char     folder[8];      // e.g. "0001"
 };
 
-// Walk a directory tree, copy new files to destDir, return harvest stats.
-// srcDir:  root directory to scan (e.g. "/sdcard")
-// destDir: destination directory (e.g. "/sdcard/harvested")
-inline HarvestResult harvestFiles(const char* srcDir, const char* destDir) {
+// Walk srcDir, move files into destBase/NNNN/ (sequential subfolder).
+// Files are copied then deleted from source (move across mount points).
+// harvestNum: caller-provided sequential counter (read+increment NVS).
+inline HarvestResult harvestFiles(const char* srcDir, const char* destBase,
+                                   uint16_t harvestNum) {
     HarvestResult result = {};
     if (!g_hal || !g_hal->filesys) return result;
 
+    snprintf(result.folder, sizeof(result.folder), "%04u", harvestNum);
+
+    g_hal->filesys->mkdir(destBase);
+    char destDir[192];
+    snprintf(destDir, sizeof(destDir), "%s/%s", destBase, result.folder);
     g_hal->filesys->mkdir(destDir);
 
     // Stack-based directory walk (max depth 4)
@@ -73,26 +80,14 @@ inline HarvestResult harvestFiles(const char* srcDir, const char* destDir) {
 
         if (ent.size == 0) continue;
 
-        // Build destination name
+        // Build destination name (flatten subdirectory path)
         char dstName[128];
         flattenPath(stack[depth].prefix, ent.name, dstName, sizeof(dstName));
 
-        // Skip if already uploaded (.done marker exists)
-        char donePath[192];
-        snprintf(donePath, sizeof(donePath), "%s/.done__%s", destDir, dstName);
-        if (g_hal->filesys->exists(donePath)) continue;
-
-        // Skip if same-size copy already pending
-        char dst[192];
+        char dst[256];
         snprintf(dst, sizeof(dst), "%s/%s", destDir, dstName);
-        uint32_t dstSize = 0;
-        bool dstIsDir = false;
-        if (g_hal->filesys->stat(dst, &dstSize, &dstIsDir)) {
-            if (dstSize == ent.size) continue;
-            g_hal->filesys->remove(dst);
-        }
 
-        // Copy file
+        // Copy file to destination
         void* sf = g_hal->filesys->open(fullpath, "rb");
         void* df = g_hal->filesys->open(dst, "wb");
         bool copied = false;
@@ -109,9 +104,11 @@ inline HarvestResult harvestFiles(const char* srcDir, const char* destDir) {
         }
         if (sf) g_hal->filesys->close(sf);
         if (df) g_hal->filesys->close(df);
-        if (!copied) g_hal->filesys->remove(dst);
 
         if (copied) {
+            // Delete source (move = copy + delete)
+            g_hal->filesys->remove(fullpath);
+
             float fileMb = (float)ent.size / 1e6f;
             result.usedMb += fileMb;
             result.count++;
@@ -126,6 +123,8 @@ inline HarvestResult harvestFiles(const char* srcDir, const char* destDir) {
                     strlcpy(result.dsuSerial, serial, sizeof(result.dsuSerial));
                 }
             }
+        } else {
+            g_hal->filesys->remove(dst);
         }
     }
 
