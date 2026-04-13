@@ -1719,9 +1719,9 @@ static bool otaDownloadAndFlash(const char* host, const char* path, uint32_t exp
 
     esp_http_client_config_t config = {};
     config.url = url;
-    config.timeout_ms = 120000;
-    config.buffer_size = 2048;
-    config.buffer_size_tx = 2048;
+    config.timeout_ms = 30000;  // 30s per-read timeout (fail fast, retry at higher level)
+    config.buffer_size = 4096;
+    config.buffer_size_tx = 1024;
     config.skip_cert_common_name_check = true;
     config.transport_type = HTTP_TRANSPORT_OVER_SSL;
 
@@ -1758,8 +1758,8 @@ static bool otaDownloadAndFlash(const char* host, const char* path, uint32_t exp
     err = esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
     if (err != ESP_OK) { log_write("OTA: begin failed"); esp_http_client_cleanup(client); g_tlsActive = false; return false; }
 
-    // Stream body to flash
-    char buf[1024];
+    // Stream body to flash (4KB chunks for fewer reads over slow cellular)
+    char buf[4096];
     uint32_t received = 0;
     while (received < (uint32_t)content_length) {
         int len = esp_http_client_read(client, buf, sizeof(buf));
