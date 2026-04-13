@@ -308,12 +308,11 @@ void test_find_next_skips_empty_subfolder(void) {
     s_fs.add_dir("/sd/harvested/0002");
     s_fs.add_file_str("/sd/harvested/0002/data.csv", "content");
     char out[64];
-    // 0001 is empty so it should be returned first but yield no files,
-    // falling through. Our implementation picks the lowest subfolder name,
-    // opens it, finds nothing, and returns false. Let's verify:
-    TEST_ASSERT_FALSE(findNextUploadFile("/sd/harvested", out, sizeof(out)));
-    // This is correct — caller should rmdir 0001 before retrying.
-    // In practice, rmdir happens in markFileUploaded after last file.
+    // 0001 is empty — should be auto-removed and 0002 found
+    TEST_ASSERT_TRUE(findNextUploadFile("/sd/harvested", out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("0002/data.csv", out);
+    // 0001 should have been cleaned up
+    TEST_ASSERT_FALSE(s_fs.exists("/sd/harvested/0001"));
 }
 
 // ── markFileUploaded tests ──────────────────────────────────────────────────

@@ -3155,46 +3155,55 @@ static void uploadTask(void* param) {
             if (g_harvesting) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
 
             // Find next file in oldest subfolder
+            // Find next file in oldest non-empty subfolder
             char relPath[128] = "";  // "NNNN/filename"
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
             {
                 char harvBase[64];
                 snprintf(harvBase, sizeof(harvBase), "%s/harvested", SD_MOUNT);
-                // Scan subfolders for oldest numeric dir
+                // Collect numeric subfolders
+                char subs[32][16];
+                int nSubs = 0;
                 DIR* topDir = opendir(harvBase);
-                char bestSub[16] = "";
                 if (topDir) {
                     struct dirent* ent;
-                    while ((ent = readdir(topDir)) != nullptr) {
+                    while ((ent = readdir(topDir)) != nullptr && nSubs < 32) {
                         if (ent->d_type != DT_DIR) continue;
                         if (ent->d_name[0] == '.' || ent->d_name[0] == '\0') continue;
                         bool numeric = true;
                         for (const char* p = ent->d_name; *p && numeric; p++)
                             if (*p < '0' || *p > '9') numeric = false;
                         if (!numeric) continue;
-                        if (bestSub[0] == '\0' || strcmp(ent->d_name, bestSub) < 0)
-                            strlcpy(bestSub, ent->d_name, sizeof(bestSub));
+                        strlcpy(subs[nSubs++], ent->d_name, 16);
                     }
                     closedir(topDir);
                 }
-                if (bestSub[0]) {
-                    char subPath[96];
-                    snprintf(subPath, sizeof(subPath), "%s/%s", harvBase, bestSub);
-                    DIR* subDir = opendir(subPath);
-                    if (subDir) {
-                        struct dirent* ent;
-                        while ((ent = readdir(subDir)) != nullptr) {
-                            if (ent->d_type == DT_DIR) continue;
-                            if (ent->d_name[0] == '.') continue;
-                            char fullpath[192];
-                            snprintf(fullpath, sizeof(fullpath), "%s/%s", subPath, ent->d_name);
-                            struct stat st;
-                            if (stat(fullpath, &st) == 0 && st.st_size == 0) continue;
-                            snprintf(relPath, sizeof(relPath), "%s/%s", bestSub, ent->d_name);
-                            break;
+                // Sort ascending
+                for (int i = 0; i < nSubs - 1; i++)
+                    for (int j = i + 1; j < nSubs; j++)
+                        if (strcmp(subs[i], subs[j]) > 0) {
+                            char tmp[16]; strlcpy(tmp, subs[i], 16);
+                            strlcpy(subs[i], subs[j], 16); strlcpy(subs[j], tmp, 16);
                         }
-                        closedir(subDir);
+                // Find first file, skip + rmdir empty folders
+                for (int s = 0; s < nSubs && !relPath[0]; s++) {
+                    char subPath[96];
+                    snprintf(subPath, sizeof(subPath), "%s/%s", harvBase, subs[s]);
+                    DIR* subDir = opendir(subPath);
+                    if (!subDir) continue;
+                    struct dirent* ent;
+                    while ((ent = readdir(subDir)) != nullptr) {
+                        if (ent->d_type == DT_DIR) continue;
+                        if (ent->d_name[0] == '.') continue;
+                        char fullpath[192];
+                        snprintf(fullpath, sizeof(fullpath), "%s/%s", subPath, ent->d_name);
+                        struct stat st;
+                        if (stat(fullpath, &st) == 0 && st.st_size == 0) continue;
+                        snprintf(relPath, sizeof(relPath), "%s/%s", subs[s], ent->d_name);
+                        break;
                     }
+                    closedir(subDir);
+                    if (!relPath[0]) rmdir(subPath);  // empty folder, clean up
                 }
             }
             xSemaphoreGive(g_sd_mutex);

@@ -112,54 +112,61 @@ typedef void (*UploadProgressFn)(uint32_t bytesSent, uint32_t totalBytes);
 // ── Find next file to upload ─────────────────────────────────────────────────
 
 // Scan harvestDir for numbered subfolders (0001, 0002, ...), return the first
-// file from the oldest subfolder.  `out` receives "NNNN/filename" relative path.
+// file from the oldest non-empty subfolder.  `out` receives "NNNN/filename".
+// Empty subfolders are removed automatically.
 inline bool findNextUploadFile(const char* harvestDir, char* out, size_t outSz) {
     out[0] = '\0';
     if (!g_hal || !g_hal->filesys) return false;
 
-    // Collect numeric subfolder names
+    // Collect all numeric subfolder names
+    char subs[32][16];
+    int nSubs = 0;
     void* topDir = g_hal->filesys->opendir(harvestDir);
     if (!topDir) return false;
-
-    char bestSub[16] = "";
     FsDirEntry ent;
-    while (g_hal->filesys->readdir(topDir, &ent)) {
-        if (!ent.is_dir) continue;
-        if (ent.name[0] == '.') continue;
-        // Only numeric folder names
+    while (g_hal->filesys->readdir(topDir, &ent) && nSubs < 32) {
+        if (!ent.is_dir || ent.name[0] == '.') continue;
         bool numeric = true;
         for (const char* p = ent.name; *p && numeric; p++)
             if (*p < '0' || *p > '9') numeric = false;
         if (!numeric || ent.name[0] == '\0') continue;
-        // Pick lowest (oldest) subfolder
-        if (bestSub[0] == '\0' || strcmp(ent.name, bestSub) < 0)
-            strlcpy(bestSub, ent.name, sizeof(bestSub));
+        strlcpy(subs[nSubs++], ent.name, 16);
     }
     g_hal->filesys->closedir(topDir);
 
-    if (bestSub[0] == '\0') return false;
+    // Sort ascending (oldest first)
+    for (int i = 0; i < nSubs - 1; i++)
+        for (int j = i + 1; j < nSubs; j++)
+            if (strcmp(subs[i], subs[j]) > 0) {
+                char tmp[16]; strlcpy(tmp, subs[i], 16);
+                strlcpy(subs[i], subs[j], 16); strlcpy(subs[j], tmp, 16);
+            }
 
-    // Scan that subfolder for the first file
-    char subPath[256];
-    snprintf(subPath, sizeof(subPath), "%s/%s", harvestDir, bestSub);
-    void* subDir = g_hal->filesys->opendir(subPath);
-    if (!subDir) return false;
+    // Find first file in any subfolder (skip + rmdir empty ones)
+    for (int s = 0; s < nSubs; s++) {
+        char subPath[256];
+        snprintf(subPath, sizeof(subPath), "%s/%s", harvestDir, subs[s]);
+        void* subDir = g_hal->filesys->opendir(subPath);
+        if (!subDir) continue;
 
-    while (g_hal->filesys->readdir(subDir, &ent)) {
-        if (ent.is_dir) continue;
-        if (ent.name[0] == '.') continue;
+        bool found = false;
+        while (g_hal->filesys->readdir(subDir, &ent)) {
+            if (ent.is_dir || ent.name[0] == '.') continue;
+            char fullpath[256];
+            snprintf(fullpath, sizeof(fullpath), "%s/%s", subPath, ent.name);
+            uint32_t sz = 0; bool isDir = false;
+            if (g_hal->filesys->stat(fullpath, &sz, &isDir) && sz == 0) continue;
+            snprintf(out, outSz, "%s/%s", subs[s], ent.name);
+            found = true;
+            break;
+        }
+        g_hal->filesys->closedir(subDir);
 
-        // Skip 0-byte files
-        char fullpath[256];
-        snprintf(fullpath, sizeof(fullpath), "%s/%s", subPath, ent.name);
-        uint32_t sz = 0; bool isDir = false;
-        if (g_hal->filesys->stat(fullpath, &sz, &isDir) && sz == 0) continue;
-
-        snprintf(out, outSz, "%s/%s", bestSub, ent.name);
-        break;
+        if (found) return true;
+        // Empty subfolder — remove it and try next
+        g_hal->filesys->rmdir(subPath);
     }
-    g_hal->filesys->closedir(subDir);
-    return out[0] != '\0';
+    return false;
 }
 
 // Delete an uploaded file and remove its subfolder if empty.
