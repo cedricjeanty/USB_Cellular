@@ -3102,6 +3102,60 @@ static void uploadTask(void* param) {
         }
     }
 
+    // ── Auto SD flash: firmware.bin on SD card ───────────────────────
+    if (g_fatfs_mounted) {
+        char fwp[64];
+        snprintf(fwp, sizeof(fwp), "%s/firmware.bin", SD_MOUNT);
+        struct ::stat fwst;
+        if (::stat(fwp, &fwst) == 0 && fwst.st_size > 100000) {
+            log_write("SD flash: firmware.bin found (%ld bytes)", (long)fwst.st_size);
+            cdc_printf("SD: firmware.bin found — flashing...\r\n");
+
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "%s/_firmware.bin", SD_MOUNT);
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+            rename(fwp, tmp);
+            xSemaphoreGive(g_sd_mutex);
+
+            const esp_partition_t* update = esp_ota_get_next_update_partition(
+                esp_ota_get_running_partition());
+            esp_ota_handle_t oh;
+            if (update && esp_ota_begin(update, OTA_WITH_SEQUENTIAL_WRITES, &oh) == ESP_OK) {
+                xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                FILE* f = fopen(tmp, "rb");
+                xSemaphoreGive(g_sd_mutex);
+                char buf[4096];
+                uint32_t rx = 0;
+                bool ok = true;
+                while (f && ok) {
+                    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                    size_t n = fread(buf, 1, sizeof(buf), f);
+                    xSemaphoreGive(g_sd_mutex);
+                    if (n == 0) break;
+                    if (esp_ota_write(oh, buf, n) != ESP_OK) ok = false;
+                    rx += n;
+                }
+                if (f) { xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex); }
+
+                if (ok && rx == (uint32_t)fwst.st_size &&
+                    esp_ota_end(oh) == ESP_OK &&
+                    esp_ota_set_boot_partition(update) == ESP_OK) {
+                    xSemaphoreTake(g_sd_mutex, portMAX_DELAY); remove(tmp); xSemaphoreGive(g_sd_mutex);
+                    log_write("SD flash: success — rebooting");
+                    cdc_printf("SD flash: OK — rebooting\r\n");
+                    disp("SD Flash OK", "Rebooting...");
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    esp_restart();
+                } else {
+                    esp_ota_abort(oh);
+                    log_write("SD flash: FAILED");
+                    cdc_printf("SD flash: FAILED\r\n");
+                }
+            }
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY); remove(tmp); xSemaphoreGive(g_sd_mutex);
+        }
+    }
+
     // ── Check S3 for custom DSU cookie override ─────────────────────
     if ((g_netConnected || g_pppConnected) && s3LoadCreds()) {
         g_tlsActive = true;
@@ -3545,6 +3599,64 @@ static void processCLI(const char* cmd) {
             vTaskDelete(nullptr);
         }, "ota", 16384, nullptr, 2, nullptr, 1);
 
+    } else if (strcmp(cmd, "SDFLASH") == 0) {
+        // Flash firmware.bin from SD card
+        char fwpath[64];
+        snprintf(fwpath, sizeof(fwpath), "%s/firmware.bin", SD_MOUNT);
+        struct ::stat fwst;
+        if (::stat(fwpath, &fwst) != 0 || fwst.st_size < 100000) {
+            cdc_printf("CLI: no firmware.bin on SD (or too small)\r\n");
+        } else {
+            cdc_printf("CLI: flashing firmware.bin (%ld bytes)...\r\n", (long)fwst.st_size);
+            xTaskCreatePinnedToCore([](void*) {
+                char fwp[64], tmp[64];
+                snprintf(fwp, sizeof(fwp), "%s/firmware.bin", SD_MOUNT);
+                snprintf(tmp, sizeof(tmp), "%s/_firmware.bin", SD_MOUNT);
+                xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                rename(fwp, tmp);
+                xSemaphoreGive(g_sd_mutex);
+
+                const esp_partition_t* update = esp_ota_get_next_update_partition(
+                    esp_ota_get_running_partition());
+                esp_ota_handle_t oh;
+                if (!update || esp_ota_begin(update, OTA_WITH_SEQUENTIAL_WRITES, &oh) != ESP_OK) {
+                    cdc_printf("SDFLASH: partition error\r\n");
+                    vTaskDelete(nullptr); return;
+                }
+                xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                FILE* f = fopen(tmp, "rb");
+                xSemaphoreGive(g_sd_mutex);
+                if (!f) { esp_ota_abort(oh); cdc_printf("SDFLASH: can't open\r\n"); vTaskDelete(nullptr); return; }
+
+                char buf[4096];
+                uint32_t rx = 0;
+                bool ok = true;
+                while (ok) {
+                    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                    size_t n = fread(buf, 1, sizeof(buf), f);
+                    xSemaphoreGive(g_sd_mutex);
+                    if (n == 0) break;
+                    if (esp_ota_write(oh, buf, n) != ESP_OK) ok = false;
+                    rx += n;
+                    if ((rx % 65536) < n) cdc_printf("SDFLASH: %lu bytes\r\n", (unsigned long)rx);
+                }
+                xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                fclose(f);
+                remove(tmp);
+                xSemaphoreGive(g_sd_mutex);
+
+                if (ok && esp_ota_end(oh) == ESP_OK && esp_ota_set_boot_partition(update) == ESP_OK) {
+                    cdc_printf("SDFLASH: success — rebooting\r\n");
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    esp_restart();
+                } else {
+                    esp_ota_abort(oh);
+                    cdc_printf("SDFLASH: failed\r\n");
+                }
+                vTaskDelete(nullptr);
+            }, "sdflash", 16384, nullptr, 3, nullptr, 1);
+        }
+
     } else if (strcmp(cmd, "REBOOT") == 0) {
         cdc_printf("CLI: rebooting...\r\n");
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -3883,15 +3995,10 @@ extern "C" void app_main(void) {
 
     // Boot splash is shown later, after file scan
 
-    // ── SD magic files: mode switch + firmware flash ────────────────────
-    // Drop these files on the SD card via USB to trigger actions on next boot:
-    //   ENABLE_CDC   → switch to CDC+MSC mode (serial debug)
-    //   ENABLE_MSC   → switch to MSC-only mode (production)
-    //   firmware.bin → flash from SD card (SD-based OTA)
+    // ── SD magic files: USB mode switch ─────────────────────────────────
+    // Drop ENABLE_CDC or ENABLE_MSC on SD card to switch USB mode on next boot
     if (g_fatfs_mounted) {
         char path[64];
-
-        // USB mode override
         snprintf(path, sizeof(path), "%s/ENABLE_CDC", SD_MOUNT);
         if (access(path, F_OK) == 0) {
             ESP_LOGW(TAG, "SD: ENABLE_CDC found — switching to CDC+MSC");
@@ -3917,72 +4024,6 @@ extern "C" void app_main(void) {
             g_msc_only = true;
             remove(path);
             vTaskDelay(pdMS_TO_TICKS(1000));
-        }
-
-        // SD-based firmware flash
-        snprintf(path, sizeof(path), "%s/firmware.bin", SD_MOUNT);
-        struct stat fwst;
-        if (stat(path, &fwst) == 0 && fwst.st_size > 100000) {
-            ESP_LOGW(TAG, "SD: firmware.bin found (%ld bytes) — flashing", (long)fwst.st_size);
-            disp("SD Flash", "Reading...");
-
-            // Rename first so a crash during flash won't retry on every boot
-            char tmppath[64];
-            snprintf(tmppath, sizeof(tmppath), "%s/_firmware.bin", SD_MOUNT);
-            rename(path, tmppath);
-
-            const esp_partition_t* running = esp_ota_get_running_partition();
-            const esp_partition_t* update_part = esp_ota_get_next_update_partition(running);
-            esp_ota_handle_t ota_handle;
-            bool flash_ok = false;
-
-            if (update_part && esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle) == ESP_OK) {
-                FILE* f = fopen(tmppath, "rb");
-                if (f) {
-                    char buf[4096];
-                    uint32_t received = 0;
-                    bool write_err = false;
-                    while (!write_err) {
-                        size_t n = fread(buf, 1, sizeof(buf), f);
-                        if (n == 0) break;
-                        if (esp_ota_write(ota_handle, buf, n) != ESP_OK) write_err = true;
-                        received += n;
-                        if ((received % 65536) < n) {
-                            char msg[32];
-                            snprintf(msg, sizeof(msg), "%lu/%ld bytes",
-                                     (unsigned long)received, (long)fwst.st_size);
-                            disp("SD Flash", msg);
-                        }
-                    }
-                    fclose(f);
-
-                    if (!write_err && received == (uint32_t)fwst.st_size &&
-                        esp_ota_end(ota_handle) == ESP_OK &&
-                        esp_ota_set_boot_partition(update_part) == ESP_OK) {
-                        flash_ok = true;
-                    } else {
-                        esp_ota_abort(ota_handle);
-                    }
-                }
-            }
-
-            remove(tmppath);  // always delete temp file
-
-            if (flash_ok) {
-                nvs_handle_t h;
-                if (nvs_open("ota", NVS_READWRITE, &h) == ESP_OK) {
-                    nvs_set_str(h, "ota_status", "pending");
-                    nvs_commit(h); nvs_close(h);
-                }
-                ESP_LOGW(TAG, "SD: firmware flashed — rebooting");
-                disp("SD Flash OK", "Rebooting...");
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                esp_restart();
-            } else {
-                ESP_LOGE(TAG, "SD: firmware flash FAILED");
-                disp("SD Flash", "FAILED");
-                vTaskDelay(pdMS_TO_TICKS(3000));
-            }
         }
     }
 
