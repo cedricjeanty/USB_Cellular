@@ -1712,83 +1712,93 @@ static void otaDisplayProgress(int pct, uint32_t received, uint32_t total) {
 }
 
 static bool otaDownloadAndFlash(const char* host, const char* path, uint32_t expectedSize) {
-    // Use esp_http_client which properly handles TLS record reassembly,
-    // TCP flow control, and timeouts over slow PPP links.
-    char url[2048];
-    snprintf(url, sizeof(url), "https://%s%s", host, path);
-
-    esp_http_client_config_t config = {};
-    config.url = url;
-    config.timeout_ms = 30000;  // 30s per-read timeout (fail fast, retry at higher level)
-    config.buffer_size = 4096;
-    config.buffer_size_tx = 1024;
-    config.skip_cert_common_name_check = true;
-    config.transport_type = HTTP_TRANSPORT_OVER_SSL;
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) { log_write("OTA: http_client init failed heap=%lu", (unsigned long)esp_get_free_heap_size()); return false; }
-
+    // Use raw esp_tls (same as upload path which works reliably over cellular)
     g_tlsActive = true;
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK) {
-        log_write("OTA: http open failed: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
+    log_write("OTA: connecting to %s heap=%lu", host, (unsigned long)esp_get_free_heap_size());
+
+    esp_tls_t* tls = tls_connect(host);
+    if (!tls) {
+        log_write("OTA: TLS connect failed heap=%lu", (unsigned long)esp_get_free_heap_size());
         g_tlsActive = false;
         return false;
     }
 
-    int content_length = esp_http_client_fetch_headers(client);
-    if (content_length <= 0) content_length = expectedSize;
-    int status = esp_http_client_get_status_code(client);
-    log_write("OTA: HTTP %d, %d bytes", status, content_length);
+    // Send GET request
+    char hdr[2700];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host);
+    if (!tls_write_all(tls, hdr, hlen)) {
+        log_write("OTA: header send failed");
+        tls_destroy(tls); g_tlsActive = false; return false;
+    }
 
-    if (status != 200) {
-        log_write("OTA: HTTP error %d", status);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        g_tlsActive = false;
-        return false;
+    // Read HTTP status line + headers
+    int contentLength = expectedSize;
+    {
+        char line[512];
+        int status = 0;
+        while (true) {
+            int pos = 0;
+            while (pos < (int)sizeof(line) - 1) {
+                char c;
+                int r = esp_tls_conn_read(tls, &c, 1);
+                if (r <= 0) goto done_hdr;
+                line[pos++] = c;
+                if (c == '\n') break;
+            }
+            line[pos] = '\0';
+            if (status == 0 && strncmp(line, "HTTP/", 5) == 0) {
+                const char* sp = strchr(line, ' ');
+                if (sp) status = atoi(sp + 1);
+            }
+            if (strncasecmp(line, "Content-Length:", 15) == 0)
+                contentLength = atoi(line + 15);
+            if (pos <= 2 && (line[0] == '\r' || line[0] == '\n')) break;
+        }
+done_hdr:
+        log_write("OTA: HTTP %d, %d bytes", status, contentLength);
+        if (status != 200) {
+            tls_destroy(tls); g_tlsActive = false; return false;
+        }
     }
 
     // Prepare OTA partition
     const esp_partition_t* update_part = esp_ota_get_next_update_partition(NULL);
-    if (!update_part) { log_write("OTA: no partition"); esp_http_client_cleanup(client); g_tlsActive = false; return false; }
+    if (!update_part) { log_write("OTA: no partition"); tls_destroy(tls); g_tlsActive = false; return false; }
 
     esp_ota_handle_t ota_handle;
-    err = esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
-    if (err != ESP_OK) { log_write("OTA: begin failed"); esp_http_client_cleanup(client); g_tlsActive = false; return false; }
+    esp_err_t err = esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
+    if (err != ESP_OK) { log_write("OTA: begin failed"); tls_destroy(tls); g_tlsActive = false; return false; }
 
-    // Stream body to flash (4KB chunks for fewer reads over slow cellular)
-    char buf[4096];
+    // Stream body to flash
+    char buf[2048];
     uint32_t received = 0;
-    while (received < (uint32_t)content_length) {
-        int len = esp_http_client_read(client, buf, sizeof(buf));
+    while (received < (uint32_t)contentLength) {
+        int len = esp_tls_conn_read(tls, buf, sizeof(buf));
         if (len > 0) {
             err = esp_ota_write(ota_handle, buf, len);
             if (err != ESP_OK) {
                 log_write("OTA: flash write failed at %lu", (unsigned long)received);
                 esp_ota_abort(ota_handle);
-                esp_http_client_cleanup(client);
-                g_tlsActive = false;
+                tls_destroy(tls); g_tlsActive = false;
                 return false;
             }
             received += len;
             if ((received % 16384) < (uint32_t)len)
-                otaDisplayProgress((received * 100) / content_length, received, content_length);
+                otaDisplayProgress((received * 100) / contentLength, received, contentLength);
         } else if (len == 0) {
-            break;  // done
+            break;
         } else {
-            log_write("OTA: read error at %lu", (unsigned long)received);
+            log_write("OTA: read error at %lu/%d", (unsigned long)received, contentLength);
             break;
         }
     }
 
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
+    tls_destroy(tls);
     g_tlsActive = false;
 
-    if (received < (uint32_t)content_length) {
-        log_write("OTA: incomplete %lu/%d", (unsigned long)received, content_length);
+    if (received < (uint32_t)contentLength) {
+        log_write("OTA: incomplete %lu/%d", (unsigned long)received, contentLength);
         esp_ota_abort(ota_handle);
         return false;
     }
@@ -1799,7 +1809,7 @@ static bool otaDownloadAndFlash(const char* host, const char* path, uint32_t exp
     if (err != ESP_OK) { log_write("OTA: set_boot failed"); return false; }
 
     log_write("OTA: success — %lu bytes", (unsigned long)received);
-    otaDisplayProgress(100, received, content_length);
+    otaDisplayProgress(100, received, contentLength);
     return true;
 }
 
@@ -1978,8 +1988,10 @@ static int otaCheck() {
         return -1;
     }
 
+    log_write("OTA: host=%s path_len=%d heap=%lu", s3Host, (int)strlen(s3Path), (unsigned long)esp_get_free_heap_size());
+
     if (!otaDownloadAndFlash(s3Host, s3Path, ota.size)) {
-        log_write("OTA: download/flash failed");
+        log_write("OTA: download/flash failed heap=%lu", (unsigned long)esp_get_free_heap_size());
         disp("OTA FAILED", "");
         vTaskDelay(pdMS_TO_TICKS(10000));
         g_otaActive = false;
