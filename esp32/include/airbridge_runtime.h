@@ -31,9 +31,6 @@ inline OtaCheckResult halOtaCheck(const char* currentVersion) {
     if (!creds.valid) { r.status = 0; return r; }  // no creds = don't retry
 
     // GET /prod/firmware — version check
-    std::string verResp = s3ApiGetViaHal(creds.apiHost, creds.apiKey, "");
-    // The API path is /prod/firmware, not /prod/presign — we need a different path.
-    // Use a direct GET with the firmware path:
     TlsHandle tls = g_hal->network->connect(creds.apiHost);
     if (!tls) { r.status = -1; return r; }
 
@@ -46,7 +43,7 @@ inline OtaCheckResult halOtaCheck(const char* currentVersion) {
         r.status = -1;
         return r;
     }
-    verResp = halHttpReadResponse(tls);
+    std::string verResp = halHttpReadResponse(tls);
     g_hal->network->destroy(tls);
 
     if (verResp.empty() || verResp.find("\"error\"") != std::string::npos) {

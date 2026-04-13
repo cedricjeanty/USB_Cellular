@@ -1570,6 +1570,12 @@ static esp_tls_t* tls_connect(const char* host) {
         tls_destroy(tls);
         return nullptr;
     }
+    // Set 30s read timeout on the underlying socket (esp_tls_conn_read blocks otherwise)
+    int sock_fd = -1;
+    if (esp_tls_get_conn_sockfd(tls, &sock_fd) == ESP_OK && sock_fd >= 0) {
+        struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+        setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
     return tls;
 }
 
