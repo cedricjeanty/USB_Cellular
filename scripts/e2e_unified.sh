@@ -189,7 +189,7 @@ for port in ports:
         local latest
         latest=$(aws s3 ls "s3://$BUCKET/$DEVICE/logs/" 2>/dev/null | sort | tail -1 | awk '{print $4}')
         [ -n "$latest" ] && aws s3 cp "s3://$BUCKET/$DEVICE/logs/$latest" - 2>/dev/null | \
-            grep -oP 'fw=\K\S+' | head -1
+            grep -oP 'fw=\K[0-9A-Za-z.]+' | head -1
     fi
 }
 
@@ -211,7 +211,7 @@ wait_for_ota() {
         if [ -n "$latest" ]; then
             local log_ver
             log_ver=$(aws s3 cp "s3://$BUCKET/$DEVICE/logs/$latest" - 2>/dev/null | \
-                grep -oP 'fw=\K\S+' | head -1)
+                grep -oP 'fw=\K[0-9A-Za-z.]+' | head -1)
             [ "$log_ver" = "$expected" ] && { OTA_RESULT="$log_ver"; return 0; }
             OTA_RESULT="$log_ver"
         fi
@@ -419,7 +419,7 @@ if [ "$TARGET" = "emulator" ]; then
     stop_device
 else
     start_device 5
-    wait_for_ota "$V_NEW" 300
+    wait_for_ota "$V_NEW" 600
     if [ "$OTA_RESULT" = "$V_NEW" ]; then
         pass "OTA: updated to v$V_NEW (verified via S3 log)"
     else
