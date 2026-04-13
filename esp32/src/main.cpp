@@ -3883,6 +3883,109 @@ extern "C" void app_main(void) {
 
     // Boot splash is shown later, after file scan
 
+    // ── SD magic files: mode switch + firmware flash ────────────────────
+    // Drop these files on the SD card via USB to trigger actions on next boot:
+    //   ENABLE_CDC   → switch to CDC+MSC mode (serial debug)
+    //   ENABLE_MSC   → switch to MSC-only mode (production)
+    //   firmware.bin → flash from SD card (SD-based OTA)
+    if (g_fatfs_mounted) {
+        char path[64];
+
+        // USB mode override
+        snprintf(path, sizeof(path), "%s/ENABLE_CDC", SD_MOUNT);
+        if (access(path, F_OK) == 0) {
+            ESP_LOGW(TAG, "SD: ENABLE_CDC found — switching to CDC+MSC");
+            disp("USB Mode", "CDC+MSC");
+            nvs_handle_t h;
+            if (nvs_open("usb", NVS_READWRITE, &h) == ESP_OK) {
+                nvs_set_u8(h, "msc_only", 0);
+                nvs_commit(h); nvs_close(h);
+            }
+            g_msc_only = false;
+            remove(path);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+        snprintf(path, sizeof(path), "%s/ENABLE_MSC", SD_MOUNT);
+        if (access(path, F_OK) == 0) {
+            ESP_LOGW(TAG, "SD: ENABLE_MSC found — switching to MSC-only");
+            disp("USB Mode", "MSC-only");
+            nvs_handle_t h;
+            if (nvs_open("usb", NVS_READWRITE, &h) == ESP_OK) {
+                nvs_set_u8(h, "msc_only", 1);
+                nvs_commit(h); nvs_close(h);
+            }
+            g_msc_only = true;
+            remove(path);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+
+        // SD-based firmware flash
+        snprintf(path, sizeof(path), "%s/firmware.bin", SD_MOUNT);
+        struct stat fwst;
+        if (stat(path, &fwst) == 0 && fwst.st_size > 100000) {
+            ESP_LOGW(TAG, "SD: firmware.bin found (%ld bytes) — flashing", (long)fwst.st_size);
+            disp("SD Flash", "Reading...");
+
+            // Rename first so a crash during flash won't retry on every boot
+            char tmppath[64];
+            snprintf(tmppath, sizeof(tmppath), "%s/_firmware.bin", SD_MOUNT);
+            rename(path, tmppath);
+
+            const esp_partition_t* running = esp_ota_get_running_partition();
+            const esp_partition_t* update_part = esp_ota_get_next_update_partition(running);
+            esp_ota_handle_t ota_handle;
+            bool flash_ok = false;
+
+            if (update_part && esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle) == ESP_OK) {
+                FILE* f = fopen(tmppath, "rb");
+                if (f) {
+                    char buf[4096];
+                    uint32_t received = 0;
+                    bool write_err = false;
+                    while (!write_err) {
+                        size_t n = fread(buf, 1, sizeof(buf), f);
+                        if (n == 0) break;
+                        if (esp_ota_write(ota_handle, buf, n) != ESP_OK) write_err = true;
+                        received += n;
+                        if ((received % 65536) < n) {
+                            char msg[32];
+                            snprintf(msg, sizeof(msg), "%lu/%ld bytes",
+                                     (unsigned long)received, (long)fwst.st_size);
+                            disp("SD Flash", msg);
+                        }
+                    }
+                    fclose(f);
+
+                    if (!write_err && received == (uint32_t)fwst.st_size &&
+                        esp_ota_end(ota_handle) == ESP_OK &&
+                        esp_ota_set_boot_partition(update_part) == ESP_OK) {
+                        flash_ok = true;
+                    } else {
+                        esp_ota_abort(ota_handle);
+                    }
+                }
+            }
+
+            remove(tmppath);  // always delete temp file
+
+            if (flash_ok) {
+                nvs_handle_t h;
+                if (nvs_open("ota", NVS_READWRITE, &h) == ESP_OK) {
+                    nvs_set_str(h, "ota_status", "pending");
+                    nvs_commit(h); nvs_close(h);
+                }
+                ESP_LOGW(TAG, "SD: firmware flashed — rebooting");
+                disp("SD Flash OK", "Rebooting...");
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                esp_restart();
+            } else {
+                ESP_LOGE(TAG, "SD: firmware flash FAILED");
+                disp("SD Flash", "FAILED");
+                vTaskDelay(pdMS_TO_TICKS(3000));
+            }
+        }
+    }
+
     // FATFS already mounted by sd_init() — no separate mount needed
 
     // ── TinyUSB init ────────────────────────────────────────────────────
