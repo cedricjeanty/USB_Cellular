@@ -147,7 +147,9 @@ namespace {
 const char* const SKIP_NAMES[] = {
     "System Volume Information", "desktop.ini", "Thumbs.db",
     ".Spotlight-V100", ".Trashes", ".fseventsd", "harvested",
-    "airbridge.log", "dsuCookie.easdf", nullptr
+    "airbridge.log", "dsuCookie.easdf",
+    "firmware.bin", "_firmware.bin", "ENABLE_CDC", "ENABLE_MSC",
+    nullptr
 };
 }
 

@@ -3073,6 +3073,61 @@ static void uploadTask(void* param) {
     (void)param;
     static bool otaDone = false;
 
+    // ── SD flash: firmware.bin on SD (runs before network, instant) ────
+    if (g_fatfs_mounted) {
+        char fwp[64];
+        snprintf(fwp, sizeof(fwp), "%s/firmware.bin", SD_MOUNT);
+        struct ::stat fwst;
+        if (::stat(fwp, &fwst) == 0 && fwst.st_size > 100000) {
+            log_write("SD flash: firmware.bin found (%ld bytes)", (long)fwst.st_size);
+            cdc_printf("SD flash: firmware.bin found (%ld bytes)\r\n", (long)fwst.st_size);
+
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "%s/_firmware.bin", SD_MOUNT);
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+            rename(fwp, tmp);
+            xSemaphoreGive(g_sd_mutex);
+
+            const esp_partition_t* update = esp_ota_get_next_update_partition(
+                esp_ota_get_running_partition());
+            esp_ota_handle_t oh;
+            if (update && esp_ota_begin(update, OTA_WITH_SEQUENTIAL_WRITES, &oh) == ESP_OK) {
+                xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                FILE* f = fopen(tmp, "rb");
+                xSemaphoreGive(g_sd_mutex);
+                char buf[4096];
+                uint32_t rx = 0;
+                bool ok = true;
+                while (f && ok) {
+                    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                    size_t n = fread(buf, 1, sizeof(buf), f);
+                    xSemaphoreGive(g_sd_mutex);
+                    if (n == 0) break;
+                    if (esp_ota_write(oh, buf, n) != ESP_OK) ok = false;
+                    rx += n;
+                    if ((rx % 65536) < n)
+                        cdc_printf("SD flash: %lu/%ld bytes\r\n", (unsigned long)rx, (long)fwst.st_size);
+                }
+                if (f) { xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex); }
+
+                if (ok && rx == (uint32_t)fwst.st_size &&
+                    esp_ota_end(oh) == ESP_OK &&
+                    esp_ota_set_boot_partition(update) == ESP_OK) {
+                    xSemaphoreTake(g_sd_mutex, portMAX_DELAY); remove(tmp); xSemaphoreGive(g_sd_mutex);
+                    log_write("SD flash: success — rebooting");
+                    cdc_printf("SD flash: OK — rebooting\r\n");
+                    disp("SD Flash OK", "Rebooting...");
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    esp_restart();
+                } else {
+                    esp_ota_abort(oh);
+                    cdc_printf("SD flash: FAILED\r\n");
+                }
+            }
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY); remove(tmp); xSemaphoreGive(g_sd_mutex);
+        }
+    }
+
     // Wait for network (up to 90s)
     for (int i = 0; i < 90 && !g_netConnected && !g_pppConnected; i++)
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -3114,59 +3169,7 @@ static void uploadTask(void* param) {
         }
     }
 
-    // ── Auto SD flash: firmware.bin on SD card ───────────────────────
-    if (g_fatfs_mounted) {
-        char fwp[64];
-        snprintf(fwp, sizeof(fwp), "%s/firmware.bin", SD_MOUNT);
-        struct ::stat fwst;
-        if (::stat(fwp, &fwst) == 0 && fwst.st_size > 100000) {
-            log_write("SD flash: firmware.bin found (%ld bytes)", (long)fwst.st_size);
-            cdc_printf("SD: firmware.bin found — flashing...\r\n");
-
-            char tmp[64];
-            snprintf(tmp, sizeof(tmp), "%s/_firmware.bin", SD_MOUNT);
-            xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-            rename(fwp, tmp);
-            xSemaphoreGive(g_sd_mutex);
-
-            const esp_partition_t* update = esp_ota_get_next_update_partition(
-                esp_ota_get_running_partition());
-            esp_ota_handle_t oh;
-            if (update && esp_ota_begin(update, OTA_WITH_SEQUENTIAL_WRITES, &oh) == ESP_OK) {
-                xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-                FILE* f = fopen(tmp, "rb");
-                xSemaphoreGive(g_sd_mutex);
-                char buf[4096];
-                uint32_t rx = 0;
-                bool ok = true;
-                while (f && ok) {
-                    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-                    size_t n = fread(buf, 1, sizeof(buf), f);
-                    xSemaphoreGive(g_sd_mutex);
-                    if (n == 0) break;
-                    if (esp_ota_write(oh, buf, n) != ESP_OK) ok = false;
-                    rx += n;
-                }
-                if (f) { xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex); }
-
-                if (ok && rx == (uint32_t)fwst.st_size &&
-                    esp_ota_end(oh) == ESP_OK &&
-                    esp_ota_set_boot_partition(update) == ESP_OK) {
-                    xSemaphoreTake(g_sd_mutex, portMAX_DELAY); remove(tmp); xSemaphoreGive(g_sd_mutex);
-                    log_write("SD flash: success — rebooting");
-                    cdc_printf("SD flash: OK — rebooting\r\n");
-                    disp("SD Flash OK", "Rebooting...");
-                    vTaskDelay(pdMS_TO_TICKS(2000));
-                    esp_restart();
-                } else {
-                    esp_ota_abort(oh);
-                    log_write("SD flash: FAILED");
-                    cdc_printf("SD flash: FAILED\r\n");
-                }
-            }
-            xSemaphoreTake(g_sd_mutex, portMAX_DELAY); remove(tmp); xSemaphoreGive(g_sd_mutex);
-        }
-    }
+    // SD flash runs at top of uploadTask — no duplicate needed here
 
     // ── Check S3 for custom DSU cookie override ─────────────────────
     if ((g_netConnected || g_pppConnected) && s3LoadCreds()) {
