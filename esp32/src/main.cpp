@@ -1967,11 +1967,10 @@ static int otaCheck() {
         return -1;
     }
 
-    // Update available — show on display (shared)
-    // Show OTA status in the main display (connection bar stays visible)
+    // Update available — switch display from "Checking..." to version + progress bar
     strlcpy(g_otaTargetVer, ota.newVersion, sizeof(g_otaTargetVer));
     g_displayState.otaActive = true;
-    g_displayState.otaPct = -1;  // "Checking..."
+    g_displayState.otaPct = 0;  // show version + empty progress bar
     strlcpy(g_displayState.otaVersion, ota.newVersion, sizeof(g_displayState.otaVersion));
     g_otaActive = true;
     log_write("OTA: update %s -> %s (%lu bytes)", FW_VERSION, ota.newVersion, (unsigned long)ota.size);
@@ -1990,8 +1989,6 @@ static int otaCheck() {
 
     if (!otaDownloadAndFlash(s3Host, s3Path, ota.size)) {
         log_write("OTA: download/flash failed heap=%lu", (unsigned long)esp_get_free_heap_size());
-        disp("OTA FAILED", "");
-        vTaskDelay(pdMS_TO_TICKS(10000));
         g_otaActive = false;
         g_displayState.otaActive = false;
         return -1;
@@ -3115,8 +3112,7 @@ static void uploadTask(void* param) {
                     xSemaphoreTake(g_sd_mutex, portMAX_DELAY); remove(tmp); xSemaphoreGive(g_sd_mutex);
                     log_write("SD flash: success — rebooting");
                     cdc_printf("SD flash: OK — rebooting\r\n");
-                    disp("SD Flash OK", "Rebooting...");
-                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    vTaskDelay(pdMS_TO_TICKS(1000));
                     esp_restart();
                 } else {
                     esp_ota_abort(oh);
@@ -3166,15 +3162,13 @@ static void uploadTask(void* param) {
             // OTA downloaded — reboot immediately unless host is actively writing
             uint32_t lastWr = g_lastWriteMs;
             if (lastWr != 0 && (millis() - lastWr) < QUIET_WINDOW_MS) {
-                // Host is writing — wait for idle
                 log_write("OTA: waiting for host writes to settle");
-                disp("OTA Ready", "Wait for USB...");
                 while (millis() - g_lastWriteMs < QUIET_WINDOW_MS) {
                     vTaskDelay(pdMS_TO_TICKS(1000));
                 }
             }
             log_write("OTA: rebooting to apply update");
-            disp("OTA Complete", "Rebooting...");
+            cdc_printf("OTA: rebooting...\r\n");
             vTaskDelay(pdMS_TO_TICKS(1000));
             esp_restart();
         }
