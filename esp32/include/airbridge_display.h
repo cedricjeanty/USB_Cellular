@@ -161,7 +161,7 @@ inline void updateDisplay(DisplayState& ds) {
 inline void dispBootSplash(const char* fwVersion, const char* deviceId,
                             const char* usbMode = "CDC+MSC") {
     g_hal->display->clear();
-    g_hal->display->text(10, 0, "AirBridge", 2);
+    g_hal->display->text(10, 1, "AirBridge", 2);
 
     // Device ID
     if (deviceId && deviceId[0]) {
@@ -192,7 +192,7 @@ inline void dispBootSplash(const char* fwVersion, const char* deviceId,
 // OTA update display — shows version being downloaded + progress
 inline void dispOtaProgress(const char* newVersion, int pct) {
     g_hal->display->clear();
-    g_hal->display->text(10, 0, "AirBridge", 2);
+    g_hal->display->text(10, 1, "AirBridge", 2);
     g_hal->display->hline(0, 127, 20);
 
     char updLine[24];
