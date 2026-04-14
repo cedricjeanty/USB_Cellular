@@ -117,8 +117,14 @@ static ModemInitResult s_modemResult = {};
 
 static pid_t s_clientPppd = -1;
 
+// Simulated connection delay (real SIM7600 takes 20-30s for AT+registration+PPP)
+#define MODEM_SIM_DELAY_MS 10000
+
 static void modemInitThread(DisplayState* ds) {
     printf("[Modem] Starting AT init sequence...\n");
+
+    // Phase 1: AT sync (2s simulated)
+    usleep(2000000);
     bool synced = modemAtSync();
     if (!synced) {
         printf("[Modem] AT sync failed\n");
@@ -126,14 +132,21 @@ static void modemInitThread(DisplayState* ds) {
         return;
     }
     printf("[Modem] AT sync OK — running init...\n");
+
+    // Phase 2: Registration + operator (show "Connecting..." on display)
+    ds->modemReady = true;
+    usleep(3000000);  // 3s for registration
+
     s_modemResult = modemRunInit();
     printf("[Modem] Init complete: op=%s rssi=%d reg=%d ppp=%d\n",
            s_modemResult.operatorName, s_modemResult.rssi,
            s_modemResult.registered, s_modemResult.connected);
 
-    ds->modemReady = true;
     ds->modemRssi = s_modemResult.rssi;
     strlcpy(ds->modemOp, s_modemResult.operatorName, sizeof(ds->modemOp));
+
+    // Phase 3: PPP dial (5s simulated — real device takes 5-10s)
+    usleep(5000000);
 
     if (s_modemResult.connected && s_modem) {
         // Start pppd on the slave fd — it negotiates PPP with SimModem
@@ -205,6 +218,23 @@ static void modemInitThread(DisplayState* ds) {
         }
     }
     s_modemInitDone = true;
+}
+
+// ── OTA progress — updates display during download ─────────────────────────
+
+static void renderFramebuffer(SDL_Renderer* renderer);  // forward decl
+
+static DisplayState* s_otaDs = nullptr;
+static SDL_Renderer* s_otaRenderer = nullptr;
+
+static void otaProgressCb(uint32_t sent, uint32_t total) {
+    if (s_otaDs && total > 0) {
+        s_otaDs->otaPct = (int)(sent * 100ULL / total);
+        updateDisplay(*s_otaDs);
+        if (s_otaRenderer) renderFramebuffer(s_otaRenderer);
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {}
+    }
 }
 
 // ── S3 upload — runs in background thread like real device ──────────────────
@@ -521,14 +551,22 @@ int main(int argc, char* argv[]) {
         // ── Automated pipeline (mirrors main_loop_task) ─────────────
         uint32_t now = g_hal->clock->millis();
 
-        // OTA check — runs once after modem connects (same as firmware uploadTask)
-        // Show "Checking for update..." until OTA resolves
+        // OTA check — show "Checking..." first, then run OTA on next frame
+        static bool otaReadyToRun = false;
         if (!otaChecked && !ds.otaActive) {
             ds.otaActive = true;
             ds.otaPct = -1;
         }
 
-        if (!otaChecked && s_modemInitDone && ds.pppConnected) {
+        if (!otaChecked && s_modemInitDone && ds.pppConnected && !otaReadyToRun) {
+            // Modem just connected — render one frame with "Checking..." before blocking
+            otaReadyToRun = true;
+            updateDisplay(ds);
+            renderFramebuffer(renderer);
+            continue;  // let the frame display, run OTA on next iteration
+        }
+
+        if (!otaChecked && otaReadyToRun) {
             otaChecked = true;
             printf("[OTA] Checking for firmware update (current=%s)...\n", FW_VERSION);
 
@@ -537,12 +575,13 @@ int main(int argc, char* argv[]) {
                 printf("[OTA] Update available: v%s (%u bytes)\n", ota.newVersion, ota.size);
                 strlcpy(ds.otaVersion, ota.newVersion, sizeof(ds.otaVersion));
                 ds.otaPct = 0;
+                updateDisplay(ds); renderFramebuffer(renderer);
 
                 printf("[OTA] Downloading...\n");
+                s_otaDs = &ds;
+                s_otaRenderer = renderer;
                 OtaDownloadResult dl = halOtaDownload(ota, "./emu_ota_update.bin",
-                    [](uint32_t sent, uint32_t total) {
-                        // Progress callback — can't easily update ds from here
-                    });
+                    otaProgressCb);
 
                 if (dl.success) {
                     printf("[OTA] Downloaded %u bytes → emu_ota_update.bin\n", dl.bytesDownloaded);
