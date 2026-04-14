@@ -83,12 +83,12 @@ inline void updateDisplay(DisplayState& ds) {
             int pw = strlen(pctStr) * 6;
             g_hal->display->text((128 - pw) / 2, 49, pctStr);
         } else {
-            // Waiting for connection or checking
-            g_hal->display->text(4, 24, "Checking for");
-            g_hal->display->text(4, 36, "update...");
+            // Waiting for connection or checking — centered
+            g_hal->display->text(16, 24, "Checking for");
+            g_hal->display->text(28, 36, "update...");
         }
 
-        g_hal->display->text(16, 55, "Do not unplug");
+        // Row 55 left empty (was "Do not unplug")
     } else {
         // ── Normal operational display ──────────────────────────────────
         float uploaded  = ds.mbUploaded + ds.uploadingMb;
