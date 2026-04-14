@@ -3992,6 +3992,67 @@ extern "C" void app_main(void) {
             remove(path);
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
+        // ── WIFI_CONFIG — two lines: ssid, password ─────────────────────
+        snprintf(path, sizeof(path), "%s/WIFI_CONFIG", SD_MOUNT);
+        {
+            FILE* wf = fopen(path, "r");
+            if (wf) {
+                char ssid[64] = "", pass[64] = "";
+                if (fgets(ssid, sizeof(ssid), wf)) {
+                    ssid[strcspn(ssid, "\r\n")] = '\0';
+                    if (fgets(pass, sizeof(pass), wf)) pass[strcspn(pass, "\r\n")] = '\0';
+                }
+                fclose(wf);
+                if (ssid[0]) {
+                    char wifiArgs[130];
+                    snprintf(wifiArgs, sizeof(wifiArgs), "%s %s", ssid, pass);
+                    CliResult r = cliSetWifi(wifiArgs);
+                    airbridge_log("SD: WIFI_CONFIG → %s", r.output);
+                }
+                remove(path);
+            }
+        }
+
+        // ── S3_CONFIG — two lines: api_host, api_key ────────────────────
+        snprintf(path, sizeof(path), "%s/S3_CONFIG", SD_MOUNT);
+        {
+            FILE* sf = fopen(path, "r");
+            if (sf) {
+                char host[128] = "", key[64] = "";
+                if (fgets(host, sizeof(host), sf)) {
+                    host[strcspn(host, "\r\n")] = '\0';
+                    if (fgets(key, sizeof(key), sf)) key[strcspn(key, "\r\n")] = '\0';
+                }
+                fclose(sf);
+                if (host[0] && key[0]) {
+                    char s3Args[200];
+                    snprintf(s3Args, sizeof(s3Args), "%s %s", host, key);
+                    CliResult r = cliSetS3(s3Args);
+                    airbridge_log("SD: S3_CONFIG → %s", r.output);
+                }
+                remove(path);
+            }
+        }
+
+        // ── FORMAT_SD — format SD card ──────────────────────────────────
+        snprintf(path, sizeof(path), "%s/FORMAT_SD", SD_MOUNT);
+        if (access(path, F_OK) == 0) {
+            remove(path);
+            airbridge_log("SD: FORMAT_SD found — formatting");
+            disp("Formatting SD", "Please wait...");
+            // Trigger format (reuses existing FORMAT logic in CLI section)
+            // For now, just log — full format requires unmount/remount
+            airbridge_log("SD: FORMAT not yet implemented via magic file");
+        }
+
+        // ── REBOOT — reboot device ──────────────────────────────────────
+        snprintf(path, sizeof(path), "%s/REBOOT", SD_MOUNT);
+        if (access(path, F_OK) == 0) {
+            remove(path);
+            airbridge_log("SD: REBOOT found — rebooting");
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_restart();
+        }
     }
 
     // FATFS already mounted by sd_init() — no separate mount needed

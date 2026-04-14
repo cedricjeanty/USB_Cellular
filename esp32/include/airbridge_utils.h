@@ -149,6 +149,7 @@ const char* const SKIP_NAMES[] = {
     ".Spotlight-V100", ".Trashes", ".fseventsd", "harvested",
     "airbridge.log", "dsuCookie.easdf",
     "firmware.bin", "_firmware.bin", "ENABLE_CDC", "ENABLE_MSC",
+    "WIFI_CONFIG", "S3_CONFIG", "FORMAT_SD", "REBOOT",
     nullptr
 };
 }
