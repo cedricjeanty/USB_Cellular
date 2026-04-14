@@ -3036,8 +3036,8 @@ static void uploadTask(void* param) {
         }
     }
 
-    // Let network stack stabilize (default route, DNS, etc.)
-    if (g_pppConnected) vTaskDelay(pdMS_TO_TICKS(5000));
+    // Brief pause for network stack to stabilize (default route, DNS)
+    if (g_pppConnected) vTaskDelay(pdMS_TO_TICKS(2000));
 
     // ── OTA check (before USB presentation — cookie + update ready for host) ──
     if (!otaDone && (g_netConnected || g_pppConnected)) {
@@ -3053,6 +3053,8 @@ static void uploadTask(void* param) {
             if (otaResult >= 0) break;  // success or up-to-date → stop retrying
         }
         otaDone = true;
+        g_displayState.otaActive = false;  // clear "Checking..." immediately
+        g_otaActive = false;
         bool staged = (otaResult == 1);
 
         if (staged) {
@@ -3070,6 +3072,9 @@ static void uploadTask(void* param) {
             esp_restart();
         }
     }
+    // Clear checking display whether OTA ran or not (network timeout)
+    g_displayState.otaActive = false;
+    g_otaActive = false;
 
     // SD flash runs at top of uploadTask — no duplicate needed here
 
