@@ -169,7 +169,7 @@ get_fw_version() {
     if [ "$TARGET" = "emulator" ]; then
         grep 'FW_VERSION' "$FW_DIR/src/main.cpp" | head -1 | grep -o '"[^"]*"' | tr -d '"'
     else
-        # Try serial first
+        # Read log stream passively (no CLI commands — serial is log-only)
         local ver=""
         ver=$(python3 -c "
 import serial, time, re, glob
@@ -177,11 +177,14 @@ ports = sorted(glob.glob('/dev/ttyACM*'))
 if not ports: exit()
 for port in ports:
     try:
-        s = serial.Serial(port, 115200, timeout=3)
-        s.write(b'STATUS\r\n'); time.sleep(2)
-        data = s.read(4096).decode(errors='replace'); s.close()
-        m = re.search(r'fw=(\S+)', data)
-        if m: print(m.group(1)); break
+        s = serial.Serial(port, 115200, timeout=30)
+        start = time.time()
+        while time.time() - start < 30:
+            line = s.readline().decode(errors='replace')
+            m = re.search(r'fw=([0-9A-Za-z.]+)', line)
+            if m: print(m.group(1)); break
+        s.close()
+        break
     except: pass
 " 2>/dev/null)
         if [ -n "$ver" ]; then echo "$ver"; return; fi
