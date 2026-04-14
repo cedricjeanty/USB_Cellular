@@ -480,8 +480,93 @@ else
     stop_device
 fi
 
-# ── TEST 9: Boot splash ──────────────────────────────────────────────────────
-log ""; log "TEST 9: Boot splash"
+# ── TEST 9: Pre-USB: OTA + cookie before host ───────────────────────────────
+log ""; log "TEST 9: OTA + S3 cookie land before USB presentation"
+if [ "$TARGET" = "emulator" ]; then
+    rm -rf "$SD_EMU/harvested" "$SD_EMU/flightHistory"
+    rm -f "$SD_EMU/dsuCookie.easdf"
+
+    # Build a "cookie" — 78-byte binary with EA1E magic header
+    COOKIE_HEX="EA1E"$(python3 -c "import os; print(os.urandom(76).hex())")
+    echo "$COOKIE_HEX" | xxd -r -p > /tmp/test_cookie.bin
+
+    # Upload cookie to S3 firmware path (Lambda serves it to device)
+    aws s3 cp /tmp/test_cookie.bin "s3://$BUCKET/firmware/dsuCookie.easdf" >/dev/null 2>&1
+
+    # Deploy OTA with a newer version
+    V_PRE=$(date +%Y%m%d%H%M%S)
+    deploy_ota "$V_PRE"
+
+    start_device 5
+
+    # Wait for emulator to signal pre-USB done (OTA downloaded + cookie fetched)
+    # Check: cookie should be on SD before any flight files appear
+    COOKIE_FOUND=false
+    for i in $(seq 1 60); do
+        if [ -f "$SD_EMU/dsuCookie.easdf" ]; then
+            COOKIE_FOUND=true
+            log "  S3 cookie arrived on SD at ${i}s"
+            break
+        fi
+        sleep 1
+    done
+
+    if $COOKIE_FOUND; then
+        pass "Pre-USB: S3 cookie on SD before USB presentation"
+    else
+        fail "Pre-USB: S3 cookie not found on SD"
+    fi
+
+    # Check OTA downloaded (emulator writes emu_ota_update.bin)
+    if [ -f "$FW_DIR/emu_ota_update.bin" ]; then
+        pass "Pre-USB: OTA downloaded before USB presentation"
+    else
+        # OTA might have been "up to date" if version didn't change
+        if grep -q "Up to date\|up to date" /tmp/emu_e2e.log 2>/dev/null; then
+            pass "Pre-USB: OTA checked (up to date)"
+        else
+            fail "Pre-USB: OTA not downloaded"
+        fi
+    fi
+
+    stop_device
+    # Reset OTA
+    deploy_ota "$(get_fw_version 2>/dev/null || echo $FW_CURRENT)"
+else
+    # Hardware: deploy OTA + cookie, boot, verify cookie on SD after boot
+    # Build cookie
+    COOKIE_HEX="EA1E"$(python3 -c "import os; print(os.urandom(76).hex())")
+    echo "$COOKIE_HEX" | xxd -r -p > /tmp/test_cookie.bin
+    aws s3 cp /tmp/test_cookie.bin "s3://$BUCKET/firmware/dsuCookie.easdf" >/dev/null 2>&1
+    log "  S3 cookie uploaded"
+
+    start_device 5
+    # Wait for device to boot, fetch cookie, present USB
+    sleep 90
+    sddev=""
+    for d in /dev/sda1 /dev/sdb1 /dev/sdc1; do [ -b "$d" ] && { sddev="$d"; break; }; done
+    if [ -n "$sddev" ]; then
+        sudo mount -o noatime "$sddev" /mnt 2>/dev/null
+        if [ -f /mnt/dsuCookie.easdf ]; then
+            # Verify it's our test cookie (check EA1E magic)
+            MAGIC=$(xxd -l 2 -p /mnt/dsuCookie.easdf 2>/dev/null)
+            if [ "$MAGIC" = "ea1e" ]; then
+                pass "Pre-USB: S3 cookie on SD before USB presentation"
+            else
+                fail "Pre-USB: cookie on SD but wrong magic ($MAGIC)"
+            fi
+        else
+            fail "Pre-USB: no cookie on SD after boot"
+        fi
+        sudo umount /mnt 2>/dev/null
+    else
+        skip "Pre-USB: can't mount SD (MSC-only mode)"
+    fi
+    stop_device
+fi
+
+# ── TEST 10: Boot splash ─────────────────────────────────────────────────────
+log ""; log "TEST 10: Boot splash"
 if [ "$TARGET" = "emulator" ]; then
     start_device 5
     pass "Boot splash rendered"

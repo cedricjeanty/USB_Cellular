@@ -561,9 +561,49 @@ int main(int argc, char* argv[]) {
                 printf("[OTA] Check failed (network error)\n");
                 s_log.write(now, "OTA: check failed");
             }
+
+            // Fetch S3 DSU cookie (same as firmware uploadTask)
+            {
+                char apiHost[128] = "", apiKey[64] = "";
+                g_hal->nvs->get_str("s3", "api_host", apiHost, sizeof(apiHost));
+                g_hal->nvs->get_str("s3", "api_key", apiKey, sizeof(apiKey));
+                if (apiHost[0] && apiKey[0]) {
+                    TlsHandle tls = g_hal->network->connect(apiHost);
+                    if (tls) {
+                        char req[512];
+                        snprintf(req, sizeof(req),
+                            "GET /prod/firmware/cookie HTTP/1.1\r\nHost: %s\r\nx-api-key: %s\r\nConnection: close\r\n\r\n",
+                            apiHost, apiKey);
+                        g_hal->network->write(tls, req, strlen(req));
+                        std::string resp = halHttpReadResponse(tls);
+                        g_hal->network->destroy(tls);
+
+                        std::string hexStr = jsonStr(resp, "cookie");
+                        if (hexStr.size() == 156) {
+                            uint8_t cookie[78];
+                            for (int i = 0; i < 78; i++) {
+                                char h[3] = { hexStr[i*2], hexStr[i*2+1], 0 };
+                                cookie[i] = (uint8_t)strtol(h, nullptr, 16);
+                            }
+                            if (cookie[0] == 0xEA && cookie[1] == 0x1E) {
+                                char cp[256];
+                                snprintf(cp, sizeof(cp), "%s/dsuCookie.easdf", SD_ROOT);
+                                void* cf = g_hal->filesys->open(cp, "wb");
+                                if (cf) {
+                                    g_hal->filesys->write(cf, cookie, 78);
+                                    g_hal->filesys->close(cf);
+                                    printf("[S3] Cookie applied to SD\n");
+                                }
+                            }
+                        } else {
+                            printf("[S3] No cookie available\n");
+                        }
+                    }
+                }
+            }
         }
 
-        // Auto-upload pending files after modem connects (boot resume)
+        // Auto-upload pending files after modem connects
         static bool bootUploadChecked = false;
         if (!bootUploadChecked && s_modemInitDone && ds.pppConnected && ds.mbQueued > 0.0f && !s_uploading) {
             bootUploadChecked = true;
