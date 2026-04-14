@@ -1696,12 +1696,12 @@ static bool s3ApiComplete(const char* uploadId, const char* key,
 static char g_otaTargetVer[16] = "";
 
 // Update OTA fields on the display state (rendered by updateDisplay in main loop)
+// Do NOT call doUpdateDisplay() here — this runs in the upload task and would
+// race with main_loop_task's display rendering, causing screen corruption.
 static void otaDisplayProgress(int pct, uint32_t received, uint32_t total) {
     g_displayState.otaActive = true;
     g_displayState.otaPct = pct;
     strlcpy(g_displayState.otaVersion, g_otaTargetVer, sizeof(g_displayState.otaVersion));
-    // Force immediate display refresh
-    doUpdateDisplay();
     (void)received; (void)total;
 }
 
