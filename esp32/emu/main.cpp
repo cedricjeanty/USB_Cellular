@@ -359,11 +359,13 @@ int main(int argc, char* argv[]) {
     const char* deviceId = (argc > 1) ? argv[1] : "EMU000001";
     s_nvs.set_str("s3", "device_id", deviceId);
 
+    airbridge_log("AirBridge fw=%s (emulator)", FW_VERSION);
+
     char tmp[4] = "";
     if (!s_nvs.get_str("s3", "api_host", tmp, sizeof(tmp)) || tmp[0] == '\0') {
         s_nvs.set_str("s3", "api_host", "disw6oxjed.execute-api.us-west-2.amazonaws.com");
         s_nvs.set_str("s3", "api_key",  "7fFErx7ZCt9Vr2fvYfyOT7YxxeEjay4G5bpmfYdm");
-        printf("S3 credentials provisioned (first run)\n");
+        airbridge_log("S3 credentials provisioned (first run)");
     }
 
     ::mkdir(SD_ROOT, 0755);

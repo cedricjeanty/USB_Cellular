@@ -3773,6 +3773,20 @@ static void main_loop_task(void* param) {
             log_write("Harvest trigger: %.1fKB, %us idle", g_hostWrittenMb * 1024.0f, (now - lastWr) / 1000);
             if (g_harvest_task) xTaskNotifyGive(g_harvest_task);
         }
+        // Periodic STATUS log (every 60s) — replaces CLI STATUS command
+        {
+            static uint32_t lastStatusMs = 0;
+            if (now - lastStatusMs >= 60000) {
+                lastStatusMs = now;
+                airbridge_log("STATUS fw=%s device=%s net=%s rssi=%d q=%u up=%u mbq=%.1f mbup=%.1f heap=%lu",
+                    FW_VERSION, g_deviceId,
+                    g_pppConnected ? "ppp" : (g_netConnected ? "wifi" : "none"),
+                    g_modemRssi, g_filesQueued, g_filesUploaded,
+                    g_mbQueued, g_mbUploaded,
+                    (unsigned long)esp_get_free_heap_size());
+            }
+        }
+
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
@@ -3787,6 +3801,7 @@ extern "C" void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
     log_init();
+    airbridge_log("AirBridge fw=%s heap=%lu", FW_VERSION, (unsigned long)esp_get_free_heap_size());
 
     // ── HAL initialization ─────────────────────────────────────────────
     static Esp32Display  s_display;
