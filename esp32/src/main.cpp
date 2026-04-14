@@ -27,6 +27,7 @@
 #include "airbridge_cli.h"
 #include "airbridge_modem.h"
 #include "airbridge_runtime.h"
+#include "airbridge_log.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -429,9 +430,32 @@ static int               g_modemRssi    = 99;
 static char g_cli_buf[128];
 static int  g_cli_len = 0;
 
+// ── Unified logging (early, before any callbacks that use log_write/cdc_printf)
+static void _cdc_serial_sink(const char* buf, int len) {
+    if (g_msc_only) return;
+    if (tud_cdc_connected()) {
+        tud_cdc_write(buf, len);
+        tud_cdc_write_flush();
+    }
+}
+#define log_write   airbridge_log
+#define log_init()  airbridge_log_init(_cdc_serial_sink, millis)
+#define log_flush_to_sd() airbridge_log_flush("/sdcard/airbridge.log")
+
+static void cdc_printf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+static void cdc_printf(const char* fmt, ...) {
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    while (len > 0 && (buf[len-1] == '\r' || buf[len-1] == '\n')) len--;
+    buf[len] = '\0';
+    if (len > 0) airbridge_log("%s", buf);
+}
+
 // ── Forward declarations ────────────────────────────────────────────────────
 static void processCLI(const char* cmd);
-static void log_write(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void doUpdateDisplay();
 static void disp(const char* line1, const char* line2 = nullptr);
 static bool sd_mount_fatfs();
@@ -633,108 +657,7 @@ void cdc_rx_callback(int itf, cdcacm_event_t *event) {
 
 }  // extern "C"
 
-// ── CDC print helper ────────────────────────────────────────────────────────
-// Wrapper to print to USB CDC (similar to Serial.print)
-static void cdc_printf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
-static void cdc_printf(const char* fmt, ...) {
-    if (g_msc_only) return;
-    char buf[256];
-    va_list args;
-    va_start(args, fmt);
-    int len = vsnprintf(buf, sizeof(buf), fmt, args);
-    va_end(args);
-    if (len > 0 && tud_cdc_connected()) {
-        tud_cdc_write(buf, len);
-        tud_cdc_write_flush();
-    }
-}
-
-// ── File-based logger (readable from USB) ───────────────────────────────────
-// Buffers log entries in RAM. Flushed to /sdcard/airbridge.log during harvest
-// (when we have exclusive FATFS access — can't write while MSC is active).
-#define LOG_BUF_SIZE 8192
-static char g_log_buf[LOG_BUF_SIZE];
-static int  g_log_len = 0;
-static SemaphoreHandle_t g_log_mutex = nullptr;
-
-static void log_init() {
-    g_log_mutex = xSemaphoreCreateMutex();
-    g_log_len = 0;
-}
-
-// Buffer a log entry in RAM (call anytime)
-static void log_write(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
-static void log_write(const char* fmt, ...) {
-    if (!g_log_mutex) return;
-    if (xSemaphoreTake(g_log_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
-
-    // Prepend timestamp: real time if synced, otherwise uptime
-    int avail = LOG_BUF_SIZE - g_log_len;
-    if (avail > 24) {
-        int n;
-        if (g_bootEpoch > 0) {
-            uint32_t now = g_bootEpoch + (millis() - g_bootMs) / 1000;
-            time_t t = (time_t)now;
-            struct tm tm;
-            gmtime_r(&t, &tm);
-            n = snprintf(g_log_buf + g_log_len, avail, "[%02d/%02d %02d:%02d:%02d] ",
-                         tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
-        } else {
-            n = snprintf(g_log_buf + g_log_len, avail, "[+%lus] ", (unsigned long)(millis() / 1000));
-        }
-        g_log_len += n;
-        avail -= n;
-    }
-
-    if (avail > 1) {
-        va_list args;
-        va_start(args, fmt);
-        int n = vsnprintf(g_log_buf + g_log_len, avail, fmt, args);
-        va_end(args);
-        if (n > 0) {
-            g_log_len += (n < avail) ? n : avail - 1;
-        }
-    }
-
-    // Add newline
-    if (g_log_len < LOG_BUF_SIZE - 1) {
-        g_log_buf[g_log_len++] = '\n';
-    }
-
-    // If buffer is getting full, discard oldest half
-    if (g_log_len > LOG_BUF_SIZE - 256) {
-        int half = g_log_len / 2;
-        // Find next newline after halfway point
-        while (half < g_log_len && g_log_buf[half] != '\n') half++;
-        if (half < g_log_len) half++;
-        memmove(g_log_buf, g_log_buf + half, g_log_len - half);
-        g_log_len -= half;
-    }
-
-    xSemaphoreGive(g_log_mutex);
-}
-
-// Flush buffered log to SD card file (call ONLY with exclusive FATFS access)
-static void log_flush_to_sd() {
-    if (!g_log_mutex || g_log_len == 0) return;
-    if (xSemaphoreTake(g_log_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
-
-    FILE* f = fopen("/sdcard/airbridge.log", "a");
-    if (f) {
-        // Truncate if file is too large
-        fseek(f, 0, SEEK_END);
-        if (ftell(f) > 64 * 1024) {
-            fclose(f);
-            f = fopen("/sdcard/airbridge.log", "w");
-        }
-        if (f) {
-            fwrite(g_log_buf, 1, g_log_len, f);
-            fclose(f);
-        }
-    }
-    g_log_len = 0;
-    xSemaphoreGive(g_log_mutex);
-}
+// (logging functions moved to early section above, before TinyUSB callbacks)
 
 // ── SD card init ────────────────────────────────────────────────────────────
 // Single init: mounts FATFS which also initializes the card.
@@ -2548,6 +2471,7 @@ static void modemTask(void* param) {
                 epoch -= tzOffsetSec;  // convert local → UTC
                 g_bootEpoch = (uint32_t)epoch;
                 g_bootMs = millis();
+                airbridge_log_set_time(g_bootEpoch, g_bootMs);
                 // Generate dated log filename for this boot session
                 struct tm utc;
                 gmtime_r(&epoch, &utc);
@@ -2972,22 +2896,17 @@ static void modemTask(void* param) {
         uint32_t sinceConnect = pppConnectMs ? (millis() - pppConnectMs) : 0;
         bool firstUpload = (lastLogUploadMs == 0 && sinceConnect > 30000);
 
-        if (g_pppConnected && !logUpRunning && g_log_len > 0 && g_logFileName[0] &&
+        if (g_pppConnected && !logUpRunning && s_loglen > 0 && g_logFileName[0] &&
             (firstUpload || (logInterval > 0 && (millis() - lastLogUploadMs) > logInterval))) {
             lastLogUploadMs = millis();
             logUpRunning = true;
             xTaskCreatePinnedToCore([](void*) {
-                // All std::string objects must be scoped so their destructors
-                // run before vTaskDelete (which does NOT call C++ destructors).
                 do {
                     if (!s3LoadCreds()) break;
 
-                    // Snapshot the full log buffer
-                    if (xSemaphoreTake(g_log_mutex, pdMS_TO_TICKS(100)) != pdTRUE) break;
-                    static char logSnap[LOG_BUF_SIZE];
-                    int snapLen = g_log_len;
-                    memcpy(logSnap, g_log_buf, snapLen);
-                    xSemaphoreGive(g_log_mutex);
+                    // Snapshot the log buffer via unified API
+                    static char logSnap[AIRBRIDGE_LOG_BUF_SIZE];
+                    int snapLen = airbridge_log_snapshot(logSnap, sizeof(logSnap));
 
                     if (snapLen == 0) break;
 

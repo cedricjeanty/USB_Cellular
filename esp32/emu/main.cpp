@@ -40,6 +40,7 @@
 #include "sim_dsu.h"
 #include "airbridge_triggers.h"
 #include "airbridge_runtime.h"
+#include "airbridge_log.h"
 
 // ── Display: same as TestDisplay but with SDL-compatible init ────────────────
 
@@ -76,6 +77,34 @@ static const char* SD_ROOT = "./emu_sdcard";
 static SpeedTracker s_usbSpeed = {};
 static SpeedTracker s_uploadSpeed = {};
 static LogBuffer s_log;
+
+// ── Log PTY — external tools can `cat` it for real-time logs ────────────────
+static int s_logPtyMaster = -1;
+static char s_logPtyPath[64] = "";
+
+static void _emu_serial_sink(const char* buf, int len) {
+    // Write to stdout
+    fwrite(buf, 1, len, stdout);
+    fflush(stdout);
+    // Write to log PTY (if open)
+    if (s_logPtyMaster >= 0) {
+        ::write(s_logPtyMaster, buf, len);
+    }
+}
+
+// Backward-compat: route cdc_printf through airbridge_log
+static void cdc_printf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+static void cdc_printf(const char* fmt, ...) {
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    while (len > 0 && (buf[len-1] == '\r' || buf[len-1] == '\n')) len--;
+    buf[len] = '\0';
+    if (len > 0) airbridge_log("%s", buf);
+}
+#define log_write airbridge_log
 
 // Harvest pipeline state (mirrors firmware globals)
 static bool     s_writeDetected = false;
@@ -310,6 +339,22 @@ static void renderFramebuffer(SDL_Renderer* renderer) {
 
 int main(int argc, char* argv[]) {
     s_display.init();
+
+    // Create log PTY for external tools (cat, test scripts)
+    {
+        int slaveFd = -1;
+        char sname[64] = "";
+        if (openpty(&s_logPtyMaster, &slaveFd, sname, nullptr, nullptr) == 0) {
+            if (slaveFd >= 0) close(slaveFd);  // we only need the master side
+            strlcpy(s_logPtyPath, sname, sizeof(s_logPtyPath));
+            // Write path to file for E2E test discovery
+            FILE* f = fopen("./emu_log.pty", "w");
+            if (f) { fprintf(f, "%s\n", s_logPtyPath); fclose(f); }
+        }
+    }
+
+    // Init unified logging with PTY+stdout sink
+    airbridge_log_init(_emu_serial_sink, SDL_GetTicks);
 
     const char* deviceId = (argc > 1) ? argv[1] : "EMU000001";
     s_nvs.set_str("s3", "device_id", deviceId);
