@@ -66,23 +66,26 @@ inline void updateDisplay(DisplayState& ds) {
 
     if (ds.otaActive) {
         // ── OTA overlay (below connection bar) ─────────────────────────
-        char updLine[24];
-        snprintf(updLine, sizeof(updLine), "Update: v%s", ds.otaVersion);
-        int uw = g_hal->display->text_width(updLine);
-        g_hal->display->text((128 - uw) / 2, 14, updLine);
-
         if (ds.otaPct >= 0) {
-            // Progress bar
-            g_hal->display->rect(4, 30, 120, 8, false);
+            // Downloading — show version on one line, progress below
+            g_hal->display->text(20, 14, "Updating...");
+            char verLine[20];
+            snprintf(verLine, sizeof(verLine), "v%s", ds.otaVersion);
+            int vw = strlen(verLine) * 6;
+            g_hal->display->text((128 - vw) / 2, 26, verLine);
+
+            g_hal->display->rect(4, 38, 120, 8, false);
             int fill = ds.otaPct * 116 / 100;
-            if (fill > 0) g_hal->display->rect(6, 32, fill, 4, true);
+            if (fill > 0) g_hal->display->rect(6, 40, fill, 4, true);
 
             char pctStr[8];
             snprintf(pctStr, sizeof(pctStr), "%d%%", ds.otaPct);
             int pw = strlen(pctStr) * 6;
-            g_hal->display->text((128 - pw) / 2, 42, pctStr);
+            g_hal->display->text((128 - pw) / 2, 49, pctStr);
         } else {
-            g_hal->display->text(22, 32, "Checking...");
+            // Waiting for connection or checking
+            g_hal->display->text(4, 24, "Checking for");
+            g_hal->display->text(4, 36, "update...");
         }
 
         g_hal->display->text(16, 55, "Do not unplug");

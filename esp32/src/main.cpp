@@ -3127,12 +3127,16 @@ static void uploadTask(void* param) {
         }
     }
 
+    // Show "Checking for update..." on display while waiting for network
+    g_displayState.otaActive = true;
+    g_displayState.otaPct = -1;
+
     // Wait for network — use the USB delay time productively.
     // If network comes up, do OTA + cookie before presenting USB to host.
     // Timeout: 120s from boot (gives cellular time, but doesn't block forever)
     {
-        uint32_t bootMs = millis();  // approximate boot time (task started shortly after)
-        uint32_t deadline = 120000;  // max 120s from boot
+        uint32_t bootMs = millis();
+        uint32_t deadline = 120000;
         while (!g_netConnected && !g_pppConnected) {
             if (millis() - bootMs > deadline) break;
             vTaskDelay(pdMS_TO_TICKS(1000));

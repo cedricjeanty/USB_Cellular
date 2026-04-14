@@ -1,3 +1,4 @@
 .pio/
 managed_components/
 sdkconfig.esp32s3
+emu_ota_update.bin

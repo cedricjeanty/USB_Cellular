@@ -522,12 +522,15 @@ int main(int argc, char* argv[]) {
         uint32_t now = g_hal->clock->millis();
 
         // OTA check — runs once after modem connects (same as firmware uploadTask)
+        // Show "Checking for update..." until OTA resolves
+        if (!otaChecked && !ds.otaActive) {
+            ds.otaActive = true;
+            ds.otaPct = -1;
+        }
+
         if (!otaChecked && s_modemInitDone && ds.pppConnected) {
             otaChecked = true;
             printf("[OTA] Checking for firmware update (current=%s)...\n", FW_VERSION);
-            ds.otaActive = true;
-            ds.otaPct = -1;
-            strlcpy(ds.otaVersion, "...", sizeof(ds.otaVersion));
 
             OtaCheckResult ota = halOtaCheck(FW_VERSION);
             if (ota.status == 1) {
