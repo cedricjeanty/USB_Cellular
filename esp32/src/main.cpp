@@ -427,8 +427,8 @@ static char              g_modemOp[32]  = "";
 static int               g_modemRssi    = 99;
 
 // ── CDC CLI ─────────────────────────────────────────────────────────────────
-static char g_cli_buf[128];
-static int  g_cli_len = 0;
+// CLI removed — CDC serial is now a log-only output stream.
+// Configuration via SD magic files: WIFI_CONFIG, S3_CONFIG, ENABLE_CDC/MSC, firmware.bin
 
 // ── Unified logging (early, before any callbacks that use log_write/cdc_printf)
 static void _cdc_serial_sink(const char* buf, int len) {
@@ -455,7 +455,6 @@ static void cdc_printf(const char* fmt, ...) {
 }
 
 // ── Forward declarations ────────────────────────────────────────────────────
-static void processCLI(const char* cmd);
 static void doUpdateDisplay();
 static void disp(const char* line1, const char* line2 = nullptr);
 static bool sd_mount_fatfs();
@@ -634,27 +633,6 @@ void cdc_line_coding_callback(int itf, cdcacm_event_t *event) {
 }
 
 // CDC RX callback for serial CLI — called by esp_tinyusb CDC ACM wrapper
-void cdc_rx_callback(int itf, cdcacm_event_t *event) {
-    (void)itf; (void)event;
-    uint8_t buf[64];
-    size_t rx_size = 0;
-    while (tinyusb_cdcacm_read((tinyusb_cdcacm_itf_t)itf, buf, sizeof(buf), &rx_size) == ESP_OK && rx_size > 0) {
-        for (size_t i = 0; i < rx_size; i++) {
-            char c = (char)buf[i];
-            if (c == '\n' || c == '\r') {
-                if (g_cli_len > 0) {
-                    g_cli_buf[g_cli_len] = 0;
-                    processCLI(g_cli_buf);
-                    g_cli_len = 0;
-                }
-            } else if (g_cli_len < (int)sizeof(g_cli_buf) - 1) {
-                g_cli_buf[g_cli_len++] = c;
-            }
-        }
-        rx_size = 0;
-    }
-}
-
 }  // extern "C"
 
 // (logging functions moved to early section above, before TinyUSB callbacks)
@@ -3376,7 +3354,11 @@ static void harvestTask(void* param) {
     }
 }
 
-// ── Serial CLI ──────────────────────────────────────────────────────────────
+// CLI removed — all configuration via SD magic files.
+// Kept for reference: SETWIFI→WIFI_CONFIG, SETS3→S3_CONFIG, SETMODE→ENABLE_CDC/MSC,
+// OTA→automatic, UPLOAD→automatic, FORMAT→FORMAT_SD, REBOOT→REBOOT file.
+
+#if 0  // CLI code removed — kept as dead code for reference during transition
 static void processCLI(const char* cmd) {
     if (strncmp(cmd, "SETWIFI ", 8) == 0) {
         CliResult r = cliSetWifi(cmd + 8);
@@ -3684,9 +3666,9 @@ static void processCLI(const char* cmd) {
 
     } else {
         cdc_printf("CLI: unknown: '%s'\r\n", cmd);
-        cdc_printf("CLI: commands: SETWIFI SETS3 STATUS UPLOAD FORMAT REBOOT MODEM MODEM_START CELLTEST\r\n");
     }
 }
+#endif  // CLI dead code
 
 // ── Main loop task ──────────────────────────────────────────────────────────
 static void main_loop_task(void* param) {
@@ -4108,7 +4090,7 @@ extern "C" void app_main(void) {
             tinyusb_config_cdcacm_t cdc_cfg = {};
             cdc_cfg.usb_dev = TINYUSB_USBDEV_0;
             cdc_cfg.cdc_port = TINYUSB_CDC_ACM_0;
-            cdc_cfg.callback_rx = cdc_rx_callback;
+            // No RX callback — CDC is log output only (no CLI)
             cdc_cfg.callback_line_coding_changed = cdc_line_coding_callback;
             ESP_ERROR_CHECK(tusb_cdc_acm_init(&cdc_cfg));
         }
