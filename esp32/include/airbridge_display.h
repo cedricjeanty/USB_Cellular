@@ -21,6 +21,10 @@ struct DisplayState {
     float    uploadingMb;
     float    usbWriteKBps;
     float    uploadKBps;
+    // OTA overlay (shown instead of USB/UPLOAD gauges when active)
+    bool     otaActive;
+    int      otaPct;       // -1=checking, 0-100=downloading
+    char     otaVersion[20];
 };
 
 // Render the main operational display
@@ -60,75 +64,94 @@ inline void updateDisplay(DisplayState& ds) {
     }
     g_hal->display->hline(0, 127, 9);
 
-    // Split Gauges: USB IN | UPLOAD
-    float uploaded  = ds.mbUploaded + ds.uploadingMb;
-    float remaining = (ds.mbQueued > ds.uploadingMb) ? ds.mbQueued - ds.uploadingMb : 0;
-    float usbSessionMb = ds.hostWrittenMb;
+    if (ds.otaActive) {
+        // ── OTA overlay (below connection bar) ─────────────────────────
+        char updLine[24];
+        snprintf(updLine, sizeof(updLine), "Update: v%s", ds.otaVersion);
+        int uw = g_hal->display->text_width(updLine);
+        g_hal->display->text((128 - uw) / 2, 14, updLine);
 
-    // Row 11: labels
-    g_hal->display->text(13, 11, "USB IN");
-    g_hal->display->text(78, 11, "UPLOAD");
-    for (int y = 11; y < 48; y += 2) g_hal->display->rect(63, y, 1, 1, true);
+        if (ds.otaPct >= 0) {
+            // Progress bar
+            g_hal->display->rect(4, 30, 120, 8, false);
+            int fill = ds.otaPct * 116 / 100;
+            if (fill > 0) g_hal->display->rect(6, 32, fill, 4, true);
 
-    // Row 20: speeds (size 1 — can be long strings like "1024KB/s")
-    {
-        char usbSpd[12], upSpd[12];
-        if (ds.usbWriteKBps > 0.5f)
-            snprintf(usbSpd, sizeof(usbSpd), "%dKB/s", (int)ds.usbWriteKBps);
-        else
-            strlcpy(usbSpd, "0KB/s", sizeof(usbSpd));
-
-        if (ds.uploadKBps > 0.5f)
-            snprintf(upSpd, sizeof(upSpd), "%dKB/s", (int)ds.uploadKBps);
-        else
-            strlcpy(upSpd, "0KB/s", sizeof(upSpd));
-
-        int usbW = strlen(usbSpd) * 6;
-        int upW  = strlen(upSpd) * 6;
-        g_hal->display->text((62 - usbW) / 2, 20, usbSpd);
-        g_hal->display->text(65 + (62 - upW) / 2, 20, upSpd);
-    }
-
-    // Row 30: totals (size 2, short format: "4.2M", "99K", "1.2G")
-    {
-        char usbTot[12], upTot[12];
-        _fmtSizeShort(usbTot, sizeof(usbTot), usbSessionMb);
-        _fmtSizeShort(upTot, sizeof(upTot), uploaded);
-        int usbW = g_hal->display->text_width(usbTot, 2);
-        int upW  = g_hal->display->text_width(upTot, 2);
-        g_hal->display->text((62 - usbW) / 2, 30, usbTot, 2);
-        g_hal->display->text(65 + (62 - upW) / 2, 30, upTot, 2);
-    }
-
-    // Row 50: progress bar (thin)
-    {
-        float totalMb = uploaded + remaining;
-        g_hal->display->rect(0, 50, 128, 5, false);
-        if (totalMb > 0.001f) {
-            int fill = (int)(uploaded / totalMb * 126);
-            if (fill > 126) fill = 126;
-            if (fill > 0) g_hal->display->rect(1, 51, fill, 3, true);
-        }
-    }
-
-    // Row 57: remaining + ETA
-    {
-        char remStr[14], etaStr[14];
-        snprintf(remStr, sizeof(remStr), "REM:"); _fmtSize(remStr + 4, sizeof(remStr) - 4, remaining);
-        g_hal->display->text(0, 57, remStr);
-
-        // ETA uses the display upload speed directly (already smoothed by 10s window)
-        // Dashes out only when speed is truly zero (no data in entire 10s window)
-        if (ds.uploadKBps > 0.5f && remaining > 0.001f) {
-            int etaSec = (int)(remaining * 1024.0f / ds.uploadKBps);
-            int mm = etaSec / 60, ss = etaSec % 60;
-            if (mm > 99) snprintf(etaStr, sizeof(etaStr), "ETA %dh%02d", mm / 60, mm % 60);
-            else         snprintf(etaStr, sizeof(etaStr), "ETA %d:%02d", mm, ss);
+            char pctStr[8];
+            snprintf(pctStr, sizeof(pctStr), "%d%%", ds.otaPct);
+            int pw = strlen(pctStr) * 6;
+            g_hal->display->text((128 - pw) / 2, 42, pctStr);
         } else {
-            strlcpy(etaStr, "ETA --:--", sizeof(etaStr));
+            g_hal->display->text(22, 32, "Checking...");
         }
-        int etaW = strlen(etaStr) * 6;
-        g_hal->display->text(128 - etaW, 57, etaStr);
+
+        g_hal->display->text(16, 55, "Do not unplug");
+    } else {
+        // ── Normal operational display ──────────────────────────────────
+        float uploaded  = ds.mbUploaded + ds.uploadingMb;
+        float remaining = (ds.mbQueued > ds.uploadingMb) ? ds.mbQueued - ds.uploadingMb : 0;
+        float usbSessionMb = ds.hostWrittenMb;
+
+        // Row 11: labels
+        g_hal->display->text(13, 11, "USB IN");
+        g_hal->display->text(78, 11, "UPLOAD");
+        for (int y = 11; y < 48; y += 2) g_hal->display->rect(63, y, 1, 1, true);
+
+        // Row 20: speeds
+        {
+            char usbSpd[12], upSpd[12];
+            if (ds.usbWriteKBps > 0.5f)
+                snprintf(usbSpd, sizeof(usbSpd), "%dKB/s", (int)ds.usbWriteKBps);
+            else
+                strlcpy(usbSpd, "0KB/s", sizeof(usbSpd));
+            if (ds.uploadKBps > 0.5f)
+                snprintf(upSpd, sizeof(upSpd), "%dKB/s", (int)ds.uploadKBps);
+            else
+                strlcpy(upSpd, "0KB/s", sizeof(upSpd));
+            int usbW = strlen(usbSpd) * 6;
+            int upW  = strlen(upSpd) * 6;
+            g_hal->display->text((62 - usbW) / 2, 20, usbSpd);
+            g_hal->display->text(65 + (62 - upW) / 2, 20, upSpd);
+        }
+
+        // Row 30: totals (size 2)
+        {
+            char usbTot[12], upTot[12];
+            _fmtSizeShort(usbTot, sizeof(usbTot), usbSessionMb);
+            _fmtSizeShort(upTot, sizeof(upTot), uploaded);
+            int usbW = g_hal->display->text_width(usbTot, 2);
+            int upW  = g_hal->display->text_width(upTot, 2);
+            g_hal->display->text((62 - usbW) / 2, 30, usbTot, 2);
+            g_hal->display->text(65 + (62 - upW) / 2, 30, upTot, 2);
+        }
+
+        // Row 50: progress bar
+        {
+            float totalMb = uploaded + remaining;
+            g_hal->display->rect(0, 50, 128, 5, false);
+            if (totalMb > 0.001f) {
+                int fill = (int)(uploaded / totalMb * 126);
+                if (fill > 126) fill = 126;
+                if (fill > 0) g_hal->display->rect(1, 51, fill, 3, true);
+            }
+        }
+
+        // Row 57: remaining + ETA
+        {
+            char remStr[14], etaStr[14];
+            snprintf(remStr, sizeof(remStr), "REM:"); _fmtSize(remStr + 4, sizeof(remStr) - 4, remaining);
+            g_hal->display->text(0, 57, remStr);
+            if (ds.uploadKBps > 0.5f && remaining > 0.001f) {
+                int etaSec = (int)(remaining * 1024.0f / ds.uploadKBps);
+                int mm = etaSec / 60, ss = etaSec % 60;
+                if (mm > 99) snprintf(etaStr, sizeof(etaStr), "ETA %dh%02d", mm / 60, mm % 60);
+                else         snprintf(etaStr, sizeof(etaStr), "ETA %d:%02d", mm, ss);
+            } else {
+                strlcpy(etaStr, "ETA --:--", sizeof(etaStr));
+            }
+            int etaW = strlen(etaStr) * 6;
+            g_hal->display->text(128 - etaW, 57, etaStr);
+        }
     }
 
     g_hal->display->flush();

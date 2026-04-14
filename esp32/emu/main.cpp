@@ -525,30 +525,28 @@ int main(int argc, char* argv[]) {
         if (!otaChecked && s_modemInitDone && ds.pppConnected) {
             otaChecked = true;
             printf("[OTA] Checking for firmware update (current=%s)...\n", FW_VERSION);
-            dispOtaProgress("?.?.?", -1);  // show "Checking..." screen
-            renderFramebuffer(renderer);
+            ds.otaActive = true;
+            ds.otaPct = -1;
+            strlcpy(ds.otaVersion, "...", sizeof(ds.otaVersion));
 
             OtaCheckResult ota = halOtaCheck(FW_VERSION);
             if (ota.status == 1) {
                 printf("[OTA] Update available: v%s (%u bytes)\n", ota.newVersion, ota.size);
-                dispOtaProgress(ota.newVersion, 0);
-                renderFramebuffer(renderer);
+                strlcpy(ds.otaVersion, ota.newVersion, sizeof(ds.otaVersion));
+                ds.otaPct = 0;
 
-                // Download firmware (real device would flash — emulator saves to file)
                 printf("[OTA] Downloading...\n");
                 OtaDownloadResult dl = halOtaDownload(ota, "./emu_ota_update.bin",
                     [](uint32_t sent, uint32_t total) {
-                        // Update OTA progress display
-                        // (can't call renderFramebuffer from callback — just update state)
+                        // Progress callback — can't easily update ds from here
                     });
 
                 if (dl.success) {
                     printf("[OTA] Downloaded %u bytes → emu_ota_update.bin\n", dl.bytesDownloaded);
-                    dispOtaProgress(ota.newVersion, 100);
-                    renderFramebuffer(renderer);
-                    // Mark pending in NVS (emulator simulates reboot by reading this on next start)
+                    ds.otaPct = 100;
                     g_hal->nvs->set_str("ota", "pending_version", ota.newVersion);
                     s_log.write(now, "OTA: downloaded v%s (%u bytes)", ota.newVersion, dl.bytesDownloaded);
+                    updateDisplay(ds); renderFramebuffer(renderer);
                     SDL_Delay(2000);
                 } else {
                     printf("[OTA] Download failed: %s\n", dl.error);
@@ -561,6 +559,7 @@ int main(int argc, char* argv[]) {
                 printf("[OTA] Check failed (network error)\n");
                 s_log.write(now, "OTA: check failed");
             }
+            ds.otaActive = false;
 
             // Fetch S3 DSU cookie (same as firmware uploadTask)
             {

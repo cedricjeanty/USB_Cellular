@@ -1695,27 +1695,14 @@ static bool s3ApiComplete(const char* uploadId, const char* key,
 
 static char g_otaTargetVer[16] = "";
 
+// Update OTA fields on the display state (rendered by updateDisplay in main loop)
 static void otaDisplayProgress(int pct, uint32_t received, uint32_t total) {
-    oled_clear();
-    oled_text(14, 0, "AirBridge", 2);
-    oled_hline(0, 127, 20);
-    char title[24];
-    if (g_otaTargetVer[0])
-        snprintf(title, sizeof(title), "OTA v%s", g_otaTargetVer);
-    else
-        strlcpy(title, "OTA Update", sizeof(title));
-    int tw = oled_text_width(title);
-    oled_text((128 - tw) / 2, 24, title);
-    // Progress bar: 108px wide at y=38
-    oled_rect(10, 38, 108, 10, false);
-    int fillW = (pct * 106) / 100;
-    if (fillW > 0) oled_rect(11, 39, fillW, 8, true);
-    char line[28];
-    snprintf(line, sizeof(line), "%d%%  %.0fKB/%.0fKB", pct,
-             received / 1024.0f, total / 1024.0f);
-    int w = oled_text_width(line);
-    oled_text((128 - w) / 2, 52, line);
-    oled_flush();
+    g_displayState.otaActive = true;
+    g_displayState.otaPct = pct;
+    strlcpy(g_displayState.otaVersion, g_otaTargetVer, sizeof(g_displayState.otaVersion));
+    // Force immediate display refresh
+    doUpdateDisplay();
+    (void)received; (void)total;
 }
 
 static bool otaDownloadAndFlash(const char* host, const char* path, uint32_t expectedSize) {
@@ -1981,9 +1968,12 @@ static int otaCheck() {
     }
 
     // Update available — show on display (shared)
-    dispOtaProgress(ota.newVersion, -1);
-    g_otaActive = true;
+    // Show OTA status in the main display (connection bar stays visible)
     strlcpy(g_otaTargetVer, ota.newVersion, sizeof(g_otaTargetVer));
+    g_displayState.otaActive = true;
+    g_displayState.otaPct = -1;  // "Checking..."
+    strlcpy(g_displayState.otaVersion, ota.newVersion, sizeof(g_displayState.otaVersion));
+    g_otaActive = true;
     log_write("OTA: update %s -> %s (%lu bytes)", FW_VERSION, ota.newVersion, (unsigned long)ota.size);
 
     // Step 3: Download and flash (ESP-IDF specific)
@@ -1992,6 +1982,7 @@ static int otaCheck() {
     if (!parseUrl(std::string(ota.downloadUrl), s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
         log_write("OTA: bad URL");
         g_otaActive = false;
+        g_displayState.otaActive = false;
         return -1;
     }
 
@@ -2002,6 +1993,7 @@ static int otaCheck() {
         disp("OTA FAILED", "");
         vTaskDelay(pdMS_TO_TICKS(10000));
         g_otaActive = false;
+        g_displayState.otaActive = false;
         return -1;
     }
 
@@ -3820,7 +3812,7 @@ static void main_loop_task(void* param) {
         }
 
         uint32_t now = millis();
-        if (!g_splashActive && !g_otaActive && now - g_lastDisplayMs >= DISPLAY_INTERVAL_MS) {
+        if (!g_splashActive && now - g_lastDisplayMs >= DISPLAY_INTERVAL_MS) {
             g_lastDisplayMs = now;
 
             // ── Compute live speeds from deltas ──────────────────────────
