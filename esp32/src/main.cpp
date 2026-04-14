@@ -353,6 +353,7 @@ static float    g_sdUsedMb       = 0.0f; // updated periodically for display
 static volatile bool g_splashActive = true; // hold splash screen on boot
 static volatile bool g_otaActive    = false; // suppress display during OTA download
 static bool          g_s3CookieActive = false; // S3 cookie overrides harvest cookie this session
+static volatile bool g_preUsbDone   = false; // upload task signals OTA+cookie done → present USB
 static float    g_uploadingMb    = 0.0f; // live progress of current file upload
 static volatile bool g_tlsActive = false; // suppress +++ escape during TLS
 static float    g_uploadBaseMb   = 0.0f; // base offset for multipart (completed parts)
@@ -3134,14 +3135,22 @@ static void uploadTask(void* param) {
         }
     }
 
-    // Wait for network (up to 90s)
-    for (int i = 0; i < 90 && !g_netConnected && !g_pppConnected; i++)
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    // Wait for network — use the USB delay time productively.
+    // If network comes up, do OTA + cookie before presenting USB to host.
+    // Timeout: 120s from boot (gives cellular time, but doesn't block forever)
+    {
+        uint32_t bootMs = millis();  // approximate boot time (task started shortly after)
+        uint32_t deadline = 120000;  // max 120s from boot
+        while (!g_netConnected && !g_pppConnected) {
+            if (millis() - bootMs > deadline) break;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
 
     // Let network stack stabilize (default route, DNS, etc.)
     if (g_pppConnected) vTaskDelay(pdMS_TO_TICKS(5000));
 
-    // ── OTA check first (highest priority after network) ────────────
+    // ── OTA check (before USB presentation — cookie + update ready for host) ──
     if (!otaDone && (g_netConnected || g_pppConnected)) {
         int otaResult = 0;
         for (int attempt = 0; attempt < 3; attempt++) {
@@ -3221,6 +3230,11 @@ static void uploadTask(void* param) {
         }
         g_tlsActive = false;
     }
+
+    // Signal main loop: OTA + cookie done, safe to present USB to host
+    g_preUsbDone = true;
+    log_write("Pre-USB tasks done — USB can be presented");
+    cdc_printf("Pre-USB: OTA+cookie done\r\n");
 
     // ── Upload loop — scan /harvested/NNNN/ subfolders ──────────────
     for (;;) {
@@ -3769,8 +3783,10 @@ static void processCLI(const char* cmd) {
 static void main_loop_task(void* param) {
     (void)param;
 
-    // Delayed USB presentation — aircraft DSU needs device to appear after boot
-    #define USB_PRESENT_DELAY_MS 60000
+    // USB presentation: minimum 60s (aircraft DSU timing), maximum 120s.
+    // Present early if upload task signals OTA+cookie are done (g_preUsbDone).
+    #define USB_MIN_DELAY_MS  60000
+    #define USB_MAX_DELAY_MS 120000
     uint32_t usbPresentMs = millis();
 
     for (;;) {
@@ -3784,11 +3800,17 @@ static void main_loop_task(void* param) {
             vTaskDelay(pdMS_TO_TICKS(30000));  // 30s cooldown for modem cold boot
         }
 
-        // Enable USB MSC after delay (card sectors must be valid)
-        if (!g_sd_ready && g_card_sectors > 0 && (millis() - usbPresentMs) >= USB_PRESENT_DELAY_MS) {
-            g_sd_ready = true;
-            log_write("USB: drive presented to host (after %ds delay)", USB_PRESENT_DELAY_MS / 1000);
-            cdc_printf("USB: drive ready\r\n");
+        // Enable USB MSC: present when pre-USB tasks done (min 60s) or timeout (120s)
+        if (!g_sd_ready && g_card_sectors > 0) {
+            uint32_t elapsed = millis() - usbPresentMs;
+            bool minElapsed = (elapsed >= USB_MIN_DELAY_MS);
+            bool maxElapsed = (elapsed >= USB_MAX_DELAY_MS);
+            if (maxElapsed || (minElapsed && g_preUsbDone)) {
+                g_sd_ready = true;
+                log_write("USB: drive presented (after %ds, preUsb=%s)",
+                         (int)(elapsed / 1000), g_preUsbDone ? "done" : "timeout");
+                cdc_printf("USB: drive ready\r\n");
+            }
         }
 
         // Print buffered harvest log
