@@ -440,7 +440,13 @@ static void _cdc_serial_sink(const char* buf, int len) {
 }
 #define log_write   airbridge_log
 #define log_init()  airbridge_log_init(_cdc_serial_sink, millis)
-#define log_flush_to_sd() airbridge_log_flush("/sdcard/airbridge.log")
+// Log flush writes to session-specific file: /sdcard/logs/boot_NNNN.log
+static void log_flush_to_sd() {
+    if (!g_logFileName[0]) return;
+    char path[64];
+    snprintf(path, sizeof(path), "/sdcard/logs/%s.log", g_logFileName);
+    airbridge_log_flush(path);
+}
 
 static void cdc_printf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void cdc_printf(const char* fmt, ...) {
@@ -2450,14 +2456,6 @@ static void modemTask(void* param) {
                 g_bootEpoch = (uint32_t)epoch;
                 g_bootMs = millis();
                 airbridge_log_set_time(g_bootEpoch, g_bootMs);
-                // Generate dated log filename for this boot session
-                struct tm utc;
-                gmtime_r(&epoch, &utc);
-                snprintf(g_logFileName, sizeof(g_logFileName),
-                         "logs/%04lu_%04d%02d%02d_%02d%02d%02d.log",
-                         (unsigned long)g_bootCount,
-                         utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
-                         utc.tm_hour, utc.tm_min, utc.tm_sec);
                 cdc_printf("Modem: time synced 20%02d-%02d-%02d %02d:%02d:%02d TZ%c%d\r\n",
                            yy, mo, dd, hh, mi, ss, tzSign, tzVal);
                 log_write("Time: 20%02d-%02d-%02d %02d:%02d:%02d TZ%c%d",
@@ -2784,11 +2782,7 @@ static void modemTask(void* param) {
             if (ppp_lwip_netif) netif_set_default(ppp_lwip_netif);
             esp_netif_set_default_netif(g_ppp_netif);
             cdc_printf("Modem: cellular ready — set as default route\r\n");
-            // Set fallback log filename (no time yet — will be renamed if time syncs)
-            if (!g_logFileName[0]) {
-                snprintf(g_logFileName, sizeof(g_logFileName),
-                         "logs/%04lu.log", (unsigned long)g_bootCount);
-            }
+            // Log filename already set at boot (boot_NNNN)
         }
 
         // ── Track last PPP data for stale detection ─────────────────────
@@ -2874,75 +2868,76 @@ static void modemTask(void* param) {
         uint32_t sinceConnect = pppConnectMs ? (millis() - pppConnectMs) : 0;
         bool firstUpload = (lastLogUploadMs == 0 && sinceConnect > 30000);
 
-        // Flush RAM log to SD file first (needs SD mutex)
-        if (s_loglen > 0 && g_fatfs_mounted && !g_harvesting) {
-            xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-            log_flush_to_sd();
-            xSemaphoreGive(g_sd_mutex);
+        // Flush RAM log to SD file (every 30s, needs SD mutex, skip if MSC busy)
+        {
+            static uint32_t lastFlushMs = 0;
+            if (s_loglen > 0 && g_fatfs_mounted && !g_harvesting &&
+                (millis() - lastFlushMs) > 30000) {
+                if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    log_flush_to_sd();
+                    xSemaphoreGive(g_sd_mutex);
+                    lastFlushMs = millis();
+                }
+            }
         }
 
-        // Upload new log content from SD file to S3 (incremental)
+        // Upload log to S3 via /prod/log/append (incremental, per-session)
         static long lastUploadPos = 0;
         if (g_pppConnected && !logUpRunning && g_logFileName[0] &&
             (firstUpload || (logInterval > 0 && (millis() - lastLogUploadMs) > logInterval))) {
 
-            // Check if SD log file has new content
-            xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+            // Check SD log file size
+            char logPath[64];
+            snprintf(logPath, sizeof(logPath), "/sdcard/logs/%s.log", g_logFileName);
             long fileSize = 0;
-            { FILE* f = fopen("/sdcard/airbridge.log", "r");
-              if (f) { fseek(f, 0, SEEK_END); fileSize = ftell(f); fclose(f); } }
-            xSemaphoreGive(g_sd_mutex);
+            if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                FILE* f = fopen(logPath, "r");
+                if (f) { fseek(f, 0, SEEK_END); fileSize = ftell(f); fclose(f); }
+                xSemaphoreGive(g_sd_mutex);
+            }
 
             if (fileSize > lastUploadPos) {
                 lastLogUploadMs = millis();
                 logUpRunning = true;
                 long uploadFrom = lastUploadPos;
                 int uploadLen = (int)(fileSize - uploadFrom);
-                // Cap at 16KB per upload to avoid heap issues
-                if (uploadLen > 16384) { uploadFrom = fileSize - 16384; uploadLen = 16384; }
+                if (uploadLen > 8192) uploadLen = 8192;  // max 8KB per append
 
                 xTaskCreatePinnedToCore([](void* param) {
-                    long* params = (long*)param;  // [0]=offset, [1]=len
-                    long offset = params[0];
-                    int len = (int)params[1];
+                    long* p = (long*)param;
+                    long offset = p[0]; int len = (int)p[1];
+                    delete[] p;
                     do {
                         if (!s3LoadCreds()) break;
 
-                        // Read new log content from SD file
-                        static char logChunk[16384];
+                        // Read new log chunk from SD
+                        static char chunk[8192];
                         xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-                        FILE* f = fopen("/sdcard/airbridge.log", "r");
+                        char lp[64];
+                        snprintf(lp, sizeof(lp), "/sdcard/logs/%s.log", g_logFileName);
+                        FILE* f = fopen(lp, "r");
                         int readLen = 0;
                         if (f) {
                             fseek(f, offset, SEEK_SET);
-                            readLen = fread(logChunk, 1, len < (int)sizeof(logChunk) ? len : sizeof(logChunk), f);
+                            readLen = fread(chunk, 1, len, f);
                             fclose(f);
                         }
                         xSemaphoreGive(g_sd_mutex);
                         if (readLen == 0) break;
 
-                        std::string enc = urlEncode(g_logFileName);
-                        char query[512];
-                        snprintf(query, sizeof(query), "file=%s&size=%d&device=%s",
-                                 enc.c_str(), readLen, g_deviceId);
-                        std::string resp = s3ApiGet(query);
-                        std::string url = jsonStr(resp, "\"url\"");
-                        if (url.empty()) break;
-
-                        char s3Host[128];
-                        static char s3Path[2500];
-                        if (!parseUrl(url, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) break;
-
-                        esp_tls_t* tls = tls_connect(s3Host);
+                        // POST to /prod/log/append
+                        esp_tls_t* tls = tls_connect(g_apiHost);
                         if (!tls) break;
 
-                        char hdr[2700];
+                        char hdr[512];
                         int hlen = snprintf(hdr, sizeof(hdr),
-                            "PUT %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
-                            s3Path, s3Host, readLen);
+                            "POST /prod/log/append?device=%s&session=%s HTTP/1.1\r\n"
+                            "Host: %s\r\nx-api-key: %s\r\n"
+                            "Content-Length: %d\r\nConnection: close\r\n\r\n",
+                            g_deviceId, g_logFileName, g_apiHost, g_apiKey, readLen);
 
                         bool ok = tls_write_all(tls, hdr, hlen) &&
-                                  tls_write_all(tls, logChunk, readLen);
+                                  tls_write_all(tls, chunk, readLen);
                         if (ok) {
                             httpReadResponse(tls);
                             lastUploadPos = offset + readLen;
@@ -2951,7 +2946,7 @@ static void modemTask(void* param) {
                     } while (0);
                     logUpRunning = false;
                     vTaskDelete(nullptr);
-                }, "log_up", 8192, (void*)new long[2]{uploadFrom, uploadLen}, 2, nullptr, 1);
+                }, "log_up", 8192, new long[2]{uploadFrom, uploadLen}, 2, nullptr, 1);
             }
         }
     }
@@ -3846,6 +3841,8 @@ extern "C" void app_main(void) {
             nvs_commit(h);
             nvs_close(h);
             g_bootCount = boots;
+            // Set session log filename immediately (boot number, no time dependency)
+            snprintf(g_logFileName, sizeof(g_logFileName), "boot_%04lu", (unsigned long)boots);
 
             esp_reset_reason_t reason = esp_reset_reason();
             ESP_LOGI(TAG, "Boot #%u  reset_reason=%d  heap=%lu",
@@ -3968,6 +3965,11 @@ extern "C" void app_main(void) {
     }
 
     g_sdTotalMb = g_card_sectors * 512.0f / 1e6f;
+
+    // Create logs directory on SD for per-session log files
+    if (g_fatfs_mounted) {
+        mkdir("/sdcard/logs", 0775);
+    }
 
     // Initialize SD used space for display
     if (g_fatfs_mounted) {

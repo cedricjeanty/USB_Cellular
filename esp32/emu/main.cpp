@@ -359,7 +359,19 @@ int main(int argc, char* argv[]) {
     const char* deviceId = (argc > 1) ? argv[1] : "EMU000001";
     s_nvs.set_str("s3", "device_id", deviceId);
 
-    airbridge_log("AirBridge fw=%s (emulator)", FW_VERSION);
+    // Boot counter + session log file (same as firmware)
+    uint32_t emuBootCount = 0;
+    s_nvs.get_u32("dbg", "boots", &emuBootCount);
+    emuBootCount++;
+    s_nvs.set_u32("dbg", "boots", emuBootCount);
+    char emuLogSession[32];
+    snprintf(emuLogSession, sizeof(emuLogSession), "boot_%04lu", (unsigned long)emuBootCount);
+    char emuLogPath[256];
+    snprintf(emuLogPath, sizeof(emuLogPath), "%s/logs", SD_ROOT);
+    ::mkdir(emuLogPath, 0755);
+    snprintf(emuLogPath, sizeof(emuLogPath), "%s/logs/%s.log", SD_ROOT, emuLogSession);
+
+    airbridge_log("AirBridge fw=%s boot=%lu (emulator)", FW_VERSION, (unsigned long)emuBootCount);
 
     char tmp[4] = "";
     if (!s_nvs.get_str("s3", "api_host", tmp, sizeof(tmp)) || tmp[0] == '\0') {
@@ -816,10 +828,114 @@ int main(int argc, char* argv[]) {
         ds.usbWriteKBps = s_usbSpeed.update(ds.hostWrittenMb, now);
         ds.uploadKBps = s_uploadSpeed.update(ds.mbUploaded + ds.uploadingMb, now);
 
+        // Periodic log flush to SD (every 10s) + S3 upload (every 30s)
+        {
+            static uint32_t lastFlush = 0;
+            if (s_loglen > 0 && (now - lastFlush) > 10000) {
+                airbridge_log_flush(emuLogPath);
+                lastFlush = now;
+            }
+
+            // Upload log chunks to S3 via /prod/log/append
+            static uint32_t lastUpload = 0;
+            static long lastUploadPos = 0;
+            static std::atomic<bool> logUploading{false};
+            if (ds.pppConnected && !logUploading && (now - lastUpload) > 30000) {
+                // Check session file size (scan all boot_ files — upload old ones first)
+                // Scan logs directory
+                char dirPath[128];
+                snprintf(dirPath, sizeof(dirPath), "%s/logs", SD_ROOT);
+                void* dir = g_hal->filesys->opendir(dirPath);
+                char oldestPending[64] = "";
+                if (dir) {
+                    FsDirEntry ent;
+                    while (g_hal->filesys->readdir(dir, &ent)) {
+                        if (ent.is_dir || strncmp(ent.name, "boot_", 5) != 0) continue;
+                        // Compare to current session
+                        if (strncmp(ent.name, emuLogSession, strlen(emuLogSession)) == 0) continue;
+                        // Older session — upload fully
+                        if (oldestPending[0] == '\0' || strcmp(ent.name, oldestPending) < 0)
+                            strlcpy(oldestPending, ent.name, sizeof(oldestPending));
+                    }
+                    g_hal->filesys->closedir(dir);
+                }
+
+                lastUpload = now;
+                logUploading = true;
+                // Spawn upload thread
+                std::thread([&ds, emuLogPath, emuLogSession, oldestPending, &logUploading, &lastUploadPos]() {
+                    char apiHost[128] = "", apiKey[64] = "", devId[32] = "";
+                    g_hal->nvs->get_str("s3", "api_host", apiHost, sizeof(apiHost));
+                    g_hal->nvs->get_str("s3", "api_key", apiKey, sizeof(apiKey));
+                    g_hal->nvs->get_str("s3", "device_id", devId, sizeof(devId));
+
+                    auto uploadChunk = [&](const char* session, const char* chunk, int len) {
+                        TlsHandle tls = g_hal->network->connect(apiHost);
+                        if (!tls) return false;
+                        char hdr[512];
+                        snprintf(hdr, sizeof(hdr),
+                            "POST /prod/log/append?device=%s&session=%s HTTP/1.1\r\n"
+                            "Host: %s\r\nx-api-key: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+                            devId, session, apiHost, apiKey, len);
+                        bool ok = g_hal->network->write(tls, hdr, strlen(hdr)) &&
+                                  g_hal->network->write(tls, chunk, len);
+                        if (ok) halHttpReadResponse(tls);
+                        g_hal->network->destroy(tls);
+                        return ok;
+                    };
+
+                    // Upload any older complete sessions first
+                    if (oldestPending[0]) {
+                        char path[256];
+                        snprintf(path, sizeof(path), "%s/logs/%s", SD_ROOT, oldestPending);
+                        FILE* f = fopen(path, "r");
+                        if (f) {
+                            fseek(f, 0, SEEK_END);
+                            long sz = ftell(f);
+                            fseek(f, 0, SEEK_SET);
+                            static char buf[8192];
+                            int rd = fread(buf, 1, sizeof(buf), f);
+                            fclose(f);
+                            if (rd > 0) {
+                                // Strip .log extension for session name
+                                char session[64]; strlcpy(session, oldestPending, sizeof(session));
+                                char* dot = strrchr(session, '.');
+                                if (dot) *dot = '\0';
+                                if (uploadChunk(session, buf, rd)) {
+                                    // If uploaded everything, delete the file
+                                    if (rd >= sz) remove(path);
+                                }
+                            }
+                        }
+                    }
+
+                    // Upload new content from current session
+                    FILE* f = fopen(emuLogPath, "r");
+                    if (f) {
+                        fseek(f, 0, SEEK_END);
+                        long sz = ftell(f);
+                        if (sz > lastUploadPos) {
+                            fseek(f, lastUploadPos, SEEK_SET);
+                            static char buf[8192];
+                            int rd = fread(buf, 1, sizeof(buf), f);
+                            if (rd > 0 && uploadChunk(emuLogSession, buf, rd)) {
+                                lastUploadPos += rd;
+                            }
+                        }
+                        fclose(f);
+                    }
+                    logUploading = false;
+                }).detach();
+            }
+        }
+
         updateDisplay(ds);
         renderFramebuffer(renderer);
         SDL_Delay(100);
     }
+
+    // Final flush before exit
+    airbridge_log_flush(emuLogPath);
 
     if (modemThread.joinable()) modemThread.join();
     // Clean up pppd and routing
