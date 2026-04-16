@@ -3830,19 +3830,26 @@ extern "C" void app_main(void) {
 
     g_sd_mutex = xSemaphoreCreateMutex();
 
-    // ── Crash-loop detection ────────────────────────────────────────────
+    // ── Session counter (always increments) + crash-loop detection ──────
     {
         nvs_handle_t h;
         if (nvs_open("dbg", NVS_READWRITE, &h) == ESP_OK) {
+            // Session counter — monotonic, never reset (for log file naming)
+            uint32_t session = 0;
+            nvs_get_u32(h, "session", &session);
+            session++;
+            nvs_set_u32(h, "session", session);
+
+            // Crash-loop counter — reset on successful boot
             uint32_t boots = 0;
             nvs_get_u32(h, "boots", &boots);
             boots++;
             nvs_set_u32(h, "boots", boots);
             nvs_commit(h);
             nvs_close(h);
-            g_bootCount = boots;
-            // Set session log filename immediately (boot number, no time dependency)
-            snprintf(g_logFileName, sizeof(g_logFileName), "boot_%04lu", (unsigned long)boots);
+            g_bootCount = session;
+            // Set session log filename (monotonic session number)
+            snprintf(g_logFileName, sizeof(g_logFileName), "boot_%04lu", (unsigned long)session);
 
             esp_reset_reason_t reason = esp_reset_reason();
             ESP_LOGI(TAG, "Boot #%u  reset_reason=%d  heap=%lu",

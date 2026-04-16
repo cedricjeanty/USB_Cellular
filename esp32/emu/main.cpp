@@ -359,11 +359,11 @@ int main(int argc, char* argv[]) {
     const char* deviceId = (argc > 1) ? argv[1] : "EMU000001";
     s_nvs.set_str("s3", "device_id", deviceId);
 
-    // Boot counter + session log file (same as firmware)
+    // Session counter (monotonic) + session log file (same as firmware)
     uint32_t emuBootCount = 0;
-    s_nvs.get_u32("dbg", "boots", &emuBootCount);
+    s_nvs.get_u32("dbg", "session", &emuBootCount);
     emuBootCount++;
-    s_nvs.set_u32("dbg", "boots", emuBootCount);
+    s_nvs.set_u32("dbg", "session", emuBootCount);
     char emuLogSession[32];
     snprintf(emuLogSession, sizeof(emuLogSession), "boot_%04lu", (unsigned long)emuBootCount);
     char emuLogPath[256];
