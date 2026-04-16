@@ -149,4 +149,30 @@ def handler(event, context):
         )
         return respond(200, {"status": "ok"})
 
+    elif path == "/log/append" and method == "POST":
+        # Append log text to a per-session S3 object
+        # Query: device=XXXX&session=boot_NNNN
+        device = params.get("device", "")
+        session = params.get("session", "")
+        if not device or not session:
+            return respond(400, {"error": "device and session required"})
+
+        key = f"{device}/logs/{session}.log"
+        body = event.get("body", "")
+        if not body:
+            return respond(400, {"error": "empty body"})
+
+        # Read existing content (if any) and append
+        try:
+            existing = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+        except Exception:
+            existing = b""
+
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+
+        new_content = existing + body
+        s3.put_object(Bucket=BUCKET, Key=key, Body=new_content, ContentType="text/plain")
+        return respond(200, {"size": len(new_content)})
+
     return respond(404, {"error": "not found"})
