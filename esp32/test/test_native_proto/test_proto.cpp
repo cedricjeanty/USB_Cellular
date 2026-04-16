@@ -1,5 +1,6 @@
 #include <unity.h>
 #include <cstring>
+#include <cstdio>
 #include "airbridge_proto.h"
 
 void setUp(void) {}
@@ -98,6 +99,21 @@ void test_buildDsuCookie_small_flight(void) {
     uint16_t actual = ((uint16_t)cookie[76] << 8) | cookie[77];
     TEST_ASSERT_EQUAL_UINT16(expected, actual);
 }
+// Golden-file check — byte-for-byte match against a known-good cookie captured
+// from a real DSU. Regression guard: any change to buildDsuCookie() that breaks
+// aircraft compatibility will fail this test.
+void test_buildDsuCookie_golden_1210(void) {
+    uint8_t ours[78];
+    buildDsuCookie("EA500.000243", 1210, ours);
+
+    FILE* f = fopen("test/test_native_proto/fixtures/dsuCookie_1210.easdf", "rb");
+    TEST_ASSERT_NOT_NULL_MESSAGE(f, "fixture dsuCookie_1210.easdf missing");
+    uint8_t ref[78] = {0};
+    size_t n = fread(ref, 1, 78, f);
+    fclose(f);
+    TEST_ASSERT_EQUAL_size_t(78, n);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(ref, ours, 78);
+}
 
 // ── parseDsuFilename ────────────────────────────────────────────────────────
 
@@ -170,6 +186,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_buildDsuCookie_mode_flag);
     RUN_TEST(test_buildDsuCookie_crc_validates);
     RUN_TEST(test_buildDsuCookie_small_flight);
+    RUN_TEST(test_buildDsuCookie_golden_1210);
 
     // parseDsuFilename
     RUN_TEST(test_parseDsuFilename_standard);

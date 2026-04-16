@@ -4219,28 +4219,55 @@ extern "C" void app_main(void) {
         }
     }
 
-    // ── Scan SD root for unharvested files (from previous session) ─────
+    // ── Scan SD for unharvested files (from previous session) ──────────
+    // Checks root AND DSU subdirectories (e.g. flightHistory/) — the aircraft
+    // writes .eaofh files into flightHistory/, not flat to root, so a root-only
+    // scan would miss them and never trigger a boot-time harvest.
     if (g_fatfs_mounted && g_filesQueued == 0) {
+        bool found = false;
+        const char* foundPath = nullptr;
+        static char foundPathBuf[96];
+
         DIR* rootDir = opendir(SD_MOUNT);
         if (rootDir) {
-            bool found = false;
             struct dirent* ent;
             while ((ent = readdir(rootDir)) != nullptr) {
-                if (ent->d_type == DT_DIR) continue;
                 if (ent->d_name[0] == '.') continue;
-                if (strcmp(ent->d_name, "airbridge.log") == 0) continue;
-                if (strcmp(ent->d_name, "dsuCookie.easdf") == 0) continue;
-                found = true;
-                ESP_LOGI(TAG, "Boot: unharvested file in root: %s", ent->d_name);
-                break;
+                if (isSkipped(ent->d_name)) continue;  // harvested/, logs/, dsuCookie, magic files, etc.
+
+                if (ent->d_type == DT_DIR) {
+                    // Peek one level into this subdirectory — if it has any
+                    // non-hidden file, there's work to harvest.
+                    char subPath[96];
+                    snprintf(subPath, sizeof(subPath), "%s/%s", SD_MOUNT, ent->d_name);
+                    DIR* sub = opendir(subPath);
+                    if (!sub) continue;
+                    struct dirent* subEnt;
+                    while ((subEnt = readdir(sub)) != nullptr) {
+                        if (subEnt->d_name[0] == '.') continue;
+                        snprintf(foundPathBuf, sizeof(foundPathBuf), "%s/%s",
+                                 ent->d_name, subEnt->d_name);
+                        foundPath = foundPathBuf;
+                        found = true;
+                        break;
+                    }
+                    closedir(sub);
+                    if (found) break;
+                } else {
+                    foundPath = ent->d_name;
+                    found = true;
+                    break;
+                }
             }
             closedir(rootDir);
-            if (found) {
-                ESP_LOGI(TAG, "Boot: triggering harvest for unharvested root files");
-                g_writeDetected = true;
-                g_hostWasConnected = true;
-                g_lastWriteMs = millis();
-            }
+        }
+
+        if (found) {
+            ESP_LOGI(TAG, "Boot: unharvested file: %s — triggering harvest",
+                     foundPath ? foundPath : "?");
+            g_writeDetected = true;
+            g_hostWasConnected = true;
+            g_lastWriteMs = millis();
         }
     }
 
