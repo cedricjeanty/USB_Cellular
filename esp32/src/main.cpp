@@ -2874,52 +2874,85 @@ static void modemTask(void* param) {
         uint32_t sinceConnect = pppConnectMs ? (millis() - pppConnectMs) : 0;
         bool firstUpload = (lastLogUploadMs == 0 && sinceConnect > 30000);
 
-        if (g_pppConnected && !logUpRunning && s_loglen > 0 && g_logFileName[0] &&
+        // Flush RAM log to SD file first (needs SD mutex)
+        if (s_loglen > 0 && g_fatfs_mounted && !g_harvesting) {
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+            log_flush_to_sd();
+            xSemaphoreGive(g_sd_mutex);
+        }
+
+        // Upload new log content from SD file to S3 (incremental)
+        static long lastUploadPos = 0;
+        if (g_pppConnected && !logUpRunning && g_logFileName[0] &&
             (firstUpload || (logInterval > 0 && (millis() - lastLogUploadMs) > logInterval))) {
-            lastLogUploadMs = millis();
-            logUpRunning = true;
-            xTaskCreatePinnedToCore([](void*) {
-                do {
-                    if (!s3LoadCreds()) break;
 
-                    // Snapshot the log buffer via unified API
-                    static char logSnap[AIRBRIDGE_LOG_BUF_SIZE];
-                    int snapLen = airbridge_log_snapshot(logSnap, sizeof(logSnap));
+            // Check if SD log file has new content
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+            long fileSize = 0;
+            { FILE* f = fopen("/sdcard/airbridge.log", "r");
+              if (f) { fseek(f, 0, SEEK_END); fileSize = ftell(f); fclose(f); } }
+            xSemaphoreGive(g_sd_mutex);
 
-                    if (snapLen == 0) break;
+            if (fileSize > lastUploadPos) {
+                lastLogUploadMs = millis();
+                logUpRunning = true;
+                long uploadFrom = lastUploadPos;
+                int uploadLen = (int)(fileSize - uploadFrom);
+                // Cap at 16KB per upload to avoid heap issues
+                if (uploadLen > 16384) { uploadFrom = fileSize - 16384; uploadLen = 16384; }
 
-                    // Use dated session filename
-                    std::string enc = urlEncode(g_logFileName);
-                    char query[512];
-                    snprintf(query, sizeof(query), "file=%s&size=%d&device=%s",
-                             enc.c_str(), snapLen, g_deviceId);
-                    std::string resp = s3ApiGet(query);
-                    std::string url = jsonStr(resp, "\"url\"");
-                    if (url.empty()) break;
+                xTaskCreatePinnedToCore([](void* param) {
+                    long* params = (long*)param;  // [0]=offset, [1]=len
+                    long offset = params[0];
+                    int len = (int)params[1];
+                    do {
+                        if (!s3LoadCreds()) break;
 
-                    char s3Host[128];
-                    static char s3Path[2500];
-                    if (!parseUrl(url, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) break;
+                        // Read new log content from SD file
+                        static char logChunk[16384];
+                        xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                        FILE* f = fopen("/sdcard/airbridge.log", "r");
+                        int readLen = 0;
+                        if (f) {
+                            fseek(f, offset, SEEK_SET);
+                            readLen = fread(logChunk, 1, len < (int)sizeof(logChunk) ? len : sizeof(logChunk), f);
+                            fclose(f);
+                        }
+                        xSemaphoreGive(g_sd_mutex);
+                        if (readLen == 0) break;
 
-                    esp_tls_t* tls = tls_connect(s3Host);
-                    if (!tls) break;
+                        std::string enc = urlEncode(g_logFileName);
+                        char query[512];
+                        snprintf(query, sizeof(query), "file=%s&size=%d&device=%s",
+                                 enc.c_str(), readLen, g_deviceId);
+                        std::string resp = s3ApiGet(query);
+                        std::string url = jsonStr(resp, "\"url\"");
+                        if (url.empty()) break;
 
-                    char hdr[2700];
-                    int hlen = snprintf(hdr, sizeof(hdr),
-                        "PUT %s HTTP/1.1\r\n"
-                        "Host: %s\r\n"
-                        "Content-Length: %d\r\n"
-                        "Connection: close\r\n\r\n",
-                        s3Path, s3Host, snapLen);
+                        char s3Host[128];
+                        static char s3Path[2500];
+                        if (!parseUrl(url, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) break;
 
-                    bool ok = tls_write_all(tls, hdr, hlen) &&
-                              tls_write_all(tls, logSnap, snapLen);
-                    if (ok) httpReadResponse(tls);
-                    tls_destroy(tls);
-                } while (0);
-                logUpRunning = false;
-                vTaskDelete(nullptr);
-            }, "log_up", 8192, nullptr, 2, nullptr, 1);
+                        esp_tls_t* tls = tls_connect(s3Host);
+                        if (!tls) break;
+
+                        char hdr[2700];
+                        int hlen = snprintf(hdr, sizeof(hdr),
+                            "PUT %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+                            s3Path, s3Host, readLen);
+
+                        bool ok = tls_write_all(tls, hdr, hlen) &&
+                                  tls_write_all(tls, logChunk, readLen);
+                        if (ok) {
+                            httpReadResponse(tls);
+                            lastUploadPos = offset + readLen;
+                        }
+                        tls_destroy(tls);
+                    } while (0);
+                    logUpRunning = false;
+                    vTaskDelete(nullptr);
+                }, "log_up", 8192, (void*)new long[2]{uploadFrom, uploadLen}, 2, nullptr, 1);
+            }
         }
     }
 }
@@ -3189,7 +3222,7 @@ static void uploadTask(void* param) {
             }
             xSemaphoreGive(g_sd_mutex);
 
-            if (!relPath[0]) { cdc_printf("Upload: no files in /harvested/\r\n"); break; }
+            if (!relPath[0]) break;  // nothing to upload — no log spam
 
             char path[192];
             snprintf(path, sizeof(path), "%s/harvested/%s", SD_MOUNT, relPath);
