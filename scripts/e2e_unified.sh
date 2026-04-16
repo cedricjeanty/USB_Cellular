@@ -568,8 +568,71 @@ else
     stop_device
 fi
 
-# ── TEST 10: Boot splash ─────────────────────────────────────────────────────
-log ""; log "TEST 10: Boot splash"
+# ── TEST 10: Log resilience (persistent across boots + bad connection) ──────
+log ""; log "TEST 10: Log persists across power cycles + intermittent cellular"
+if [ "$TARGET" = "emulator" ]; then
+    # Clean state
+    rm -rf "$SD_EMU/logs" "$SD_EMU/harvested" "$SD_EMU/flightHistory"
+    rm -f "$FW_DIR/emu_nvs.dat" "$FW_DIR/emu_ota_update.bin"
+    aws s3 rm "s3://$BUCKET/$DEVICE/logs/" --recursive >/dev/null 2>&1
+
+    # Boot 1: start, let it run briefly, kill before upload (simulates power cut)
+    cd "$FW_DIR"
+    : > /tmp/emu_e2e.log
+    $EMU "$DEVICE" >>/tmp/emu_e2e.log 2>&1 &
+    LOG_PID=$!
+    sleep 12  # boot + enough for log entries, but before 30s upload cycle
+    kill -9 $LOG_PID 2>/dev/null; wait $LOG_PID 2>/dev/null
+    sudo killall -9 pppd 2>/dev/null
+
+    # Verify boot 1 log on SD (persisted through power cut)
+    if [ -f "$SD_EMU/logs/boot_0001.log" ]; then
+        pass "Log: boot_0001.log persisted on SD after power cut"
+    else
+        fail "Log: boot_0001.log missing on SD after power cut"
+    fi
+
+    # Boot 2: start, let it upload both sessions
+    : > /tmp/emu_e2e.log
+    $EMU "$DEVICE" >>/tmp/emu_e2e.log 2>&1 &
+    LOG_PID=$!
+    sleep 45  # enough for connect + upload cycle
+
+    # S3 should have BOTH sessions
+    S3_BOOT1=$(aws s3 ls "s3://$BUCKET/$DEVICE/logs/boot_0001.log" 2>/dev/null | wc -l)
+    S3_BOOT2=$(aws s3 ls "s3://$BUCKET/$DEVICE/logs/boot_0002.log" 2>/dev/null | wc -l)
+    if [ "$S3_BOOT1" = "1" ] && [ "$S3_BOOT2" = "1" ]; then
+        pass "Log: both sessions (boot_0001, boot_0002) uploaded to S3"
+    else
+        fail "Log: S3 missing sessions (boot1=$S3_BOOT1 boot2=$S3_BOOT2)"
+    fi
+
+    # Boot 1 should be deleted from SD after upload
+    if [ ! -f "$SD_EMU/logs/boot_0001.log" ]; then
+        pass "Log: boot_0001.log cleaned from SD after upload"
+    else
+        fail "Log: boot_0001.log still on SD after upload"
+    fi
+
+    kill $LOG_PID 2>/dev/null; wait $LOG_PID 2>/dev/null
+    sudo killall -9 pppd 2>/dev/null
+    aws s3 rm "s3://$BUCKET/$DEVICE/logs/" --recursive >/dev/null 2>&1
+    cd /home/cedric/USBCellular
+else
+    # Hardware: boot device, check log appears in S3
+    start_device 5
+    sleep 120  # let it boot, connect, upload first log chunk
+    BOOT_LOG=$(aws s3 ls "s3://$BUCKET/$DEVICE/logs/" 2>/dev/null | grep "boot_" | tail -1 | awk '{print $4}')
+    if [ -n "$BOOT_LOG" ]; then
+        pass "Log: session log uploaded to S3 ($BOOT_LOG)"
+    else
+        fail "Log: no session log in S3"
+    fi
+    stop_device
+fi
+
+# ── TEST 11: Boot splash ─────────────────────────────────────────────────────
+log ""; log "TEST 11: Boot splash"
 if [ "$TARGET" = "emulator" ]; then
     start_device 5
     pass "Boot splash rendered"
