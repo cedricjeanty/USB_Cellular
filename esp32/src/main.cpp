@@ -3730,6 +3730,11 @@ static void main_loop_task(void* param) {
             bool minElapsed = (elapsed >= USB_MIN_DELAY_MS);
             bool maxElapsed = (elapsed >= USB_MAX_DELAY_MS);
             if (maxElapsed || (minElapsed && g_preUsbDone)) {
+                // In MSC-only mode we held D+ low at boot to hide the device.
+                // Now raise D+ so the host enumerates for the first time.
+                if (g_msc_only) {
+                    tud_connect();
+                }
                 g_sd_ready = true;
                 log_write("USB: drive presented (after %ds, preUsb=%s)",
                          (int)(elapsed / 1000), g_preUsbDone ? "done" : "timeout");
@@ -4140,6 +4145,15 @@ extern "C" void app_main(void) {
             // No RX callback — CDC is log output only (no CLI)
             cdc_cfg.callback_line_coding_changed = cdc_line_coding_callback;
             ESP_ERROR_CHECK(tusb_cdc_acm_init(&cdc_cfg));
+        }
+
+        // Avionics (MSC-only) mode: pull D+ low so host sees nothing at all —
+        // just power draw — until main_loop_task calls tud_connect() after
+        // the presentation delay. In CDC/debug mode, keep USB visible so the
+        // developer's serial console works immediately from boot.
+        if (g_msc_only) {
+            tud_disconnect();
+            ESP_LOGI(TAG, "USB: disconnected (hidden from host until delay elapses)");
         }
 
         if (g_card_sectors > 0) {
