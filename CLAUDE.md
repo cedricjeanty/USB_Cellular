@@ -10,7 +10,7 @@ harvest files when idle, and upload via cellular.
 
 **Hardware:** ESP32-S3-DevKitC-1 (4 MB flash, 2 MB PSRAM)
 
-**USB:** TinyUSB — MSC-only (PID 0x0002, avionics mode) or CDC+MSC (PID 0x0001, debug mode). Mode stored in NVS, set via `SETMODE MSC` / `SETMODE CDC`.
+**USB:** TinyUSB — MSC-only (PID 0x0002, avionics mode) or CDC+MSC (PID 0x0001, debug mode). Mode stored in NVS, set via SD magic files `ENABLE_CDC` / `ENABLE_MSC`. In MSC-only mode, D+ is held low at boot via `tud_disconnect()` — host sees nothing (just power draw) until the 60s presentation delay elapses, then `tud_connect()` triggers first enumeration.
 
 **Cellular:** SIM7600 modem via UART (TX=43, RX=44), PPPoS. Hologram SIM. Max baud 921600.
 
@@ -30,30 +30,46 @@ harvest files when idle, and upload via cellular.
 
 ### Duty Cycle
 
-1. **Boot:** 60s USB presentation delay (aircraft DSU expects device to appear after power-on). Modem connects PPPoS in parallel. OTA check runs first (with retry on transient errors).
-2. **DSU Cookie:** Writes `dsuCookie.easdf` to SD root (tells aircraft where to resume downloading logs). Can be overridden via S3.
-3. **Data Collection:** USB MSC presents SD card to legacy host. Host writes files.
-4. **Harvest:** After 15s of no USB writes, eject media, remount FATFS, copy new files
-   from SD root to `/harvested/`, re-insert media.
+1. **Boot:** MSC-only mode holds D+ low (USB invisible) for 60s minimum / 120s max.
+   Modem connects PPPoS in parallel. OTA check + S3 cookie fetch run first. USB
+   `tud_connect()` fires once OTA+cookie complete (min 60s) or timeout (120s).
+   Boot scan also checks for unharvested files in root AND subdirectories (e.g. `flightHistory/`).
+2. **DSU Cookie:** 78-byte binary (`dsuCookie.easdf`) on SD root tells aircraft DSU
+   where to resume downloading flight logs. Written by firmware after harvest via
+   `buildDsuCookie()` (EA1E magic, serial, flight BE u32, CRC-16). Can be overridden
+   via S3 one-shot: upload to `s3://BUCKET/firmware/dsuCookie.easdf`, device fetches
+   and applies on next boot (Lambda deletes after GET).
+3. **Data Collection:** USB MSC presents SD card to legacy host. Host writes files
+   (typically to `flightHistory/` subdirectory).
+4. **Harvest:** After 15s of no USB writes, remount FATFS, recursively copy new files
+   from SD root (including subdirectories) to `/harvested/NNNN/`, flattening paths with
+   `__` separator.
 5. **Upload:** Upload files from `/harvested/` to S3 via HTTPS PUT (pre-signed URLs).
-   Mark uploaded files with `.done__` markers. Small files (<5 MB) use single PUT;
-   large files use S3 multipart with NVS-persisted resume state.
+   Small files (<5 MB) use single PUT; large files use S3 multipart with NVS-persisted
+   resume state.
+6. **Logging:** `airbridge_log()` writes to serial + 8KB RAM ring buffer. Flushed to
+   SD (`/sdcard/logs/boot_NNNN.log`) every 30s, uploaded to S3 via Lambda
+   `/prod/log/append` endpoint every 60s. Each boot creates a unique session file
+   (monotonic NVS counter `dbg/session`).
 
-### Serial CLI (CDC mode only)
+### Serial / CDC
 
-| Command | Description |
-|---------|-------------|
-| `SETWIFI <ssid> <pass>` | Save a WiFi network |
-| `SETS3 <api_host> <api_key>` | Set S3 upload backend |
-| `STATUS` | Show WiFi, upload stats, S3 config, firmware version |
-| `UPLOAD` | Trigger upload task manually |
-| `FORMAT` | Format SD card (destroys all data) |
+CDC is **log-only** (no RX callback, no interactive CLI). All configuration is via SD
+magic files. CLI code is kept as dead code for reference. STATUS is logged automatically
+every 60s via `airbridge_log()`.
+
+### SD Magic Files
+
+Drop any of these on the SD root; firmware processes and deletes them on boot:
+| File | Effect |
+|------|--------|
+| `ENABLE_CDC` | Switch to CDC+MSC mode (NVS `usb/msc_only=0`) |
+| `ENABLE_MSC` | Switch to MSC-only mode (NVS `usb/msc_only=1`) |
+| `WIFI_CONFIG` | Two lines: ssid, password |
+| `S3_CONFIG` | Two lines: api_host, api_key |
+| `firmware.bin` | SD-flash: write to OTA partition + reboot |
+| `FORMAT_SD` | Format SD as 8GB FAT32 |
 | `REBOOT` | Reboot device |
-| `OTA` | Check for firmware update and apply |
-| `MODEM` | Show modem/PPP status |
-| `MODEM_START` | Start modem task if stopped |
-| `CELLTEST` | Run 10 MB cellular upload speed test |
-| `SETMODE CDC/MSC` | Set USB mode (takes effect on reboot) |
 
 ### NVS Namespaces
 
@@ -64,6 +80,8 @@ harvest files when idle, and upload via cellular.
 | `wifi` | `ssid0`..`ssid4`, `pass0`..`pass4`, `count` | Saved WiFi networks |
 | `ota` | `ota_status`, `fw_ver` | OTA rollback tracking |
 | `usb` | `msc_only` | USB mode preference |
+| `dbg` | `session` | Monotonic boot counter for log filenames |
+| `harvest` | `count` | Sequential harvest folder counter |
 
 ### FreeRTOS Tasks
 
@@ -100,8 +118,14 @@ The modem task handles multiple baud/mode scenarios on boot:
 * `esp32/partitions.csv` — Dual OTA partition table (ota_0 + ota_1, 1.875 MB each)
 * `esp32/sdkconfig.defaults` — ESP-IDF branch: lwIP/mbedTLS tuning (32KB TCP buffers)
 * `esp32/components/esp_tinyusb/` — ESP-IDF branch: local TinyUSB with custom MSC callbacks
-* `lambda/presign.py` — Lambda: S3 pre-signed URLs, firmware version check, DSU cookie, OTA download URL
-* `scripts/e2e_test.sh` — E2E test suite (7 tests: OTA, upload, power cuts, combos). Requires CoolGear hub.
+* `esp32/include/airbridge_log.h` — Unified logging: ring buffer + serial + SD flush
+* `esp32/include/airbridge_harvest.h` — Recursive directory walk, file move to /harvested/NNNN/
+* `esp32/include/airbridge_proto.h` — DSU cookie builder, CRC-16, filename parser, chunked decode
+* `esp32/include/airbridge_triggers.h` — Harvest trigger logic (15s quiet window)
+* `esp32/include/airbridge_utils.h` — JSON helpers, URL encode/decode, version compare, file skip list
+* `esp32/emu/main.cpp` — SDL2 emulator (~870 lines): SimModem via PTY, FileNvs, FakeSD
+* `lambda/presign.py` — Lambda: S3 pre-signed URLs, firmware version check, DSU cookie, OTA download URL, log append
+* `scripts/e2e_unified.sh` — Unified E2E test suite (15 emulator / 12 hardware tests). `--target emulator` or `--target device`.
 * `scripts/commission.sh` — Device commissioning (flash, format SD, verify cellular/OTA/USB)
 * `scripts/coolgear.py` — CoolGear USB hub power control for automated testing
 
