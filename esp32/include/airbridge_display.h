@@ -83,9 +83,17 @@ inline void updateDisplay(DisplayState& ds) {
             int pw = strlen(pctStr) * 6;
             g_hal->display->text((128 - pw) / 2, 49, pctStr);
         } else {
-            // Waiting for connection or checking — centered
-            g_hal->display->text(16, 24, "Checking for");
-            g_hal->display->text(28, 36, "update...");
+            // Waiting for connection or checking — centered with cycling dots
+            static int dotFrame = 0;
+            const char* dots[] = { "   ", ".  ", ".. ", "..." };
+            char line2[16];
+            snprintf(line2, sizeof(line2), "update%s", dots[dotFrame % 4]);
+            dotFrame++;
+
+            int w1 = 12 * 6; // "Checking for"
+            int w2 = strlen(line2) * 6;
+            g_hal->display->text((128 - w1) / 2, 28, "Checking for");
+            g_hal->display->text((128 - w2) / 2, 40, line2);
         }
 
         // Row 55 left empty (was "Do not unplug")
@@ -214,7 +222,13 @@ inline void dispOtaProgress(const char* newVersion, int pct) {
         int pw = strlen(pctStr) * 6;
         g_hal->display->text((128 - pw) / 2, 50, pctStr);
     } else {
-        g_hal->display->text(22, 38, "Checking...");
+        static int dotFrame2 = 0;
+        const char* dots[] = { "   ", ".  ", ".. ", "..." };
+        char chkLine[20];
+        snprintf(chkLine, sizeof(chkLine), "Checking%s", dots[dotFrame2 % 4]);
+        dotFrame2++;
+        int cw = strlen(chkLine) * 6;
+        g_hal->display->text((128 - cw) / 2, 38, chkLine);
     }
 
     g_hal->display->flush();
