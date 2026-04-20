@@ -428,7 +428,7 @@ static int               g_modemRssi    = 99;
 
 // ── CDC CLI ─────────────────────────────────────────────────────────────────
 // CLI removed — CDC serial is now a log-only output stream.
-// Configuration via SD magic files: WIFI_CONFIG, S3_CONFIG, ENABLE_CDC/MSC, firmware.bin
+// Configuration via SD magic files: WIFI_CONFIG, S3_CONFIG, ENABLE_CDC, firmware.bin
 
 // ── Unified logging (early, before any callbacks that use log_write/cdc_printf)
 static void _cdc_serial_sink(const char* buf, int len) {
@@ -1478,11 +1478,12 @@ static esp_tls_t* tls_connect(const char* host) {
         tls_destroy(tls);
         return nullptr;
     }
-    // Set 30s read timeout on the underlying socket (esp_tls_conn_read blocks otherwise)
+    // Set 30s read/write timeout on the underlying socket
     int sock_fd = -1;
     if (esp_tls_get_conn_sockfd(tls, &sock_fd) == ESP_OK && sock_fd >= 0) {
         struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
         setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sock_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
     return tls;
 }
@@ -1913,7 +1914,7 @@ static int otaCheck() {
     return 1;
 }
 
-// Upload a file from /sdcard/harvested/<relPath> to S3 using pre-signed URLs.
+// Upload a file from /sdcard/upload/<relPath> to S3 using pre-signed URLs.
 // relPath is "NNNN/filename" (e.g. "0001/data.csv")
 static bool s3UploadFile(const char* relPath) {
     if (!g_netConnected && !g_pppConnected) { cdc_printf("S3: no network\r\n"); return false; }
@@ -1921,7 +1922,7 @@ static bool s3UploadFile(const char* relPath) {
     g_tlsActive = true;  // suppress +++ for entire upload session
 
     char fpath[128];
-    snprintf(fpath, sizeof(fpath), "%s/harvested/%s", SD_MOUNT, relPath);
+    snprintf(fpath, sizeof(fpath), "%s/upload/%s", SD_MOUNT, relPath);
 
     xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
     FILE* f = fopen(fpath, "rb");
@@ -1946,6 +1947,15 @@ static bool s3UploadFile(const char* relPath) {
         char query[512];
         snprintf(query, sizeof(query), "file=%s&size=%u&device=%s", enc.c_str(), fileSize, g_deviceId);
         std::string resp = s3ApiGet(query);
+
+        // Skip upload if S3 already has this file (e.g. log uploaded via incremental)
+        if (resp.find("\"skip\"") != std::string::npos &&
+            resp.find("true") != std::string::npos) {
+            log_write("S3: skip '%s' (already on S3)", relPath);
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
+            return true;  // treat as success — caller will delete the file
+        }
+
         std::string url = jsonStr(resp, "\"url\"");
         if (url.empty()) {
             cdc_printf("S3: presign failed: %.200s", resp.c_str());
@@ -2037,6 +2047,14 @@ static bool s3UploadFile(const char* relPath) {
         char query[512];
         snprintf(query, sizeof(query), "file=%s&size=%u&device=%s", enc.c_str(), fileSize, g_deviceId);
         std::string resp = s3ApiGet(query);
+
+        // Skip if S3 already has this file
+        if (resp.find("\"skip\"") != std::string::npos &&
+            resp.find("true") != std::string::npos) {
+            log_write("S3: skip '%s' (already on S3)", relPath);
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
+            return true;
+        }
 
         std::string uid = jsonStr(resp, "\"upload_id\"");
         std::string key = jsonStr(resp, "\"key\"");
@@ -2793,8 +2811,11 @@ static void modemTask(void* param) {
         // RSSI is read during modem init. modemRssiCheck() available for safe gaps.
 
         // ── Detect PPP connection loss or stuck CONNECT without IP ────────
+        // Extend stale timeout during TLS — slow handshakes on weak links
+        // produce no PPP rx data while waiting for server response.
+        uint32_t staleMs = g_tlsActive ? 90000 : 30000;
         bool pppStale = g_pppConnected && lastPppRxMs > 0 &&
-                        (millis() - lastPppRxMs) > 30000;
+                        (millis() - lastPppRxMs) > staleMs;
         // If we got CONNECT but no IP within 30s, force reconnect
         if (!g_pppConnected && !g_pppNeedsReconnect && lastPppRxMs > 0 &&
             (millis() - lastPppRxMs) > 30000) {
@@ -3151,12 +3172,15 @@ static void uploadTask(void* param) {
         g_tlsActive = false;
     }
 
+    // Old boot logs are moved to SD root at boot (see app_main) so the
+    // normal harvest → upload pipeline handles them. No TLS needed here.
+
     // Signal main loop: OTA + cookie done, safe to present USB to host
     g_preUsbDone = true;
     log_write("Pre-USB tasks done — USB can be presented");
     cdc_printf("Pre-USB: OTA+cookie done\r\n");
 
-    // ── Upload loop — scan /harvested/NNNN/ subfolders ──────────────
+    // ── Upload loop — scan /upload/NNNN/ subfolders ──────────────
     for (;;) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));  // wake on notify or every 15s
 
@@ -3169,7 +3193,7 @@ static void uploadTask(void* param) {
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
             {
                 char harvBase[64];
-                snprintf(harvBase, sizeof(harvBase), "%s/harvested", SD_MOUNT);
+                snprintf(harvBase, sizeof(harvBase), "%s/upload", SD_MOUNT);
                 // Collect numeric subfolders
                 char subs[32][16];
                 int nSubs = 0;
@@ -3220,7 +3244,7 @@ static void uploadTask(void* param) {
             if (!relPath[0]) break;  // nothing to upload — no log spam
 
             char path[192];
-            snprintf(path, sizeof(path), "%s/harvested/%s", SD_MOUNT, relPath);
+            snprintf(path, sizeof(path), "%s/upload/%s", SD_MOUNT, relPath);
             cdc_printf("Upload: found %s\r\n", path);
 
             // Get file size before upload
@@ -3269,7 +3293,7 @@ static void uploadTask(void* param) {
                 const char* slash = strchr(relPath, '/');
                 if (slash) {
                     char subDir[96];
-                    snprintf(subDir, sizeof(subDir), "%s/harvested/%.*s",
+                    snprintf(subDir, sizeof(subDir), "%s/upload/%.*s",
                              SD_MOUNT, (int)(slash - relPath), relPath);
                     rmdir(subDir);
                 }
@@ -3283,7 +3307,9 @@ static void uploadTask(void* param) {
 
             // RSSI check removed — +++ disrupts PPP even between files
         }
-        ESP_LOGI(TAG, "Upload idle — %u uploaded", g_filesUploaded);
+        if (g_filesQueued > 0) {
+            log_write("Upload: scan found no files but q=%u — possible FATFS stale cache", g_filesQueued);
+        }
     }
 }
 
@@ -3321,7 +3347,7 @@ static void doHarvest() {
 
     // Harvest files using shared harvestFiles() from airbridge_harvest.h
     char harvDir[64];
-    snprintf(harvDir, sizeof(harvDir), "%s/harvested", SD_MOUNT);
+    snprintf(harvDir, sizeof(harvDir), "%s/upload", SD_MOUNT);
     uint32_t harvestNum = 0;
     g_hal->nvs->get_u32("harvest", "count", &harvestNum);
     harvestNum++;
@@ -3388,7 +3414,7 @@ static void harvestTask(void* param) {
 }
 
 // CLI removed — all configuration via SD magic files.
-// Kept for reference: SETWIFI→WIFI_CONFIG, SETS3→S3_CONFIG, SETMODE→ENABLE_CDC/MSC,
+// Kept for reference: SETWIFI→WIFI_CONFIG, SETS3→S3_CONFIG, SETMODE→ENABLE_CDC,
 // OTA→automatic, UPLOAD→automatic, FORMAT→FORMAT_SD, REBOOT→REBOOT file.
 
 #if 0  // CLI code removed — kept as dead code for reference during transition
@@ -3525,8 +3551,8 @@ static void processCLI(const char* cmd) {
                 g_fatfs_mounted = true;
                 g_card_sectors = g_card->csd.capacity;
                 g_sd_ready = true;
-                // Create harvested directory
-                mkdir("/sdcard/harvested", 0775);
+                // Create upload directory
+                mkdir("/sdcard/upload", 0775);
                 cdc_printf("CLI: format complete, 8GB FAT32 ready\r\n");
             } else {
                 cdc_printf("CLI: remount FAILED: %s\r\n", esp_err_to_name(ret));
@@ -3651,7 +3677,7 @@ static void processCLI(const char* cmd) {
                 // Create 10 MB test file on SD in a temp subfolder
                 cdc_printf("CellTest: creating %lu byte test file...\r\n", (unsigned long)TEST_SIZE);
                 char testDir[80], filepath[128];
-                snprintf(testDir, sizeof(testDir), "%s/harvested/celltest", SD_MOUNT);
+                snprintf(testDir, sizeof(testDir), "%s/upload/celltest", SD_MOUNT);
                 snprintf(filepath, sizeof(filepath), "%s/%s", testDir, testName);
 
                 xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
@@ -3996,33 +4022,17 @@ extern "C" void app_main(void) {
 
     // Boot splash is shown later, after file scan
 
-    // ── SD magic files: USB mode switch ─────────────────────────────────
-    // Drop ENABLE_CDC or ENABLE_MSC on SD card to switch USB mode on next boot
+    // ── SD magic file: USB mode switch ──────────────────────────────────
+    // Drop ENABLE_CDC on SD to temporarily enable CDC+MSC for this boot.
+    // File is deleted after processing. NVS stays MSC-only so the next boot
+    // without the file reverts to production mode automatically.
     if (g_fatfs_mounted) {
         char path[64];
         snprintf(path, sizeof(path), "%s/ENABLE_CDC", SD_MOUNT);
         if (access(path, F_OK) == 0) {
-            ESP_LOGW(TAG, "SD: ENABLE_CDC found — switching to CDC+MSC");
-            disp("USB Mode", "CDC+MSC");
-            nvs_handle_t h;
-            if (nvs_open("usb", NVS_READWRITE, &h) == ESP_OK) {
-                nvs_set_u8(h, "msc_only", 0);
-                nvs_commit(h); nvs_close(h);
-            }
-            g_msc_only = false;
-            remove(path);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
-        snprintf(path, sizeof(path), "%s/ENABLE_MSC", SD_MOUNT);
-        if (access(path, F_OK) == 0) {
-            ESP_LOGW(TAG, "SD: ENABLE_MSC found — switching to MSC-only");
-            disp("USB Mode", "MSC-only");
-            nvs_handle_t h;
-            if (nvs_open("usb", NVS_READWRITE, &h) == ESP_OK) {
-                nvs_set_u8(h, "msc_only", 1);
-                nvs_commit(h); nvs_close(h);
-            }
-            g_msc_only = true;
+            ESP_LOGW(TAG, "SD: ENABLE_CDC found — CDC+MSC for this boot");
+            disp("USB Mode", "CDC+MSC (temp)");
+            g_msc_only = false;  // enable CDC for this boot only — NVS unchanged
             remove(path);
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
@@ -4185,10 +4195,10 @@ extern "C" void app_main(void) {
     xTaskCreatePinnedToCore(modemTask,     "modem",     16384, nullptr, 2, &g_modem_task,   0);  // core 0, 16KB stack for reconnection
     xTaskCreatePinnedToCore(main_loop_task, "main_loop", 4096, nullptr, 1, nullptr,         0);
 
-    // ── Scan /harvested/ subfolders for leftover files from before last reboot ──
+    // ── Scan /upload/ subfolders for leftover files from before last reboot ──
     if (g_fatfs_mounted) {
         char harvBase[64];
-        snprintf(harvBase, sizeof(harvBase), "%s/harvested", SD_MOUNT);
+        snprintf(harvBase, sizeof(harvBase), "%s/upload", SD_MOUNT);
         DIR* topDir = opendir(harvBase);
         if (topDir) {
             struct dirent* sub;
@@ -4213,9 +4223,39 @@ extern "C" void app_main(void) {
             }
             closedir(topDir);
             if (g_filesQueued > 0) {
-                ESP_LOGI(TAG, "Boot: found %u file(s) in /harvested/ — notifying upload", g_filesQueued);
+                ESP_LOGI(TAG, "Boot: found %u file(s) in /upload/ — notifying upload", g_filesQueued);
                 xTaskNotifyGive(g_upload_task);
             }
+        }
+    }
+
+    // ── Move old boot logs from /logs/ to SD root for harvest pipeline ──
+    // Previous sessions' logs get picked up by the normal harvest → upload
+    // flow. No TLS or cellular needed at boot — just a fast rename.
+    if (g_fatfs_mounted && g_logFileName[0]) {
+        DIR* logDir = opendir("/sdcard/logs");
+        if (logDir) {
+            struct dirent* ent;
+            while ((ent = readdir(logDir)) != nullptr) {
+                if (strncmp(ent->d_name, "boot_", 5) != 0) continue;
+                const char* dot = strrchr(ent->d_name, '.');
+                if (!dot || strcmp(dot, ".log") != 0) continue;
+                // Extract session name (without .log) to skip current
+                char session[48];
+                size_t nameLen = dot - ent->d_name;
+                if (nameLen >= sizeof(session)) continue;
+                memcpy(session, ent->d_name, nameLen);
+                session[nameLen] = '\0';
+                if (strcmp(session, g_logFileName) == 0) continue;
+
+                char src[80], dst[80];
+                snprintf(src, sizeof(src), "/sdcard/logs/%s", ent->d_name);
+                snprintf(dst, sizeof(dst), "/sdcard/%s", ent->d_name);
+                if (rename(src, dst) == 0) {
+                    log_write("Moved old log %s to root for harvest", ent->d_name);
+                }
+            }
+            closedir(logDir);
         }
     }
 
@@ -4223,7 +4263,9 @@ extern "C" void app_main(void) {
     // Checks root AND DSU subdirectories (e.g. flightHistory/) — the aircraft
     // writes .eaofh files into flightHistory/, not flat to root, so a root-only
     // scan would miss them and never trigger a boot-time harvest.
-    if (g_fatfs_mounted && g_filesQueued == 0) {
+    // Always scan regardless of queued count — files in /upload/ don't mean
+    // root is clean (e.g. aircraft wrote 60 MB after last harvest).
+    if (g_fatfs_mounted) {
         bool found = false;
         const char* foundPath = nullptr;
         static char foundPathBuf[96];
@@ -4233,7 +4275,7 @@ extern "C" void app_main(void) {
             struct dirent* ent;
             while ((ent = readdir(rootDir)) != nullptr) {
                 if (ent->d_name[0] == '.') continue;
-                if (isSkipped(ent->d_name)) continue;  // harvested/, logs/, dsuCookie, magic files, etc.
+                if (isSkipped(ent->d_name)) continue;  // upload/, logs/, dsuCookie, magic files, etc.
 
                 if (ent->d_type == DT_DIR) {
                     // Peek one level into this subdirectory — if it has any

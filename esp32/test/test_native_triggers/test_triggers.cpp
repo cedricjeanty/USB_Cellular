@@ -67,6 +67,24 @@ void test_harvest_overflow_guard(void) {
     TEST_ASSERT_FALSE(shouldHarvest(false, true, true, 50000, 0, 15000, 10000));
 }
 
+void test_harvest_second_trigger_after_first_completes(void) {
+    // Simulates: first harvest at t=90000, flags reset, aircraft writes again,
+    // 15s quiet, second harvest triggers.
+    // After first harvest, writeDetected/hostWasConnected/lastWriteMs are reset.
+    // Aircraft writes again at t=100000, setting flags back.
+    // At t=120000 (20s idle), second harvest should trigger.
+    TEST_ASSERT_TRUE(shouldHarvest(false, true, true, 100000, 90000, 15000, 120000));
+}
+
+void test_harvest_triggers_with_flags_reset_then_new_write(void) {
+    // After harvest resets all flags, no harvest without new write
+    TEST_ASSERT_FALSE(shouldHarvest(false, false, false, 0, 90000, 15000, 120000));
+    // New write sets flags — still within quiet window
+    TEST_ASSERT_FALSE(shouldHarvest(false, true, true, 119000, 90000, 15000, 120000));
+    // After quiet window elapses
+    TEST_ASSERT_TRUE(shouldHarvest(false, true, true, 119000, 90000, 15000, 135000));
+}
+
 // ── Test runner ─────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -84,6 +102,8 @@ int main(int argc, char** argv) {
     RUN_TEST(test_harvest_cooldown_after_first_harvest);
     RUN_TEST(test_harvest_cooldown_blocks_rapid_reharvest);
     RUN_TEST(test_harvest_overflow_guard);
+    RUN_TEST(test_harvest_second_trigger_after_first_completes);
+    RUN_TEST(test_harvest_triggers_with_flags_reset_then_new_write);
 
     return UNITY_END();
 }

@@ -146,9 +146,9 @@ inline int8_t rssiToBars(int32_t rssi) {
 namespace {
 const char* const SKIP_NAMES[] = {
     "System Volume Information", "desktop.ini", "Thumbs.db",
-    ".Spotlight-V100", ".Trashes", ".fseventsd", "harvested", "logs",
+    ".Spotlight-V100", ".Trashes", ".fseventsd", "upload", "logs",
     "airbridge.log", "dsuCookie.easdf",
-    "firmware.bin", "_firmware.bin", "ENABLE_CDC", "ENABLE_MSC",
+    "firmware.bin", "_firmware.bin", "ENABLE_CDC",
     "WIFI_CONFIG", "S3_CONFIG", "FORMAT_SD", "REBOOT",
     nullptr
 };

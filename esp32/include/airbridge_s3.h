@@ -244,7 +244,7 @@ struct UploadResult {
 };
 
 // Upload a single file to S3 using pre-signed URLs.
-// filepath: full path to the file (e.g. "./emu_sdcard/harvested/data.csv")
+// filepath: full path to the file (e.g. "./emu_sdcard/upload/data.csv")
 // filename: just the name (e.g. "data.csv") — used for S3 key
 // progress: optional callback for display updates
 inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
@@ -274,6 +274,15 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
     snprintf(query, sizeof(query), "file=%s&size=%u&device=%s",
              urlEncode(filename).c_str(), fileSize, creds.deviceId);
     std::string resp = s3ApiGetViaHal(creds.apiHost, creds.apiKey, query);
+
+    // Skip upload if S3 already has this file with matching size
+    if (resp.find("\"skip\"") != std::string::npos &&
+        resp.find("true") != std::string::npos) {
+        res.success = true;
+        res.kbps = 0;
+        strlcpy(res.error, "skipped (already on S3)", sizeof(res.error));
+        return res;
+    }
 
     std::string url = jsonStr(resp, "url");
     std::string uploadId = jsonStr(resp, "upload_id");
