@@ -69,7 +69,7 @@ write_test_file() {
     done
     [ -n "$sddev" ] || { log "  WARN: no USB drive found after 90s"; return 1; }
     sudo mount -o noatime "$sddev" /mnt 2>/dev/null || { log "  WARN: mount $sddev failed"; return 1; }
-    sudo rm -f /mnt/harvested/.done__test_* /mnt/harvested/test_*.bin /mnt/test_*.bin 2>/dev/null
+    sudo rm -f /mnt/upload/.done__test_* /mnt/upload/test_*.bin /mnt/test_*.bin 2>/dev/null
     sudo dd if=/dev/urandom of="/mnt/$name" bs=1M count="$size_mb" 2>/dev/null
     sync; sudo umount /mnt 2>/dev/null
     log "  Wrote $name (${size_mb}MB)"
@@ -188,7 +188,7 @@ done
 if [ -n "$SDDEV" ]; then
     log "  Found $SDDEV"
     sudo mount -o noatime "$SDDEV" /mnt 2>/dev/null
-    sudo rm -f /mnt/harvested/.done__test_* /mnt/test_*.bin /mnt/harvested/test_*.bin 2>/dev/null
+    sudo rm -f /mnt/upload/.done__test_* /mnt/test_*.bin /mnt/upload/test_*.bin 2>/dev/null
     sudo umount /mnt 2>/dev/null
 fi
 

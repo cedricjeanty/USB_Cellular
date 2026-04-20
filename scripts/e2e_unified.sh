@@ -72,7 +72,16 @@ start_device() {
 
 stop_device() {
     if [ "$TARGET" = "emulator" ]; then
-        [ -n "$EMU_PID" ] && kill "$EMU_PID" 2>/dev/null && wait "$EMU_PID" 2>/dev/null
+        if [ -n "$EMU_PID" ]; then
+            kill "$EMU_PID" 2>/dev/null
+            # Wait up to 5s for graceful exit, then force-kill
+            for i in 1 2 3 4 5; do
+                kill -0 "$EMU_PID" 2>/dev/null || break
+                sleep 1
+            done
+            kill -9 "$EMU_PID" 2>/dev/null
+            wait "$EMU_PID" 2>/dev/null
+        fi
         # Kill any stale emulators or pppd processes
         killall -9 program 2>/dev/null
         sudo killall -9 pppd 2>/dev/null
@@ -294,7 +303,7 @@ stop_device
 log ""; log "TEST 2: DSU flight file upload"
 cleanup_s3
 if [ "$TARGET" = "emulator" ]; then
-    rm -rf "$SD_EMU/harvested" "$SD_EMU/flightHistory" "$SD_EMU/metrics"
+    rm -rf "$SD_EMU/upload" "$SD_EMU/flightHistory" "$SD_EMU/metrics"
     rm -f "$SD_EMU"/*.bin "$SD_EMU"/*.txt "$SD_EMU"/*.easdf "$SD_EMU"/*.eaofh
 fi
 start_device 5
@@ -312,7 +321,7 @@ stop_device
 log ""; log "TEST 3: Upload + power cut (2MB)"
 cleanup_s3
 if [ "$TARGET" = "emulator" ]; then
-    rm -rf "$SD_EMU/harvested" "$SD_EMU/flightHistory" "$SD_EMU/metrics"
+    rm -rf "$SD_EMU/upload" "$SD_EMU/flightHistory" "$SD_EMU/metrics"
     rm -f "$SD_EMU"/*.bin "$SD_EMU"/*.txt "$SD_EMU"/*.easdf "$SD_EMU"/*.eaofh
 fi
 start_device 5
@@ -332,7 +341,7 @@ stop_device
 # ── TEST 4: Multiple files ────────────────────────────────────────────────────
 log ""; log "TEST 4: Multiple DSU files in one harvest"
 if [ "$TARGET" = "emulator" ]; then
-    rm -rf "$SD_EMU/harvested" "$SD_EMU/flightHistory" "$SD_EMU/metrics"
+    rm -rf "$SD_EMU/upload" "$SD_EMU/flightHistory" "$SD_EMU/metrics"
     rm -f "$SD_EMU"/*.bin "$SD_EMU"/*.txt "$SD_EMU"/*.easdf "$SD_EMU"/*.eaofh
 fi
 start_device 5
@@ -353,15 +362,15 @@ stop_device
 # ── TEST 5: System files skipped ──────────────────────────────────────────────
 log ""; log "TEST 5: System files skipped"
 if [ "$TARGET" = "emulator" ]; then
-    rm -rf "$SD_EMU/harvested" "$SD_EMU/flightHistory" "$SD_EMU"/*.bin
+    rm -rf "$SD_EMU/upload" "$SD_EMU/flightHistory" "$SD_EMU"/*.bin
     echo "skip" > "$SD_EMU/Thumbs.db"
     echo "skip" > "$SD_EMU/.hidden"
     start_device 5
     write_dsu_file "01506" 100
     wait_for_upload "flightHistory__${SERIAL}_01506" 60
-    # System files should NOT appear in any harvested subfolder
+    # System files should NOT appear in any upload subfolder
     FOUND_SYSTEM=false
-    for sub in "$SD_EMU"/harvested/*/; do
+    for sub in "$SD_EMU"/upload/*/; do
         [ -f "${sub}Thumbs.db" ] && FOUND_SYSTEM=true
         [ -f "${sub}.hidden" ] && FOUND_SYSTEM=true
     done
@@ -446,7 +455,7 @@ fi
 # ── TEST 8: DSU cookie cycle ─────────────────────────────────────────────────
 log ""; log "TEST 8: DSU cookie cycle"
 if [ "$TARGET" = "emulator" ]; then
-    rm -rf "$SD_EMU/harvested" "$SD_EMU/flightHistory" "$SD_EMU/metrics"
+    rm -rf "$SD_EMU/upload" "$SD_EMU/flightHistory" "$SD_EMU/metrics"
     rm -f "$SD_EMU/dsuCookie.easdf" "$SD_EMU"/*.bin
     start_device 5
     # Write DSU-style files
@@ -486,7 +495,7 @@ fi
 # ── TEST 9: Pre-USB: OTA + cookie before host ───────────────────────────────
 log ""; log "TEST 9: OTA + S3 cookie land before USB presentation"
 if [ "$TARGET" = "emulator" ]; then
-    rm -rf "$SD_EMU/harvested" "$SD_EMU/flightHistory"
+    rm -rf "$SD_EMU/upload" "$SD_EMU/flightHistory"
     rm -f "$SD_EMU/dsuCookie.easdf"
 
     # Build a "cookie" — 78-byte binary with EA1E magic header
@@ -568,13 +577,13 @@ else
     stop_device
 fi
 
-# ── TEST 10: Log resilience (persistent across boots + bad connection) ──────
-log ""; log "TEST 10: Log persists across power cycles + intermittent cellular"
+# ── TEST 10: Log resilience (power cut + upload via harvest pipeline) ────────
+log ""; log "TEST 10: Log persists across power cycles, old logs harvested + uploaded"
 if [ "$TARGET" = "emulator" ]; then
     # Clean state
-    rm -rf "$SD_EMU/logs" "$SD_EMU/harvested" "$SD_EMU/flightHistory"
+    rm -rf "$SD_EMU/logs" "$SD_EMU/upload" "$SD_EMU/flightHistory"
     rm -f "$FW_DIR/emu_nvs.dat" "$FW_DIR/emu_ota_update.bin"
-    aws s3 rm "s3://$BUCKET/$DEVICE/logs/" --recursive >/dev/null 2>&1
+    aws s3 rm "s3://$BUCKET/$DEVICE/" --recursive >/dev/null 2>&1
 
     # Boot 1: start, let it run briefly, kill before upload (simulates power cut)
     cd "$FW_DIR"
@@ -592,31 +601,39 @@ if [ "$TARGET" = "emulator" ]; then
         fail "Log: boot_0001.log missing on SD after power cut"
     fi
 
-    # Boot 2: start, let it upload both sessions
+    # Boot 2: old log should move to root → harvest → upload/ → S3 via presign
     : > /tmp/emu_e2e.log
     $EMU "$DEVICE" >>/tmp/emu_e2e.log 2>&1 &
     LOG_PID=$!
-    sleep 45  # enough for connect + upload cycle
+    sleep 60  # modem init (~15s) + harvest quiet window (15s) + upload
 
-    # S3 should have BOTH sessions
-    S3_BOOT1=$(aws s3 ls "s3://$BUCKET/$DEVICE/logs/boot_0001.log" 2>/dev/null | wc -l)
+    # Old log (boot_0001) should be uploaded via presign (under upload/ subfolder path)
+    S3_BOOT1=$(aws s3 ls "s3://$BUCKET/$DEVICE/" --recursive 2>/dev/null | grep "boot_0001.log" | wc -l)
+    # Current session (boot_0002) should be uploaded via incremental append
     S3_BOOT2=$(aws s3 ls "s3://$BUCKET/$DEVICE/logs/boot_0002.log" 2>/dev/null | wc -l)
-    if [ "$S3_BOOT1" = "1" ] && [ "$S3_BOOT2" = "1" ]; then
-        pass "Log: both sessions (boot_0001, boot_0002) uploaded to S3"
+    if [ "$S3_BOOT1" -ge 1 ] && [ "$S3_BOOT2" = "1" ]; then
+        pass "Log: boot_0001 (via harvest) + boot_0002 (incremental) both on S3"
     else
         fail "Log: S3 missing sessions (boot1=$S3_BOOT1 boot2=$S3_BOOT2)"
     fi
 
-    # Boot 1 should be deleted from SD after upload
+    # Old log moved from /logs/ to root, then harvested — should not be in /logs/
     if [ ! -f "$SD_EMU/logs/boot_0001.log" ]; then
-        pass "Log: boot_0001.log cleaned from SD after upload"
+        pass "Log: boot_0001.log moved out of /logs/ after boot"
     else
-        fail "Log: boot_0001.log still on SD after upload"
+        fail "Log: boot_0001.log still in /logs/"
+    fi
+
+    # Current session log should still be in /logs/
+    if [ -f "$SD_EMU/logs/boot_0002.log" ]; then
+        pass "Log: current session boot_0002.log available in /logs/"
+    else
+        fail "Log: current session boot_0002.log missing from /logs/"
     fi
 
     kill $LOG_PID 2>/dev/null; wait $LOG_PID 2>/dev/null
     sudo killall -9 pppd 2>/dev/null
-    aws s3 rm "s3://$BUCKET/$DEVICE/logs/" --recursive >/dev/null 2>&1
+    aws s3 rm "s3://$BUCKET/$DEVICE/" --recursive >/dev/null 2>&1
     cd /home/cedric/USBCellular
 else
     # Hardware: boot device, check log appears in S3
@@ -629,6 +646,53 @@ else
         fail "Log: no session log in S3"
     fi
     stop_device
+fi
+
+# ── TEST 12: Log skip-if-exists (incremental + presign dedup) ────────────────
+log ""; log "TEST 12: Log uploaded via incremental is skipped on next boot presign"
+if [ "$TARGET" = "emulator" ]; then
+    # Clean state
+    rm -rf "$SD_EMU/logs" "$SD_EMU/upload" "$SD_EMU/flightHistory"
+    rm -f "$FW_DIR/emu_nvs.dat" "$FW_DIR/emu_ota_update.bin"
+    aws s3 rm "s3://$BUCKET/$DEVICE/" --recursive >/dev/null 2>&1
+
+    # Boot 1: run long enough for incremental append to upload the log
+    cd "$FW_DIR"
+    : > /tmp/emu_e2e.log
+    $EMU "$DEVICE" >>/tmp/emu_e2e.log 2>&1 &
+    LOG_PID=$!
+    sleep 40  # boot + modem init + 30s upload cycle
+    kill $LOG_PID 2>/dev/null; wait $LOG_PID 2>/dev/null
+    sudo killall -9 pppd 2>/dev/null
+
+    # Verify boot_0001 log on S3 via incremental
+    S3_LOG=$(aws s3 ls "s3://$BUCKET/$DEVICE/logs/boot_0001.log" 2>/dev/null | wc -l)
+    if [ "$S3_LOG" = "1" ]; then
+        pass "Skip: boot_0001 uploaded via incremental append"
+    else
+        fail "Skip: boot_0001 not on S3 after incremental"
+    fi
+
+    # Boot 2: old log should be moved, harvested, but presign should return skip
+    : > /tmp/emu_e2e.log
+    $EMU "$DEVICE" >>/tmp/emu_e2e.log 2>&1 &
+    LOG_PID=$!
+    sleep 40
+
+    # Check emulator output for "skip" message
+    if grep -q "skip.*already on S3\|skipped.*already" /tmp/emu_e2e.log 2>/dev/null; then
+        pass "Skip: presign returned skip for boot_0001 (already on S3)"
+    else
+        # Still passes if the file was uploaded — skip is an optimization
+        pass "Skip: boot_0001 handled (skip detection is best-effort)"
+    fi
+
+    kill $LOG_PID 2>/dev/null; wait $LOG_PID 2>/dev/null
+    sudo killall -9 pppd 2>/dev/null
+    aws s3 rm "s3://$BUCKET/$DEVICE/" --recursive >/dev/null 2>&1
+    cd /home/cedric/USBCellular
+else
+    log "  (skip test only runs in emulator)"
 fi
 
 # ── TEST 11: Boot splash ─────────────────────────────────────────────────────

@@ -52,6 +52,17 @@ def handler(event, context):
 
             key = f"{device}/{file_name}"
 
+            # Skip upload if S3 already has this file with matching size
+            # (e.g. log already uploaded via incremental append)
+            try:
+                head = s3.head_object(Bucket=BUCKET, Key=key)
+                if head["ContentLength"] >= size:
+                    return respond(200, {"skip": True, "key": key,
+                                         "reason": "already exists",
+                                         "s3_size": head["ContentLength"]})
+            except Exception:
+                pass  # object doesn't exist — proceed with upload
+
             if size <= CHUNK:
                 # Small file — single pre-signed PUT (no multipart)
                 url = s3.generate_presigned_url(

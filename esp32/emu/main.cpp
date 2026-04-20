@@ -8,8 +8,8 @@
 //
 // Keyboard:
 //   C       Toggle cellular connected (enables/disables uploads)
-//   H       Harvest files from emu_sdcard/ to emu_sdcard/harvested/
-//   P       Upload harvested files to S3 (requires C first)
+//   H       Harvest files from emu_sdcard/ to emu_sdcard/upload/
+//   P       Upload files from emu_sdcard/upload/ to S3 (requires C first)
 //   T       Test AT command sequence via simulated UART
 //   U       Simulate USB write (+10 MB display counter)
 //   +/-     Adjust display upload speed
@@ -105,6 +105,10 @@ static void cdc_printf(const char* fmt, ...) {
     if (len > 0) airbridge_log("%s", buf);
 }
 #define log_write airbridge_log
+
+// Signal handler for clean shutdown on SIGTERM/SIGINT
+static volatile bool s_quit = false;
+static void sigHandler(int) { s_quit = true; }
 
 // Harvest pipeline state (mirrors firmware globals)
 static bool     s_writeDetected = false;
@@ -281,7 +285,7 @@ static void uploadProgressCb(uint32_t bytesSent, uint32_t totalBytes) {
 static void uploadThread(DisplayState* ds) {
     s_uploadDs = ds;
     char harvestDir[256];
-    snprintf(harvestDir, sizeof(harvestDir), "%s/harvested", SD_ROOT);
+    snprintf(harvestDir, sizeof(harvestDir), "%s/upload", SD_ROOT);
     printf("[S3] Upload thread started — %s\n", harvestDir);
 
     char relPath[128];
@@ -338,6 +342,8 @@ static void renderFramebuffer(SDL_Renderer* renderer) {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
+    signal(SIGTERM, sigHandler);
+    signal(SIGINT, sigHandler);
     s_display.init();
 
     // Create log PTY for external tools (cat, test scripts)
@@ -372,6 +378,47 @@ int main(int argc, char* argv[]) {
     snprintf(emuLogPath, sizeof(emuLogPath), "%s/logs/%s.log", SD_ROOT, emuLogSession);
 
     airbridge_log("AirBridge fw=%s boot=%lu (emulator)", FW_VERSION, (unsigned long)emuBootCount);
+
+    // Move old boot logs from /logs/ to SD root for harvest → upload pipeline
+    // (matches firmware behavior — old logs get uploaded via presign, not append)
+    {
+        char logDir[256];
+        snprintf(logDir, sizeof(logDir), "%s/logs", SD_ROOT);
+        void* dir = g_hal->filesys->opendir(logDir);
+        if (dir) {
+            FsDirEntry ent;
+            std::vector<std::string> oldLogs;
+            while (g_hal->filesys->readdir(dir, &ent)) {
+                if (ent.is_dir) continue;
+                if (strncmp(ent.name, "boot_", 5) != 0) continue;
+                const char* dot = strrchr(ent.name, '.');
+                if (!dot || strcmp(dot, ".log") != 0) continue;
+                // Skip current session
+                char session[48];
+                size_t nameLen = dot - ent.name;
+                if (nameLen >= sizeof(session)) continue;
+                memcpy(session, ent.name, nameLen);
+                session[nameLen] = '\0';
+                if (strcmp(session, emuLogSession) == 0) continue;
+                oldLogs.push_back(ent.name);
+            }
+            g_hal->filesys->closedir(dir);
+            for (auto& name : oldLogs) {
+                char src[256], dst[256];
+                snprintf(src, sizeof(src), "%s/logs/%s", SD_ROOT, name.c_str());
+                snprintf(dst, sizeof(dst), "%s/%s", SD_ROOT, name.c_str());
+                if (rename(src, dst) == 0) {
+                    airbridge_log("Moved old log %s to root for harvest", name.c_str());
+                }
+            }
+            // Trigger harvest for moved files (same as firmware boot scan)
+            if (!oldLogs.empty()) {
+                s_writeDetected = true;
+                s_hostWasConnected = true;
+                s_lastWriteMs = SDL_GetTicks();
+            }
+        }
+    }
 
     char tmp[4] = "";
     if (!s_nvs.get_str("s3", "api_host", tmp, sizeof(tmp)) || tmp[0] == '\0') {
@@ -432,7 +479,7 @@ int main(int argc, char* argv[]) {
     // Check for pending uploads from previous session (scan subfolders)
     {
         char harvestDir[256];
-        snprintf(harvestDir, sizeof(harvestDir), "%s/harvested", SD_ROOT);
+        snprintf(harvestDir, sizeof(harvestDir), "%s/upload", SD_ROOT);
         char pendingRel[128];
         if (findNextUploadFile(harvestDir, pendingRel, sizeof(pendingRel))) {
             printf("[Boot] Found pending upload: %s — will upload after modem init\n", pendingRel);
@@ -476,7 +523,7 @@ int main(int argc, char* argv[]) {
             SDL_Delay(100);
         }
     }
-    while (running) {
+    while (running && !s_quit) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) {
@@ -496,7 +543,7 @@ int main(int argc, char* argv[]) {
                 case SDLK_h: {
                     printf("Harvesting from %s/ ...\n", SD_ROOT);
                     char destDir[256];
-                    snprintf(destDir, sizeof(destDir), "%s/harvested", SD_ROOT);
+                    snprintf(destDir, sizeof(destDir), "%s/upload", SD_ROOT);
                     uint32_t hnum = 0;
                     g_hal->nvs->get_u32("harvest", "count", &hnum);
                     hnum++;
@@ -726,7 +773,7 @@ int main(int argc, char* argv[]) {
                     FsDirEntry ent;
                     while (g_hal->filesys->readdir(dir, &ent)) {
                         if (ent.name[0] == '.') continue;
-                        if (strcmp(ent.name, "harvested") == 0) continue;
+                        if (strcmp(ent.name, "upload") == 0) continue;
                         if (isSkipped(ent.name)) continue;
                         char fp[256]; snprintf(fp, sizeof(fp), "%s/%s", path, ent.name);
                         uint32_t sz = 0; bool isDir = false;
@@ -763,7 +810,7 @@ int main(int argc, char* argv[]) {
                     if (d2) {
                         FsDirEntry e2;
                         while (g_hal->filesys->readdir(d2, &e2)) {
-                            if (e2.name[0] == '.' || strcmp(e2.name, "harvested") == 0) continue;
+                            if (e2.name[0] == '.' || strcmp(e2.name, "upload") == 0) continue;
                             uint32_t sz = 0; bool isDir = false;
                             char fp[256]; snprintf(fp, sizeof(fp), "%s/%s", SD_ROOT, e2.name);
                             if (g_hal->filesys->stat(fp, &sz, &isDir) && !isDir)
@@ -787,7 +834,7 @@ int main(int argc, char* argv[]) {
             s_harvesting = true;
 
             char destDir[256];
-            snprintf(destDir, sizeof(destDir), "%s/harvested", SD_ROOT);
+            snprintf(destDir, sizeof(destDir), "%s/upload", SD_ROOT);
             uint32_t hnum = 0;
             g_hal->nvs->get_u32("harvest", "count", &hnum);
             hnum++;
@@ -841,29 +888,13 @@ int main(int argc, char* argv[]) {
             static long lastUploadPos = 0;
             static std::atomic<bool> logUploading{false};
             if (ds.pppConnected && !logUploading && (now - lastUpload) > 30000) {
-                // Check session file size (scan all boot_ files — upload old ones first)
-                // Scan logs directory
-                char dirPath[128];
-                snprintf(dirPath, sizeof(dirPath), "%s/logs", SD_ROOT);
-                void* dir = g_hal->filesys->opendir(dirPath);
-                char oldestPending[64] = "";
-                if (dir) {
-                    FsDirEntry ent;
-                    while (g_hal->filesys->readdir(dir, &ent)) {
-                        if (ent.is_dir || strncmp(ent.name, "boot_", 5) != 0) continue;
-                        // Compare to current session
-                        if (strncmp(ent.name, emuLogSession, strlen(emuLogSession)) == 0) continue;
-                        // Older session — upload fully
-                        if (oldestPending[0] == '\0' || strcmp(ent.name, oldestPending) < 0)
-                            strlcpy(oldestPending, ent.name, sizeof(oldestPending));
-                    }
-                    g_hal->filesys->closedir(dir);
-                }
+                // Old logs are moved to SD root at boot and handled by the
+                // harvest → upload pipeline. Only upload current session here.
 
                 lastUpload = now;
                 logUploading = true;
                 // Spawn upload thread
-                std::thread([&ds, emuLogPath, emuLogSession, oldestPending, &logUploading, &lastUploadPos]() {
+                std::thread([&ds, emuLogPath, emuLogSession, &logUploading, &lastUploadPos]() {
                     char apiHost[128] = "", apiKey[64] = "", devId[32] = "";
                     g_hal->nvs->get_str("s3", "api_host", apiHost, sizeof(apiHost));
                     g_hal->nvs->get_str("s3", "api_key", apiKey, sizeof(apiKey));
@@ -883,31 +914,6 @@ int main(int argc, char* argv[]) {
                         g_hal->network->destroy(tls);
                         return ok;
                     };
-
-                    // Upload any older complete sessions first
-                    if (oldestPending[0]) {
-                        char path[256];
-                        snprintf(path, sizeof(path), "%s/logs/%s", SD_ROOT, oldestPending);
-                        FILE* f = fopen(path, "r");
-                        if (f) {
-                            fseek(f, 0, SEEK_END);
-                            long sz = ftell(f);
-                            fseek(f, 0, SEEK_SET);
-                            static char buf[8192];
-                            int rd = fread(buf, 1, sizeof(buf), f);
-                            fclose(f);
-                            if (rd > 0) {
-                                // Strip .log extension for session name
-                                char session[64]; strlcpy(session, oldestPending, sizeof(session));
-                                char* dot = strrchr(session, '.');
-                                if (dot) *dot = '\0';
-                                if (uploadChunk(session, buf, rd)) {
-                                    // If uploaded everything, delete the file
-                                    if (rd >= sz) remove(path);
-                                }
-                            }
-                        }
-                    }
 
                     // Upload new content from current session
                     FILE* f = fopen(emuLogPath, "r");

@@ -216,10 +216,10 @@ void test_load_creds_missing(void) {
 // ── halS3UploadFile tests ───────────────────────────────────────────────────
 
 void test_upload_no_creds(void) {
-    s_fs.add_dir("/sd/harvested");
-    s_fs.add_dir("/sd/harvested/0001");
-    s_fs.add_file_str("/sd/harvested/0001/test.txt", "data");
-    UploadResult r = halS3UploadFile("/sd/harvested/0001/test.txt", "0001/test.txt");
+    s_fs.add_dir("/sd/upload");
+    s_fs.add_dir("/sd/upload/0001");
+    s_fs.add_file_str("/sd/upload/0001/test.txt", "data");
+    UploadResult r = halS3UploadFile("/sd/upload/0001/test.txt", "0001/test.txt");
     TEST_ASSERT_FALSE(r.success);
     TEST_ASSERT_TRUE(strstr(r.error, "credentials") != nullptr);
 }
@@ -228,7 +228,7 @@ void test_upload_file_missing(void) {
     s_nvs.set_str("s3", "api_host", "api.ex.com");
     s_nvs.set_str("s3", "api_key", "key");
     s_nvs.set_str("s3", "device_id", "D1");
-    UploadResult r = halS3UploadFile("/sd/harvested/0001/missing.txt", "0001/missing.txt");
+    UploadResult r = halS3UploadFile("/sd/upload/0001/missing.txt", "0001/missing.txt");
     TEST_ASSERT_FALSE(r.success);
 }
 
@@ -236,12 +236,12 @@ void test_upload_presign_fails(void) {
     s_nvs.set_str("s3", "api_host", "api.ex.com");
     s_nvs.set_str("s3", "api_key", "key");
     s_nvs.set_str("s3", "device_id", "D1");
-    s_fs.add_dir("/sd/harvested");
-    s_fs.add_dir("/sd/harvested/0001");
-    s_fs.add_file_str("/sd/harvested/0001/test.txt", "hello");
+    s_fs.add_dir("/sd/upload");
+    s_fs.add_dir("/sd/upload/0001");
+    s_fs.add_file_str("/sd/upload/0001/test.txt", "hello");
     // Empty presign response
     s_net.next_response = "HTTP/1.1 500 Error\r\n\r\n{\"error\":\"fail\"}";
-    UploadResult r = halS3UploadFile("/sd/harvested/0001/test.txt", "0001/test.txt");
+    UploadResult r = halS3UploadFile("/sd/upload/0001/test.txt", "0001/test.txt");
     TEST_ASSERT_FALSE(r.success);
     TEST_ASSERT_TRUE(strstr(r.error, "Presign") != nullptr);
 }
@@ -250,15 +250,15 @@ void test_upload_success(void) {
     s_nvs.set_str("s3", "api_host", "api.ex.com");
     s_nvs.set_str("s3", "api_key", "key");
     s_nvs.set_str("s3", "device_id", "D1");
-    s_fs.add_dir("/sd/harvested");
-    s_fs.add_dir("/sd/harvested/0001");
-    s_fs.add_file_str("/sd/harvested/0001/test.txt", "hello world");
+    s_fs.add_dir("/sd/upload");
+    s_fs.add_dir("/sd/upload/0001");
+    s_fs.add_file_str("/sd/upload/0001/test.txt", "hello world");
 
     s_net.next_response =
         "HTTP/1.1 200 OK\r\n\r\n"
         "{\"url\":\"https://s3.aws.com/bucket/D1/0001/test.txt?sig=abc\",\"key\":\"D1/0001/test.txt\",\"parts\":1}";
 
-    UploadResult r = halS3UploadFile("/sd/harvested/0001/test.txt", "0001/test.txt");
+    UploadResult r = halS3UploadFile("/sd/upload/0001/test.txt", "0001/test.txt");
     (void)r;  // Result varies with mock — real upload tested in emulator
 }
 
@@ -266,76 +266,93 @@ void test_upload_connect_fails(void) {
     s_nvs.set_str("s3", "api_host", "api.ex.com");
     s_nvs.set_str("s3", "api_key", "key");
     s_nvs.set_str("s3", "device_id", "D1");
-    s_fs.add_dir("/sd/harvested");
-    s_fs.add_dir("/sd/harvested/0001");
-    s_fs.add_file_str("/sd/harvested/0001/test.txt", "data");
+    s_fs.add_dir("/sd/upload");
+    s_fs.add_dir("/sd/upload/0001");
+    s_fs.add_file_str("/sd/upload/0001/test.txt", "data");
     s_net.fail_connect = true;
-    UploadResult r = halS3UploadFile("/sd/harvested/0001/test.txt", "0001/test.txt");
+    UploadResult r = halS3UploadFile("/sd/upload/0001/test.txt", "0001/test.txt");
     TEST_ASSERT_FALSE(r.success);
 }
 
 // ── findNextUploadFile tests ────────────────────────────────────────────────
 
 void test_find_next_empty(void) {
-    s_fs.add_dir("/sd/harvested");
+    s_fs.add_dir("/sd/upload");
     char out[64];
-    TEST_ASSERT_FALSE(findNextUploadFile("/sd/harvested", out, sizeof(out)));
+    TEST_ASSERT_FALSE(findNextUploadFile("/sd/upload", out, sizeof(out)));
 }
 
 void test_find_next_in_subfolder(void) {
-    s_fs.add_dir("/sd/harvested");
-    s_fs.add_dir("/sd/harvested/0001");
-    s_fs.add_file_str("/sd/harvested/0001/data.csv", "content");
+    s_fs.add_dir("/sd/upload");
+    s_fs.add_dir("/sd/upload/0001");
+    s_fs.add_file_str("/sd/upload/0001/data.csv", "content");
     char out[64];
-    TEST_ASSERT_TRUE(findNextUploadFile("/sd/harvested", out, sizeof(out)));
+    TEST_ASSERT_TRUE(findNextUploadFile("/sd/upload", out, sizeof(out)));
     TEST_ASSERT_EQUAL_STRING("0001/data.csv", out);
 }
 
 void test_find_next_oldest_subfolder_first(void) {
-    s_fs.add_dir("/sd/harvested");
-    s_fs.add_dir("/sd/harvested/0002");
-    s_fs.add_dir("/sd/harvested/0001");
-    s_fs.add_file_str("/sd/harvested/0002/newer.csv", "bbb");
-    s_fs.add_file_str("/sd/harvested/0001/older.csv", "aaa");
+    s_fs.add_dir("/sd/upload");
+    s_fs.add_dir("/sd/upload/0002");
+    s_fs.add_dir("/sd/upload/0001");
+    s_fs.add_file_str("/sd/upload/0002/newer.csv", "bbb");
+    s_fs.add_file_str("/sd/upload/0001/older.csv", "aaa");
     char out[64];
-    TEST_ASSERT_TRUE(findNextUploadFile("/sd/harvested", out, sizeof(out)));
+    TEST_ASSERT_TRUE(findNextUploadFile("/sd/upload", out, sizeof(out)));
     TEST_ASSERT_EQUAL_STRING("0001/older.csv", out);
 }
 
 void test_find_next_skips_empty_subfolder(void) {
-    s_fs.add_dir("/sd/harvested");
-    s_fs.add_dir("/sd/harvested/0001");  // empty
-    s_fs.add_dir("/sd/harvested/0002");
-    s_fs.add_file_str("/sd/harvested/0002/data.csv", "content");
+    s_fs.add_dir("/sd/upload");
+    s_fs.add_dir("/sd/upload/0001");  // empty
+    s_fs.add_dir("/sd/upload/0002");
+    s_fs.add_file_str("/sd/upload/0002/data.csv", "content");
     char out[64];
     // 0001 is empty — should be auto-removed and 0002 found
-    TEST_ASSERT_TRUE(findNextUploadFile("/sd/harvested", out, sizeof(out)));
+    TEST_ASSERT_TRUE(findNextUploadFile("/sd/upload", out, sizeof(out)));
     TEST_ASSERT_EQUAL_STRING("0002/data.csv", out);
     // 0001 should have been cleaned up
-    TEST_ASSERT_FALSE(s_fs.exists("/sd/harvested/0001"));
+    TEST_ASSERT_FALSE(s_fs.exists("/sd/upload/0001"));
 }
 
 // ── markFileUploaded tests ──────────────────────────────────────────────────
 
 void test_mark_uploaded_deletes_file(void) {
-    s_fs.add_dir("/sd/harvested");
-    s_fs.add_dir("/sd/harvested/0001");
-    s_fs.add_file_str("/sd/harvested/0001/data.csv", "content");
-    s_fs.add_file_str("/sd/harvested/0001/other.csv", "other");
-    markFileUploaded("/sd/harvested", "0001/data.csv");
-    TEST_ASSERT_FALSE(s_fs.has_file("/sd/harvested/0001/data.csv"));
+    s_fs.add_dir("/sd/upload");
+    s_fs.add_dir("/sd/upload/0001");
+    s_fs.add_file_str("/sd/upload/0001/data.csv", "content");
+    s_fs.add_file_str("/sd/upload/0001/other.csv", "other");
+    markFileUploaded("/sd/upload", "0001/data.csv");
+    TEST_ASSERT_FALSE(s_fs.has_file("/sd/upload/0001/data.csv"));
     // Subfolder still has other.csv, so it shouldn't be removed
-    TEST_ASSERT_TRUE(s_fs.exists("/sd/harvested/0001"));
+    TEST_ASSERT_TRUE(s_fs.exists("/sd/upload/0001"));
 }
 
 void test_mark_uploaded_removes_empty_subfolder(void) {
-    s_fs.add_dir("/sd/harvested");
-    s_fs.add_dir("/sd/harvested/0001");
-    s_fs.add_file_str("/sd/harvested/0001/data.csv", "content");
-    markFileUploaded("/sd/harvested", "0001/data.csv");
-    TEST_ASSERT_FALSE(s_fs.has_file("/sd/harvested/0001/data.csv"));
+    s_fs.add_dir("/sd/upload");
+    s_fs.add_dir("/sd/upload/0001");
+    s_fs.add_file_str("/sd/upload/0001/data.csv", "content");
+    markFileUploaded("/sd/upload", "0001/data.csv");
+    TEST_ASSERT_FALSE(s_fs.has_file("/sd/upload/0001/data.csv"));
     // Subfolder should be removed since it's now empty
-    TEST_ASSERT_FALSE(s_fs.exists("/sd/harvested/0001"));
+    TEST_ASSERT_FALSE(s_fs.exists("/sd/upload/0001"));
+}
+
+void test_upload_skip_if_exists(void) {
+    s_nvs.set_str("s3", "api_host", "api.ex.com");
+    s_nvs.set_str("s3", "api_key", "key");
+    s_nvs.set_str("s3", "device_id", "D1");
+    s_fs.add_dir("/sd/upload");
+    s_fs.add_dir("/sd/upload/0001");
+    s_fs.add_file_str("/sd/upload/0001/boot_0010.log", "log content here");
+
+    // Lambda returns skip:true because S3 already has this file
+    s_net.next_response =
+        "HTTP/1.1 200 OK\r\n\r\n"
+        "{\"skip\":true,\"key\":\"D1/0001/boot_0010.log\",\"reason\":\"already exists\",\"s3_size\":16}";
+
+    UploadResult r = halS3UploadFile("/sd/upload/0001/boot_0010.log", "0001/boot_0010.log");
+    TEST_ASSERT_TRUE(r.success);  // skip counts as success
 }
 
 // ── Test runner ─────────────────────────────────────────────────────────────
@@ -376,6 +393,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_upload_presign_fails);
     RUN_TEST(test_upload_success);
     RUN_TEST(test_upload_connect_fails);
+    RUN_TEST(test_upload_skip_if_exists);
 
     // findNextUploadFile
     RUN_TEST(test_find_next_empty);

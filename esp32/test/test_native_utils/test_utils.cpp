@@ -199,7 +199,7 @@ void test_isSkipped_known_names(void) {
     TEST_ASSERT_TRUE(isSkipped("Thumbs.db"));
     TEST_ASSERT_TRUE(isSkipped("desktop.ini"));
     TEST_ASSERT_TRUE(isSkipped("System Volume Information"));
-    TEST_ASSERT_TRUE(isSkipped("harvested"));
+    TEST_ASSERT_TRUE(isSkipped("upload"));
     TEST_ASSERT_TRUE(isSkipped("airbridge.log"));
     TEST_ASSERT_TRUE(isSkipped("dsuCookie.easdf"));
 }
