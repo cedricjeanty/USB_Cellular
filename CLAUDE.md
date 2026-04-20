@@ -12,7 +12,7 @@ harvest files when idle, and upload via cellular.
 
 **USB:** TinyUSB — MSC-only (PID 0x0002, avionics mode) or CDC+MSC (PID 0x0001, debug mode). Mode stored in NVS, set via SD magic files `ENABLE_CDC` / `ENABLE_MSC`. In MSC-only mode, D+ is held low at boot via `tud_disconnect()` — host sees nothing (just power draw) until the 60s presentation delay elapses, then `tud_connect()` triggers first enumeration.
 
-**Cellular:** SIM7600 modem via UART (TX=43, RX=44), PPPoS. Hologram SIM. Max baud 921600.
+**Cellular:** SIM7600 modem via UART (TX=43, RX=44, RTS=1, CTS=2), PPPoS. Hologram SIM. Runs at 3 Mbaud + HW flow control on PCB.
 
 **Storage:** SD card via SPI (CS=10, MOSI=11, MISO=12, SCK=13)
 

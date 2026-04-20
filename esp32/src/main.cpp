@@ -2360,8 +2360,8 @@ static void modemTask(void* param) {
 
     // Fallback: try other bauds — modem may be in PPP data mode at high baud
     if (!ready) {
-        const int tryBauds[] = { 921600, 460800, 3000000 };
-        for (int b = 0; b < 3 && !ready; b++) {
+        const int tryBauds[] = { 921600, 460800, 2000000, 3000000 };
+        for (int b = 0; b < 4 && !ready; b++) {
             // First try WITHOUT flow control (modem may not assert CTS in data mode)
             mdm_set_baudrate(tryBauds[b]);
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -2485,12 +2485,12 @@ static void modemTask(void* param) {
         }
     }
 
-    // ── Increase baud rate ──────────────────────────────────────────────
-    // OTA downloads now use esp_http_client which handles TLS properly.
+    // ── Increase baud rate (try highest first, fall back) ─────────────
     {
-        const int bauds[] = { 921600 };
+        const int bauds[] = { 3000000, 2000000, 921600 };
+        const int nBauds = sizeof(bauds) / sizeof(bauds[0]);
         bool upgraded = false;
-        for (int i = 0; i < 5 && !upgraded; i++) {
+        for (int i = 0; i < nBauds && !upgraded; i++) {
             cdc_printf("Modem: trying %d baud...\r\n", bauds[i]);
             char cmd[32];
             snprintf(cmd, sizeof(cmd), "AT+IPR=%d", bauds[i]);
@@ -2529,20 +2529,22 @@ static void modemTask(void* param) {
                     // Verify flow control works
                     int len = modem_at_cmd("AT", resp, sizeof(resp), 2000);
                     if (len > 0 && strstr(resp, "OK")) {
-                        cdc_printf("Modem: HW flow control enabled\r\n");
+                        cdc_printf("Modem: HW flow control enabled at %d\r\n", bauds[i]);
+                        log_write("Modem: HW FC enabled at %d", bauds[i]);
                     } else {
                         // Flow control broke things — disable it
-                        cdc_printf("Modem: HW flow control failed, disabling\r\n");
+                        cdc_printf("Modem: HW flow control failed at %d, disabling\r\n", bauds[i]);
                         uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_DISABLE, 0);
                         uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
                                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
                         modem_at_cmd("AT+IFC=0,0", resp, sizeof(resp), 2000);
+                        log_write("Modem: HW FC failed at %d", bauds[i]);
                     }
                 }
             } else {
                 // Failed — modem is at new baud but ESP can't talk to it
                 // Try to reset modem baud: send AT+IPR=115200 at the failed baud
-                cdc_printf("Modem: %d failed, resetting...\r\n", bauds[i]);
+                cdc_printf("Modem: %d failed, resetting to 115200...\r\n", bauds[i]);
                 modem_at_cmd("AT+IPR=115200", resp, sizeof(resp), 2000);
                 vTaskDelay(pdMS_TO_TICKS(200));
                 mdm_set_baudrate(115200);
@@ -2554,6 +2556,7 @@ static void modemTask(void* param) {
         }
         if (!upgraded) {
             cdc_printf("Modem: staying at 115200\r\n");
+            log_write("Modem: baud 115200 (upgrade failed)");
         }
     }
 
