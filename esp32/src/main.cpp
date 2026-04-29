@@ -77,7 +77,7 @@ HAL* g_hal = nullptr;
 // ── MSC-only mode (no CDC) ──────────────────────────────────────────────────
 // Default: MSC-only for avionics compatibility. Set via CLI: SETMODE CDC / SETMODE MSC
 // Persists in NVS. CDC mode gives serial console for debugging + config.
-static bool g_msc_only = false;  // default CDC+MSC until SETMODE MSC is run
+static bool g_msc_only = true;   // default MSC-only; ENABLE_CDC on SD overrides per-boot
 
 // ── Utility: millis() equivalent ─────────────────────────────────────────────
 static inline uint32_t millis() {
@@ -3943,7 +3943,7 @@ extern "C" void app_main(void) {
     {
         nvs_handle_t h;
         if (nvs_open("usb", NVS_READWRITE, &h) == ESP_OK) {
-            uint8_t mode = 0;  // default: CDC+MSC (forced for debug) until SETMODE MSC is run
+            uint8_t mode = 1;  // default: MSC-only; drop ENABLE_CDC on SD for debug
             nvs_get_u8(h, "msc_only", &mode);
             g_msc_only = (mode != 0);
             nvs_close(h);

@@ -10,7 +10,7 @@ harvest files when idle, and upload via cellular.
 
 **Hardware:** ESP32-S3-DevKitC-1 (4 MB flash, 2 MB PSRAM)
 
-**USB:** TinyUSB — MSC-only (PID 0x0002, avionics mode) or CDC+MSC (PID 0x0001, debug mode). Mode stored in NVS, set via SD magic files `ENABLE_CDC` / `ENABLE_MSC`. In MSC-only mode, D+ is held low at boot via `tud_disconnect()` — host sees nothing (just power draw) until the 60s presentation delay elapses, then `tud_connect()` triggers first enumeration.
+**USB:** TinyUSB — MSC-only (PID 0x0002, avionics mode) or CDC+MSC (PID 0x0001, debug mode). Default is MSC-only. Drop `ENABLE_CDC` on SD to temporarily boot CDC+MSC (file is deleted, next boot reverts to MSC-only). In MSC-only mode, D+ is held low at boot via `tud_disconnect()` — host sees nothing (just power draw) until the 60s presentation delay elapses, then `tud_connect()` triggers first enumeration.
 
 **Cellular:** SIM7600 modem via UART (TX=43, RX=44, RTS=1, CTS=2), PPPoS. Hologram SIM. Runs at 3 Mbaud + HW flow control on PCB.
 
@@ -63,8 +63,7 @@ every 60s via `airbridge_log()`.
 Drop any of these on the SD root; firmware processes and deletes them on boot:
 | File | Effect |
 |------|--------|
-| `ENABLE_CDC` | Switch to CDC+MSC mode (NVS `usb/msc_only=0`) |
-| `ENABLE_MSC` | Switch to MSC-only mode (NVS `usb/msc_only=1`) |
+| `ENABLE_CDC` | Boot CDC+MSC this once (deleted after processing, no NVS change) |
 | `WIFI_CONFIG` | Two lines: ssid, password |
 | `S3_CONFIG` | Two lines: api_host, api_key |
 | `firmware.bin` | SD-flash: write to OTA partition + reboot |
