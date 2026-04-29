@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260428195500"
+#define FW_VERSION "20260428203400"
 
 #include <cstring>
 #include <ctime>
@@ -1673,8 +1673,12 @@ done_hdr:
     if (err != ESP_OK) { log_write("OTA: begin failed"); tls_destroy(tls); g_tlsActive = false; return false; }
 
     // Stream body to flash
+    // SO_RCVTIMEO (30s) catches fully stalled reads.
+    // Progress timeout (60s) catches trickle connections.
     char buf[2048];
     uint32_t received = 0;
+    uint32_t lastProgressMs = millis();
+    uint32_t lastProgressBytes = 0;
     while (received < (uint32_t)contentLength) {
         int len = esp_tls_conn_read(tls, buf, sizeof(buf));
         if (len > 0) {
@@ -1688,10 +1692,20 @@ done_hdr:
             received += len;
             if ((received % 16384) < (uint32_t)len)
                 otaDisplayProgress((received * 100) / contentLength, received, contentLength);
+            // Reset progress timer on meaningful progress (>4KB since last check)
+            if (received - lastProgressBytes >= 4096) {
+                lastProgressMs = millis();
+                lastProgressBytes = received;
+            }
         } else if (len == 0) {
             break;
         } else {
             log_write("OTA: read error at %lu/%d", (unsigned long)received, contentLength);
+            break;
+        }
+        // Abort if no meaningful progress for 60s
+        if (millis() - lastProgressMs > 60000) {
+            log_write("OTA: stalled at %lu/%d — aborting", (unsigned long)received, contentLength);
             break;
         }
     }
