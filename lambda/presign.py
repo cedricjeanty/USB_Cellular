@@ -114,11 +114,16 @@ def handler(event, context):
             return respond(500, {"error": err})
 
     elif path == "/firmware/cookie" and method == "GET":
-        # Return DSU cookie as hex-encoded JSON, then delete from S3 (one-shot)
+        # Return DSU cookie as hex-encoded JSON, then delete from S3 (one-shot).
+        # Per-device path: firmware/cookies/{device}/dsuCookie.easdf
+        device = params.get("device", "")
+        if not device:
+            return respond(400, {"error": "device required"})
+        key = f"firmware/cookies/{device}/dsuCookie.easdf"
         try:
-            obj = s3.get_object(Bucket=BUCKET, Key="firmware/dsuCookie.easdf")
+            obj = s3.get_object(Bucket=BUCKET, Key=key)
             data = obj["Body"].read()
-            s3.delete_object(Bucket=BUCKET, Key="firmware/dsuCookie.easdf")
+            s3.delete_object(Bucket=BUCKET, Key=key)
             return respond(200, {"cookie": data.hex(), "size": len(data)})
         except Exception as e:
             err = str(e)

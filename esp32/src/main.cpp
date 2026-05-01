@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260428203400"
+#define FW_VERSION "20260501080600"
 
 #include <cstring>
 #include <ctime>
@@ -3151,9 +3151,9 @@ static void uploadTask(void* param) {
         if (tls) {
             char req[512];
             int rlen = snprintf(req, sizeof(req),
-                "GET /prod/firmware/cookie HTTP/1.1\r\n"
+                "GET /prod/firmware/cookie?device=%s HTTP/1.1\r\n"
                 "Host: %s\r\nx-api-key: %s\r\nConnection: close\r\n\r\n",
-                g_apiHost, g_apiKey);
+                g_deviceId, g_apiHost, g_apiKey);
             if (tls_write_all(tls, req, rlen)) {
                 std::string resp = httpReadResponse(tls);
                 // Response is JSON: {"cookie":"<hex>","size":78} or {"error":"..."}
