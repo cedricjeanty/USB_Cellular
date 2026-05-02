@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260501080600"
+#define FW_VERSION "20260501170100"
 
 #include <cstring>
 #include <ctime>
@@ -3763,6 +3763,8 @@ static void main_loop_task(void* param) {
             cdc_printf("Modem: restarting task...\r\n");
             g_modemReady = false;
             g_pppConnected = false;
+            g_modemRssi = 99;
+            g_modemOp[0] = '\0';
             xTaskCreatePinnedToCore(modemTask, "modem", 16384, nullptr, 2, &g_modem_task, 0);
             vTaskDelay(pdMS_TO_TICKS(30000));  // 30s cooldown for modem cold boot
         }

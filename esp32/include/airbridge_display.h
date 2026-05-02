@@ -35,7 +35,7 @@ inline void updateDisplay(DisplayState& ds) {
     {
         char label[18];
         int bars = 0;
-        if (ds.pppConnected && ds.modemRssi > 0) {
+        if (ds.pppConnected && ds.modemRssi > 0 && ds.modemRssi < 99) {
             if (ds.modemOp[0]) strlcpy(label, ds.modemOp, sizeof(label));
             else               strlcpy(label, "Cellular", sizeof(label));
             if      (ds.modemRssi >= 20) bars = 4;
@@ -45,15 +45,10 @@ inline void updateDisplay(DisplayState& ds) {
         } else if (ds.netConnected) {
             strlcpy(label, ds.wifiLabel, sizeof(label));
             bars = ds.wifiBars;
-        } else if (ds.pppConnected) {
-            strlcpy(label, "No Signal", sizeof(label));
         } else if (ds.modemReady) {
-            if (ds.modemOp[0])
-                snprintf(label, sizeof(label), "%s...", ds.modemOp);
-            else
-                strlcpy(label, "Connecting...", sizeof(label));
+            strlcpy(label, "Connecting...", sizeof(label));
         } else {
-            strlcpy(label, "No Network", sizeof(label));
+            strlcpy(label, "No Connection", sizeof(label));
         }
         g_hal->display->text(0, 0, label);
 
