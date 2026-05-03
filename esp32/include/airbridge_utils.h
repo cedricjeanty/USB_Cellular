@@ -150,6 +150,7 @@ const char* const SKIP_NAMES[] = {
     "airbridge.log", "dsuCookie.easdf",
     "firmware.bin", "_firmware.bin", "ENABLE_CDC",
     "WIFI_CONFIG", "S3_CONFIG", "FORMAT_SD", "REBOOT",
+    "metrics", "downloadReport.txt",
     nullptr
 };
 }
