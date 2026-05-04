@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260503193000"
+#define FW_VERSION "20260503195500"
 
 #include <cstring>
 #include <ctime>
@@ -378,6 +378,7 @@ static uint32_t msc_visible_sectors() {
 // Partition 1 (8 GB): DSU-facing, presented via MSC raw sectors
 // Partition 2 (rest): firmware internal (upload/, logs/)
 static bool     g_dual_partition   = false;
+static bool     g_p2_needs_format  = false; // deferred: format P2 in upload task (has 16KB stack)
 static uint32_t g_p2_start_sector  = 0;  // partition 2 LBA start
 static uint32_t g_p2_sectors       = 0;  // partition 2 size in sectors
 static FATFS*   g_p2_fs            = nullptr; // partition 2 FATFS object
@@ -802,10 +803,41 @@ static bool sd_init() {
             ESP_LOGI(TAG, "SD: dual partition detected — P2 start=%lu size=%lu",
                      (unsigned long)g_p2_start_sector, (unsigned long)g_p2_sectors);
         }
-        // No auto-migration — use FORMAT_SD magic file or CLI FORMAT command
-        // to create dual-partition layout. Auto-migration was removed because
-        // f_mkfs overflows the main task stack and full-card partitions cause
-        // underflow in the available space calculation.
+        // ── Auto-migrate: add P2 entry to MBR (MBR write only, no f_mkfs) ──
+        // f_mkfs is deferred to the upload task (16KB stack) to avoid
+        // stack overflow in the main task. Only migrate if P1 is our 8GB
+        // partition (not a full-card partition from external formatting).
+        uint32_t p1_start = le32(mbr + 0x1BE + 8);
+        uint32_t p1_size  = le32(mbr + 0x1BE + 12);
+        uint64_t p1_end64 = (uint64_t)p1_start + p1_size;
+        bool p1_is_capped = (p1_size > 0 && p1_size <= MSC_MAX_SECTORS + 2048);
+        uint32_t avail = (p1_is_capped && p1_end64 < g_card_sectors)
+                          ? (uint32_t)(g_card_sectors - p1_end64) : 0;
+
+        if (p1_is_capped && avail > 1024000) {
+            ESP_LOGW(TAG, "SD: auto-migrate — adding P2 to MBR (start=%lu, %luMB)",
+                     (unsigned long)p1_end64, (unsigned long)(avail / 2048));
+
+            mbr[0x1CE + 0] = 0x00;  // status
+            mbr[0x1CE + 1] = 0xFE; mbr[0x1CE + 2] = 0xFF; mbr[0x1CE + 3] = 0xFF;
+            mbr[0x1CE + 4] = 0x0C;  // FAT32 LBA
+            mbr[0x1CE + 5] = 0xFE; mbr[0x1CE + 6] = 0xFF; mbr[0x1CE + 7] = 0xFF;
+            uint32_t p2s = (uint32_t)p1_end64;
+            mbr[0x1CE + 8]  = p2s & 0xFF; mbr[0x1CE + 9]  = (p2s >> 8) & 0xFF;
+            mbr[0x1CE + 10] = (p2s >> 16) & 0xFF; mbr[0x1CE + 11] = (p2s >> 24) & 0xFF;
+            mbr[0x1CE + 12] = avail & 0xFF; mbr[0x1CE + 13] = (avail >> 8) & 0xFF;
+            mbr[0x1CE + 14] = (avail >> 16) & 0xFF; mbr[0x1CE + 15] = (avail >> 24) & 0xFF;
+
+            if (sdmmc_write_sectors(g_card, mbr, 0, 1) == ESP_OK) {
+                g_p2_start_sector = p2s;
+                g_p2_sectors = avail;
+                g_dual_partition = true;
+                g_p2_needs_format = true;  // deferred to upload task
+                ESP_LOGI(TAG, "SD: MBR updated — P2 format deferred to upload task");
+            }
+        } else if (p1_size > 0 && !p1_is_capped) {
+            ESP_LOGI(TAG, "SD: single partition uses full card — no migration");
+        }
     }
     free(mbr);
 
@@ -3187,6 +3219,46 @@ static void modemRssiCheck() {
 static void uploadTask(void* param) {
     (void)param;
     static bool otaDone = false;
+
+    // ── Deferred P2 format (from auto-migration in sd_init) ─────────────
+    // f_mkfs needs significant stack — safe here in upload task (16KB stack)
+    if (g_p2_needs_format && g_dual_partition) {
+        ESP_LOGI(TAG, "Upload: formatting P2 (deferred from sd_init)");
+        cdc_printf("SD: formatting partition 2...\r\n");
+        ff_diskio_register(1, &g_p2_diskio_impl);
+        MKFS_PARM opt = {};
+        opt.fmt = FM_FAT32;
+        opt.n_fat = 2;
+        opt.au_size = 16 * 1024;
+        void* work = malloc(4096);
+        if (work) {
+            FRESULT fr = f_mkfs("1:", &opt, work, 4096);
+            free(work);
+            if (fr == FR_OK) {
+                // Mount P2 at /sdcard
+                ff_diskio_register_sdmmc(0, g_card);  // pdrv 0 for P1 access
+                esp_vfs_fat_conf_t conf = {};
+                conf.base_path = SD_MOUNT;
+                conf.fat_drive = "1:";
+                conf.max_files = 5;
+                g_p2_fs = nullptr;
+                if (esp_vfs_fat_register_cfg(&conf, &g_p2_fs) == ESP_OK && g_p2_fs) {
+                    if (f_mount(g_p2_fs, "1:", 1) == FR_OK) {
+                        g_fatfs_mounted = true;
+                        mkdir("/sdcard/upload", 0775);
+                        mkdir("/sdcard/logs", 0775);
+                        log_write("SD: P2 formatted and mounted OK");
+                        cdc_printf("SD: partition 2 ready\r\n");
+                    }
+                }
+            } else {
+                ESP_LOGE(TAG, "SD: P2 mkfs failed FR=%d", fr);
+                ff_diskio_unregister(1);
+                g_dual_partition = false;
+            }
+        }
+        g_p2_needs_format = false;
+    }
 
     // ── SD flash: firmware.bin on SD (runs before network, instant) ────
     if (g_fatfs_mounted) {
