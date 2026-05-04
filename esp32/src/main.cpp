@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260503185200"
+#define FW_VERSION "20260503193000"
 
 #include <cstring>
 #include <ctime>
@@ -789,9 +789,9 @@ static bool sd_init() {
     g_card = tmp_card; tmp_card = nullptr;
     // Keep card_handle — we'll use it for raw access
 
-    // Parse MBR to detect partition 2
-    uint8_t mbr[512];
-    if (sdmmc_read_sectors(g_card, mbr, 0, 1) == ESP_OK &&
+    // Parse MBR to detect partition 2 (heap-allocate to avoid stack overflow)
+    uint8_t* mbr = (uint8_t*)malloc(512);
+    if (mbr && sdmmc_read_sectors(g_card, mbr, 0, 1) == ESP_OK &&
         mbr[510] == 0x55 && mbr[511] == 0xAA) {
         uint32_t p2_start = le32(mbr + 0x1CE + 8);
         uint32_t p2_size  = le32(mbr + 0x1CE + 12);
@@ -801,65 +801,13 @@ static bool sd_init() {
             g_dual_partition = true;
             ESP_LOGI(TAG, "SD: dual partition detected — P2 start=%lu size=%lu",
                      (unsigned long)g_p2_start_sector, (unsigned long)g_p2_sectors);
-        } else {
-            // ── Auto-migrate: create P2 in unused space beyond P1 ──────
-            uint32_t p1_start = le32(mbr + 0x1BE + 8);
-            uint32_t p1_size  = le32(mbr + 0x1BE + 12);
-            uint32_t p1_end   = p1_start + p1_size;
-            uint32_t avail    = (g_card_sectors > p1_end) ? g_card_sectors - p1_end : 0;
-            // Need at least ~500 MB for P2 to be useful
-            if (p1_size > 0 && avail > 1024000) {
-                ESP_LOGW(TAG, "SD: auto-creating P2 — start=%lu size=%lu (%.0f MB)",
-                         (unsigned long)p1_end, (unsigned long)avail, avail * 512.0f / 1e6f);
-                cdc_printf("SD: creating partition 2 (%.0f MB)...\r\n", avail * 512.0f / 1e6f);
-
-                // Write P2 entry into MBR partition table slot 2 (offset 0x1CE)
-                mbr[0x1CE + 0] = 0x00;  // status: not bootable
-                mbr[0x1CE + 1] = 0xFE; mbr[0x1CE + 2] = 0xFF; mbr[0x1CE + 3] = 0xFF; // CHS
-                mbr[0x1CE + 4] = 0x0C;  // type: FAT32 LBA
-                mbr[0x1CE + 5] = 0xFE; mbr[0x1CE + 6] = 0xFF; mbr[0x1CE + 7] = 0xFF; // CHS
-                // LBA start (LE)
-                mbr[0x1CE + 8]  = (p1_end)       & 0xFF;
-                mbr[0x1CE + 9]  = (p1_end >> 8)  & 0xFF;
-                mbr[0x1CE + 10] = (p1_end >> 16) & 0xFF;
-                mbr[0x1CE + 11] = (p1_end >> 24) & 0xFF;
-                // Size (LE)
-                mbr[0x1CE + 12] = (avail)       & 0xFF;
-                mbr[0x1CE + 13] = (avail >> 8)  & 0xFF;
-                mbr[0x1CE + 14] = (avail >> 16) & 0xFF;
-                mbr[0x1CE + 15] = (avail >> 24) & 0xFF;
-
-                if (sdmmc_write_sectors(g_card, mbr, 0, 1) == ESP_OK) {
-                    g_p2_start_sector = p1_end;
-                    g_p2_sectors = avail;
-
-                    // Format P2
-                    ff_diskio_register(1, &g_p2_diskio_impl);
-                    MKFS_PARM opt = {};
-                    opt.fmt = FM_FAT32;
-                    opt.n_fat = 2;
-                    opt.au_size = 16 * 1024;
-                    void* work = malloc(4096);
-                    if (work) {
-                        FRESULT fr = f_mkfs("1:", &opt, work, 4096);
-                        free(work);
-                        if (fr == FR_OK) {
-                            g_dual_partition = true;
-                            ESP_LOGI(TAG, "SD: P2 created and formatted OK");
-                            cdc_printf("SD: partition 2 ready\r\n");
-                            log_write("SD: auto-created P2 start=%lu size=%lu",
-                                      (unsigned long)g_p2_start_sector, (unsigned long)g_p2_sectors);
-                        } else {
-                            ESP_LOGE(TAG, "SD: P2 mkfs failed FR=%d", fr);
-                            ff_diskio_unregister(1);
-                        }
-                    } else {
-                        ff_diskio_unregister(1);
-                    }
-                }
-            }
         }
+        // No auto-migration — use FORMAT_SD magic file or CLI FORMAT command
+        // to create dual-partition layout. Auto-migration was removed because
+        // f_mkfs overflows the main task stack and full-card partitions cause
+        // underflow in the available space calculation.
     }
+    free(mbr);
 
     if (g_dual_partition) {
         // ── Dual-partition: mount partition 2 at /sdcard ────────────────
