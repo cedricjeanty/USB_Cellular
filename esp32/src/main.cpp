@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260503163000"
+#define FW_VERSION "20260503185200"
 
 #include <cstring>
 #include <ctime>
@@ -4521,33 +4521,53 @@ extern "C" void app_main(void) {
         }
     }
 
-    // ── Move old boot logs from /logs/ to SD root for harvest pipeline ──
-    // Previous sessions' logs get picked up by the normal harvest → upload
-    // flow. No TLS or cellular needed at boot — just a fast rename.
+    // ── Move old boot logs into upload queue ────────────────────────────
+    // With dual-partition, harvest scans P1 (DSU) — old logs on P2 won't be
+    // found by harvest. Move them directly into /sdcard/upload/NNNN/ so the
+    // upload pipeline picks them up without needing a harvest trigger.
     if (g_fatfs_mounted && g_logFileName[0]) {
         DIR* logDir = opendir("/sdcard/logs");
         if (logDir) {
+            // Collect old log names first (avoid readdir + rename conflicts)
+            char oldLogs[8][48];
+            int nOld = 0;
             struct dirent* ent;
-            while ((ent = readdir(logDir)) != nullptr) {
+            while ((ent = readdir(logDir)) != nullptr && nOld < 8) {
                 if (strncmp(ent->d_name, "boot_", 5) != 0) continue;
                 const char* dot = strrchr(ent->d_name, '.');
                 if (!dot || strcmp(dot, ".log") != 0) continue;
-                // Extract session name (without .log) to skip current
                 char session[48];
                 size_t nameLen = dot - ent->d_name;
                 if (nameLen >= sizeof(session)) continue;
                 memcpy(session, ent->d_name, nameLen);
                 session[nameLen] = '\0';
                 if (strcmp(session, g_logFileName) == 0) continue;
-
-                char src[80], dst[80];
-                snprintf(src, sizeof(src), "/sdcard/logs/%s", ent->d_name);
-                snprintf(dst, sizeof(dst), "/sdcard/%s", ent->d_name);
-                if (rename(src, dst) == 0) {
-                    log_write("Moved old log %s to root for harvest", ent->d_name);
-                }
+                strlcpy(oldLogs[nOld], ent->d_name, sizeof(oldLogs[0]));
+                nOld++;
             }
             closedir(logDir);
+
+            if (nOld > 0) {
+                // Create upload subfolder
+                uint32_t hnum = 0;
+                g_hal->nvs->get_u32("harvest", "count", &hnum);
+                hnum++;
+                g_hal->nvs->set_u32("harvest", "count", hnum);
+                char destDir[80];
+                snprintf(destDir, sizeof(destDir), "/sdcard/upload/%04lu", (unsigned long)hnum);
+                mkdir("/sdcard/upload", 0775);
+                mkdir(destDir, 0775);
+
+                for (int i = 0; i < nOld; i++) {
+                    char src[128], dst[128];
+                    snprintf(src, sizeof(src), "/sdcard/logs/%s", oldLogs[i]);
+                    snprintf(dst, sizeof(dst), "%s/%s", destDir, oldLogs[i]);
+                    if (rename(src, dst) == 0) {
+                        log_write("Moved old log %s to upload queue", oldLogs[i]);
+                        g_filesQueued++;
+                    }
+                }
+            }
         }
     }
 

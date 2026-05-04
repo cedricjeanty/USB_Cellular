@@ -21,7 +21,8 @@ fi
 COOLGEAR="python3 $HOME/USBCellular/scripts/coolgear.py"
 FW_DIR="$HOME/USBCellular/esp32"
 EMU="$FW_DIR/.pio/build/emulator/program"
-SD_EMU="$FW_DIR/emu_sdcard"
+SD_EMU="$FW_DIR/emu_sdcard"             # Partition 1 (DSU-facing)
+SD_INT="$FW_DIR/emu_sdcard_internal"    # Partition 2 (firmware internal)
 BUCKET="airbridge-uploads"
 API_KEY="7fFErx7ZCt9Vr2fvYfyOT7YxxeEjay4G5bpmfYdm"
 LOG="/tmp/e2e_${TARGET}_$(date +%Y%m%d_%H%M%S).txt"
@@ -45,7 +46,7 @@ skip() { log "SKIP: $1"; SKIP=$((SKIP + 1)); }
 
 start_device() {
     if [ "$TARGET" = "emulator" ]; then
-        mkdir -p "$SD_EMU"
+        mkdir -p "$SD_EMU" "$SD_INT"
         rm -f "$FW_DIR/emu_ota_update.bin"  # prevent stale OTA downloads
         cd "$FW_DIR"
         # Truncate log before each start so we don't match old "Init complete"
@@ -265,7 +266,7 @@ cleanup_s3() {
 : > /tmp/emu_e2e.log
 if [ "$TARGET" = "emulator" ]; then
     # Full clean for deterministic tests
-    rm -rf "$SD_EMU"/*
+    rm -rf "$SD_EMU"/* "$SD_INT"/*
     rm -f "$FW_DIR/emu_ota_update.bin" "$FW_DIR/emu_nvs.dat" "$FW_DIR/emu_modem.dat"
 fi
 log "═══════════════════════════════════════════════════════════════"
@@ -303,7 +304,7 @@ stop_device
 log ""; log "TEST 2: DSU flight file upload"
 cleanup_s3
 if [ "$TARGET" = "emulator" ]; then
-    rm -rf "$SD_EMU/upload" "$SD_EMU/flightHistory" "$SD_EMU/metrics"
+    rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory" "$SD_EMU/metrics"
     rm -f "$SD_EMU"/*.bin "$SD_EMU"/*.txt "$SD_EMU"/*.easdf "$SD_EMU"/*.eaofh
 fi
 start_device 5
@@ -321,7 +322,7 @@ stop_device
 log ""; log "TEST 3: Upload + power cut (2MB)"
 cleanup_s3
 if [ "$TARGET" = "emulator" ]; then
-    rm -rf "$SD_EMU/upload" "$SD_EMU/flightHistory" "$SD_EMU/metrics"
+    rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory" "$SD_EMU/metrics"
     rm -f "$SD_EMU"/*.bin "$SD_EMU"/*.txt "$SD_EMU"/*.easdf "$SD_EMU"/*.eaofh
 fi
 start_device 5
@@ -341,7 +342,7 @@ stop_device
 # ── TEST 4: Multiple files ────────────────────────────────────────────────────
 log ""; log "TEST 4: Multiple DSU files in one harvest"
 if [ "$TARGET" = "emulator" ]; then
-    rm -rf "$SD_EMU/upload" "$SD_EMU/flightHistory" "$SD_EMU/metrics"
+    rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory" "$SD_EMU/metrics"
     rm -f "$SD_EMU"/*.bin "$SD_EMU"/*.txt "$SD_EMU"/*.easdf "$SD_EMU"/*.eaofh
 fi
 start_device 5
@@ -362,7 +363,7 @@ stop_device
 # ── TEST 5: System files skipped ──────────────────────────────────────────────
 log ""; log "TEST 5: System files skipped"
 if [ "$TARGET" = "emulator" ]; then
-    rm -rf "$SD_EMU/upload" "$SD_EMU/flightHistory" "$SD_EMU"/*.bin
+    rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory" "$SD_EMU"/*.bin
     echo "skip" > "$SD_EMU/Thumbs.db"
     echo "skip" > "$SD_EMU/.hidden"
     start_device 5
@@ -370,7 +371,7 @@ if [ "$TARGET" = "emulator" ]; then
     wait_for_upload "flightHistory__${SERIAL}_01506" 60
     # System files should NOT appear in any upload subfolder
     FOUND_SYSTEM=false
-    for sub in "$SD_EMU"/upload/*/; do
+    for sub in "$SD_INT"/upload/*/; do
         [ -f "${sub}Thumbs.db" ] && FOUND_SYSTEM=true
         [ -f "${sub}.hidden" ] && FOUND_SYSTEM=true
     done
@@ -455,7 +456,7 @@ fi
 # ── TEST 8: DSU cookie cycle ─────────────────────────────────────────────────
 log ""; log "TEST 8: DSU cookie cycle"
 if [ "$TARGET" = "emulator" ]; then
-    rm -rf "$SD_EMU/upload" "$SD_EMU/flightHistory" "$SD_EMU/metrics"
+    rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory" "$SD_EMU/metrics"
     rm -f "$SD_EMU/dsuCookie.easdf" "$SD_EMU"/*.bin
     start_device 5
     # Write DSU-style files
@@ -495,7 +496,7 @@ fi
 # ── TEST 9: Pre-USB: OTA + cookie before host ───────────────────────────────
 log ""; log "TEST 9: OTA + S3 cookie land before USB presentation"
 if [ "$TARGET" = "emulator" ]; then
-    rm -rf "$SD_EMU/upload" "$SD_EMU/flightHistory"
+    rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory"
     rm -f "$SD_EMU/dsuCookie.easdf"
 
     # Build a "cookie" — 78-byte binary with EA1E magic header
@@ -503,7 +504,7 @@ if [ "$TARGET" = "emulator" ]; then
     echo "$COOKIE_HEX" | xxd -r -p > /tmp/test_cookie.bin
 
     # Upload cookie to S3 firmware path (Lambda serves it to device)
-    aws s3 cp /tmp/test_cookie.bin "s3://$BUCKET/firmware/dsuCookie.easdf" >/dev/null 2>&1
+    aws s3 cp /tmp/test_cookie.bin "s3://$BUCKET/firmware/cookies/$DEVICE/dsuCookie.easdf" >/dev/null 2>&1
 
     # Deploy OTA with a newer version
     V_PRE=$(date +%Y%m%d%H%M%S)
@@ -549,7 +550,7 @@ else
     # Build cookie
     COOKIE_HEX="EA1E"$(python3 -c "import os; print(os.urandom(76).hex())")
     echo "$COOKIE_HEX" | xxd -r -p > /tmp/test_cookie.bin
-    aws s3 cp /tmp/test_cookie.bin "s3://$BUCKET/firmware/dsuCookie.easdf" >/dev/null 2>&1
+    aws s3 cp /tmp/test_cookie.bin "s3://$BUCKET/firmware/cookies/$DEVICE/dsuCookie.easdf" >/dev/null 2>&1
     log "  S3 cookie uploaded"
 
     start_device 5
@@ -581,7 +582,7 @@ fi
 log ""; log "TEST 10: Log persists across power cycles, old logs harvested + uploaded"
 if [ "$TARGET" = "emulator" ]; then
     # Clean state
-    rm -rf "$SD_EMU/logs" "$SD_EMU/upload" "$SD_EMU/flightHistory"
+    rm -rf "$SD_INT/logs" "$SD_INT/upload" "$SD_EMU/flightHistory"
     rm -f "$FW_DIR/emu_nvs.dat" "$FW_DIR/emu_ota_update.bin"
     aws s3 rm "s3://$BUCKET/$DEVICE/" --recursive >/dev/null 2>&1
 
@@ -595,7 +596,7 @@ if [ "$TARGET" = "emulator" ]; then
     sudo killall -9 pppd 2>/dev/null
 
     # Verify boot 1 log on SD (persisted through power cut)
-    if [ -f "$SD_EMU/logs/boot_0001.log" ]; then
+    if [ -f "$SD_INT/logs/boot_0001.log" ]; then
         pass "Log: boot_0001.log persisted on SD after power cut"
     else
         fail "Log: boot_0001.log missing on SD after power cut"
@@ -618,14 +619,14 @@ if [ "$TARGET" = "emulator" ]; then
     fi
 
     # Old log moved from /logs/ to root, then harvested — should not be in /logs/
-    if [ ! -f "$SD_EMU/logs/boot_0001.log" ]; then
+    if [ ! -f "$SD_INT/logs/boot_0001.log" ]; then
         pass "Log: boot_0001.log moved out of /logs/ after boot"
     else
         fail "Log: boot_0001.log still in /logs/"
     fi
 
     # Current session log should still be in /logs/
-    if [ -f "$SD_EMU/logs/boot_0002.log" ]; then
+    if [ -f "$SD_INT/logs/boot_0002.log" ]; then
         pass "Log: current session boot_0002.log available in /logs/"
     else
         fail "Log: current session boot_0002.log missing from /logs/"
@@ -652,7 +653,7 @@ fi
 log ""; log "TEST 12: Log uploaded via incremental is skipped on next boot presign"
 if [ "$TARGET" = "emulator" ]; then
     # Clean state
-    rm -rf "$SD_EMU/logs" "$SD_EMU/upload" "$SD_EMU/flightHistory"
+    rm -rf "$SD_INT/logs" "$SD_INT/upload" "$SD_EMU/flightHistory"
     rm -f "$FW_DIR/emu_nvs.dat" "$FW_DIR/emu_ota_update.bin"
     aws s3 rm "s3://$BUCKET/$DEVICE/" --recursive >/dev/null 2>&1
 

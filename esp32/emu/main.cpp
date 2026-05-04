@@ -380,8 +380,9 @@ int main(int argc, char* argv[]) {
 
     airbridge_log("AirBridge fw=%s boot=%lu (emulator)", FW_VERSION, (unsigned long)emuBootCount);
 
-    // Move old boot logs from /logs/ to SD root for harvest → upload pipeline
-    // (matches firmware behavior — old logs get uploaded via presign, not append)
+    // Move old boot logs directly into upload queue on P2 (internal partition).
+    // With dual-partition, harvest scans P1 (DSU) — old logs on P2 won't be found
+    // by harvest, so we put them straight into upload/NNNN/ for the upload pipeline.
     {
         char logDir[256];
         snprintf(logDir, sizeof(logDir), "%s/logs", SD_INTERNAL);
@@ -394,7 +395,6 @@ int main(int argc, char* argv[]) {
                 if (strncmp(ent.name, "boot_", 5) != 0) continue;
                 const char* dot = strrchr(ent.name, '.');
                 if (!dot || strcmp(dot, ".log") != 0) continue;
-                // Skip current session
                 char session[48];
                 size_t nameLen = dot - ent.name;
                 if (nameLen >= sizeof(session)) continue;
@@ -404,19 +404,26 @@ int main(int argc, char* argv[]) {
                 oldLogs.push_back(ent.name);
             }
             g_hal->filesys->closedir(dir);
-            for (auto& name : oldLogs) {
-                char src[256], dst[256];
-                snprintf(src, sizeof(src), "%s/logs/%s", SD_INTERNAL, name.c_str());
-                snprintf(dst, sizeof(dst), "%s/%s", SD_INTERNAL, name.c_str());
-                if (rename(src, dst) == 0) {
-                    airbridge_log("Moved old log %s to root for harvest", name.c_str());
-                }
-            }
-            // Trigger harvest for moved files (same as firmware boot scan)
             if (!oldLogs.empty()) {
-                s_writeDetected = true;
-                s_hostWasConnected = true;
-                s_lastWriteMs = SDL_GetTicks();
+                uint32_t hnum = 0;
+                g_hal->nvs->get_u32("harvest", "count", &hnum);
+                hnum++;
+                g_hal->nvs->set_u32("harvest", "count", hnum);
+                char destDir[256];
+                snprintf(destDir, sizeof(destDir), "%s/upload/%04u", SD_INTERNAL, hnum);
+                ::mkdir(destDir, 0755);
+                char uploadBase[256];
+                snprintf(uploadBase, sizeof(uploadBase), "%s/upload", SD_INTERNAL);
+                ::mkdir(uploadBase, 0755);
+                ::mkdir(destDir, 0755);
+                for (auto& name : oldLogs) {
+                    char src[256], dst[256];
+                    snprintf(src, sizeof(src), "%s/logs/%s", SD_INTERNAL, name.c_str());
+                    snprintf(dst, sizeof(dst), "%s/%s", destDir, name.c_str());
+                    if (rename(src, dst) == 0) {
+                        airbridge_log("Moved old log %s to upload queue", name.c_str());
+                    }
+                }
             }
         }
     }
@@ -719,10 +726,12 @@ int main(int argc, char* argv[]) {
                 if (apiHost[0] && apiKey[0]) {
                     TlsHandle tls = g_hal->network->connect(apiHost);
                     if (tls) {
+                        char devId[32] = "";
+                        g_hal->nvs->get_str("s3", "device_id", devId, sizeof(devId));
                         char req[512];
                         snprintf(req, sizeof(req),
-                            "GET /prod/firmware/cookie HTTP/1.1\r\nHost: %s\r\nx-api-key: %s\r\nConnection: close\r\n\r\n",
-                            apiHost, apiKey);
+                            "GET /prod/firmware/cookie?device=%s HTTP/1.1\r\nHost: %s\r\nx-api-key: %s\r\nConnection: close\r\n\r\n",
+                            devId, apiHost, apiKey);
                         g_hal->network->write(tls, req, strlen(req));
                         std::string resp = halHttpReadResponse(tls);
                         g_hal->network->destroy(tls);

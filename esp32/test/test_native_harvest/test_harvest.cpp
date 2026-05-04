@@ -154,6 +154,7 @@ void test_harvest_with_preexisting_queued_files(void) {
 
 void test_harvest_root_subdirectory_files(void) {
     // Aircraft writes to flightHistory/ subdirectory — harvest must find them
+    // metrics/ is in skip list (DSU system files) — should NOT be harvested
     s_fs.add_dir("/sd");
     s_fs.add_dir("/sd/flightHistory");
     s_fs.add_file_str("/sd/flightHistory/EA500.000243_01210_20260406.eaofh", "data1");
@@ -162,8 +163,10 @@ void test_harvest_root_subdirectory_files(void) {
     s_fs.add_dir("/sd/metrics");
 
     HarvestResult r = harvestFiles("/sd", "/sd/upload", 1);
-    TEST_ASSERT_EQUAL_UINT16(3, r.count);
+    TEST_ASSERT_EQUAL_UINT16(2, r.count);  // metrics/ skipped
     TEST_ASSERT_EQUAL_UINT32(1211, r.maxFlight);
+    // Verify metrics file was NOT harvested (preserved for DSU)
+    TEST_ASSERT_TRUE(s_fs.has_file("/sd/metrics/dsuUsage.eacuf"));
 }
 
 // ── Test runner ─────────────────────────────────────────────────────────────
