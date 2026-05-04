@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260504120000"
+#define FW_VERSION "20260504130000"
 
 #include <cstring>
 #include <ctime>
@@ -791,57 +791,71 @@ static bool sd_init() {
     g_card = tmp_card; tmp_card = nullptr;
     // Keep card_handle — we'll use it for raw access
 
-    // Parse MBR to detect partition 2 (heap-allocate to avoid stack overflow)
-    uint8_t* mbr = (uint8_t*)malloc(512);
-    if (mbr && sdmmc_read_sectors(g_card, mbr, 0, 1) == ESP_OK &&
-        mbr[510] == 0x55 && mbr[511] == 0xAA) {
-        uint32_t p2_start = le32(mbr + 0x1CE + 8);
-        uint32_t p2_size  = le32(mbr + 0x1CE + 12);
-        if (p2_start > 0 && p2_size > 0 && p2_start + p2_size <= g_card_sectors) {
-            g_p2_start_sector = p2_start;
-            g_p2_sectors = p2_size;
-            g_dual_partition = true;
-            ESP_LOGI(TAG, "SD: dual partition detected — P2 start=%lu size=%lu",
-                     (unsigned long)g_p2_start_sector, (unsigned long)g_p2_sectors);
-        }
-        // ── Auto-migrate: add P2 entry to MBR (MBR write only, no f_mkfs) ──
-        // f_mkfs is deferred to the upload task (16KB stack) to avoid
-        // stack overflow in the main task. Only migrate if P1 is our 8GB
-        // partition (not a full-card partition from external formatting).
-        uint32_t p1_start = le32(mbr + 0x1BE + 8);
-        uint32_t p1_size  = le32(mbr + 0x1BE + 12);
-        uint64_t p1_end64 = (uint64_t)p1_start + p1_size;
-        bool p1_is_capped = (p1_size > 0 && p1_size <= MSC_MAX_SECTORS + 2048);
-        uint32_t avail = (p1_is_capped && p1_end64 < g_card_sectors)
-                          ? (uint32_t)(g_card_sectors - p1_end64) : 0;
+    // ── Detect partition layout and decide format action ──────────────
+    // Decision tree:
+    //   1. Valid dual-partition (P1 ≤ 8GB, P2 exists) → use as-is
+    //   2. P1 is 8GB but no P2 → add P2 entry to MBR, format P2 only
+    //   3. Anything else (wrong layout, blank, oversized P1) → full reformat
+    //   4. Card < 12GB → single-partition fallback (no room for useful P2)
+    #define MIN_DUAL_SECTORS ((uint32_t)(12ULL * 1024 * 1024 * 1024 / 512))  // 12GB minimum
+    {
+        uint8_t* mbr = (uint8_t*)malloc(512);
+        bool mbr_valid = mbr && sdmmc_read_sectors(g_card, mbr, 0, 1) == ESP_OK
+                         && mbr[510] == 0x55 && mbr[511] == 0xAA;
 
-        if (p1_is_capped && avail > 1024000) {
-            ESP_LOGW(TAG, "SD: auto-migrate — adding P2 to MBR (start=%lu, %luMB)",
-                     (unsigned long)p1_end64, (unsigned long)(avail / 2048));
+        if (mbr_valid) {
+            uint32_t p1_start = le32(mbr + 0x1BE + 8);
+            uint32_t p1_size  = le32(mbr + 0x1BE + 12);
+            uint32_t p2_start = le32(mbr + 0x1CE + 8);
+            uint32_t p2_size  = le32(mbr + 0x1CE + 12);
+            bool p1_is_ours = (p1_size > 0 && p1_size <= MSC_MAX_SECTORS + 2048);
 
-            mbr[0x1CE + 0] = 0x00;  // status
-            mbr[0x1CE + 1] = 0xFE; mbr[0x1CE + 2] = 0xFF; mbr[0x1CE + 3] = 0xFF;
-            mbr[0x1CE + 4] = 0x0C;  // FAT32 LBA
-            mbr[0x1CE + 5] = 0xFE; mbr[0x1CE + 6] = 0xFF; mbr[0x1CE + 7] = 0xFF;
-            uint32_t p2s = (uint32_t)p1_end64;
-            mbr[0x1CE + 8]  = p2s & 0xFF; mbr[0x1CE + 9]  = (p2s >> 8) & 0xFF;
-            mbr[0x1CE + 10] = (p2s >> 16) & 0xFF; mbr[0x1CE + 11] = (p2s >> 24) & 0xFF;
-            mbr[0x1CE + 12] = avail & 0xFF; mbr[0x1CE + 13] = (avail >> 8) & 0xFF;
-            mbr[0x1CE + 14] = (avail >> 16) & 0xFF; mbr[0x1CE + 15] = (avail >> 24) & 0xFF;
-
-            if (sdmmc_write_sectors(g_card, mbr, 0, 1) == ESP_OK) {
-                g_p2_start_sector = p2s;
-                g_p2_sectors = avail;
+            if (p1_is_ours && p2_start > 0 && p2_size > 0 &&
+                p2_start + p2_size <= g_card_sectors) {
+                // Case 1: valid dual-partition
+                g_p2_start_sector = p2_start;
+                g_p2_sectors = p2_size;
                 g_dual_partition = true;
-                g_p2_needs_format = true;  // deferred to upload task
-                ESP_LOGI(TAG, "SD: MBR updated — P2 format deferred to upload task");
+                ESP_LOGI(TAG, "SD: dual partition OK — P2 start=%lu size=%lu",
+                         (unsigned long)p2_start, (unsigned long)p2_size);
+            } else if (p1_is_ours && g_card_sectors >= MIN_DUAL_SECTORS) {
+                // Case 2: our P1 exists but no valid P2 — add P2 to MBR
+                uint64_t p1_end = (uint64_t)p1_start + p1_size;
+                uint32_t avail = (p1_end < g_card_sectors) ? (uint32_t)(g_card_sectors - p1_end) : 0;
+                if (avail > 1024000) {
+                    ESP_LOGW(TAG, "SD: P1 OK but no P2 — adding P2 to MBR");
+                    uint32_t p2s = (uint32_t)p1_end;
+                    const int P2E = 0x1CE;
+                    mbr[P2E] = 0x00;
+                    mbr[P2E+1] = 0xFE; mbr[P2E+2] = 0xFF; mbr[P2E+3] = 0xFF;
+                    mbr[P2E+4] = 0x0C;
+                    mbr[P2E+5] = 0xFE; mbr[P2E+6] = 0xFF; mbr[P2E+7] = 0xFF;
+                    mbr[P2E+8]  = p2s & 0xFF; mbr[P2E+9]  = (p2s>>8) & 0xFF;
+                    mbr[P2E+10] = (p2s>>16) & 0xFF; mbr[P2E+11] = (p2s>>24) & 0xFF;
+                    mbr[P2E+12] = avail & 0xFF; mbr[P2E+13] = (avail>>8) & 0xFF;
+                    mbr[P2E+14] = (avail>>16) & 0xFF; mbr[P2E+15] = (avail>>24) & 0xFF;
+                    if (sdmmc_write_sectors(g_card, mbr, 0, 1) == ESP_OK) {
+                        g_p2_start_sector = p2s;
+                        g_p2_sectors = avail;
+                        g_dual_partition = true;
+                        g_p2_needs_format = true;
+                        ESP_LOGI(TAG, "SD: MBR updated — P2 format deferred");
+                    }
+                }
+            } else if (g_card_sectors >= MIN_DUAL_SECTORS) {
+                // Case 3: wrong layout — full reformat needed
+                ESP_LOGW(TAG, "SD: layout mismatch (P1=%luMB) — full reformat needed",
+                         (unsigned long)(p1_size / 2048));
+                g_needs_full_format = true;
             }
-        } else if (p1_size > 0 && !p1_is_capped) {
-            ESP_LOGW(TAG, "SD: full-card partition — deferring full reformat to upload task");
+            // else: Case 4 — card too small, fall through to single-partition
+        } else if (g_card_sectors >= MIN_DUAL_SECTORS) {
+            // No valid MBR (blank card or corrupted) — full reformat
+            ESP_LOGW(TAG, "SD: no valid MBR — full reformat needed");
             g_needs_full_format = true;
         }
+        free(mbr);
     }
-    free(mbr);
 
     if (g_dual_partition) {
         // ── Dual-partition: mount partition 2 at /sdcard ────────────────
