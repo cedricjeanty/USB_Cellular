@@ -73,7 +73,8 @@ static HAL            s_hal = { &s_display, &s_clock, &s_nvs, &s_fs, &s_net, &s_
 HAL* g_hal = &s_hal;
 
 static SimModem* s_modem = nullptr;
-static const char* SD_ROOT = "./emu_sdcard";
+static const char* SD_ROOT = "./emu_sdcard";           // Partition 1 (DSU-facing)
+static const char* SD_INTERNAL = "./emu_sdcard_internal"; // Partition 2 (firmware internal)
 static SpeedTracker s_usbSpeed = {};
 static SpeedTracker s_uploadSpeed = {};
 static LogBuffer s_log;
@@ -285,7 +286,7 @@ static void uploadProgressCb(uint32_t bytesSent, uint32_t totalBytes) {
 static void uploadThread(DisplayState* ds) {
     s_uploadDs = ds;
     char harvestDir[256];
-    snprintf(harvestDir, sizeof(harvestDir), "%s/upload", SD_ROOT);
+    snprintf(harvestDir, sizeof(harvestDir), "%s/upload", SD_INTERNAL);
     printf("[S3] Upload thread started — %s\n", harvestDir);
 
     char relPath[128];
@@ -373,9 +374,9 @@ int main(int argc, char* argv[]) {
     char emuLogSession[32];
     snprintf(emuLogSession, sizeof(emuLogSession), "boot_%04lu", (unsigned long)emuBootCount);
     char emuLogPath[256];
-    snprintf(emuLogPath, sizeof(emuLogPath), "%s/logs", SD_ROOT);
+    snprintf(emuLogPath, sizeof(emuLogPath), "%s/logs", SD_INTERNAL);
     ::mkdir(emuLogPath, 0755);
-    snprintf(emuLogPath, sizeof(emuLogPath), "%s/logs/%s.log", SD_ROOT, emuLogSession);
+    snprintf(emuLogPath, sizeof(emuLogPath), "%s/logs/%s.log", SD_INTERNAL, emuLogSession);
 
     airbridge_log("AirBridge fw=%s boot=%lu (emulator)", FW_VERSION, (unsigned long)emuBootCount);
 
@@ -383,7 +384,7 @@ int main(int argc, char* argv[]) {
     // (matches firmware behavior — old logs get uploaded via presign, not append)
     {
         char logDir[256];
-        snprintf(logDir, sizeof(logDir), "%s/logs", SD_ROOT);
+        snprintf(logDir, sizeof(logDir), "%s/logs", SD_INTERNAL);
         void* dir = g_hal->filesys->opendir(logDir);
         if (dir) {
             FsDirEntry ent;
@@ -405,8 +406,8 @@ int main(int argc, char* argv[]) {
             g_hal->filesys->closedir(dir);
             for (auto& name : oldLogs) {
                 char src[256], dst[256];
-                snprintf(src, sizeof(src), "%s/logs/%s", SD_ROOT, name.c_str());
-                snprintf(dst, sizeof(dst), "%s/%s", SD_ROOT, name.c_str());
+                snprintf(src, sizeof(src), "%s/logs/%s", SD_INTERNAL, name.c_str());
+                snprintf(dst, sizeof(dst), "%s/%s", SD_INTERNAL, name.c_str());
                 if (rename(src, dst) == 0) {
                     airbridge_log("Moved old log %s to root for harvest", name.c_str());
                 }
@@ -428,6 +429,7 @@ int main(int argc, char* argv[]) {
     }
 
     ::mkdir(SD_ROOT, 0755);
+    ::mkdir(SD_INTERNAL, 0755);
 
     s_modem = new SimModem("./emu_modem.dat");
     s_modem->operatorName = "SimCellular";
@@ -479,7 +481,7 @@ int main(int argc, char* argv[]) {
     // Check for pending uploads from previous session (scan subfolders)
     {
         char harvestDir[256];
-        snprintf(harvestDir, sizeof(harvestDir), "%s/upload", SD_ROOT);
+        snprintf(harvestDir, sizeof(harvestDir), "%s/upload", SD_INTERNAL);
         char pendingRel[128];
         if (findNextUploadFile(harvestDir, pendingRel, sizeof(pendingRel))) {
             printf("[Boot] Found pending upload: %s — will upload after modem init\n", pendingRel);
@@ -541,9 +543,9 @@ int main(int argc, char* argv[]) {
                     printf("Cellular: %s\n", ds.pppConnected ? "ON (using laptop internet)" : "OFF");
                     break;
                 case SDLK_h: {
-                    printf("Harvesting from %s/ ...\n", SD_ROOT);
+                    printf("Harvesting from %s/ → %s/upload/ ...\n", SD_ROOT, SD_INTERNAL);
                     char destDir[256];
-                    snprintf(destDir, sizeof(destDir), "%s/upload", SD_ROOT);
+                    snprintf(destDir, sizeof(destDir), "%s/upload", SD_INTERNAL);
                     uint32_t hnum = 0;
                     g_hal->nvs->get_u32("harvest", "count", &hnum);
                     hnum++;
@@ -834,7 +836,7 @@ int main(int argc, char* argv[]) {
             s_harvesting = true;
 
             char destDir[256];
-            snprintf(destDir, sizeof(destDir), "%s/upload", SD_ROOT);
+            snprintf(destDir, sizeof(destDir), "%s/upload", SD_INTERNAL);
             uint32_t hnum = 0;
             g_hal->nvs->get_u32("harvest", "count", &hnum);
             hnum++;

@@ -374,6 +374,96 @@ static uint32_t msc_visible_sectors() {
     return g_card_sectors < MSC_MAX_SECTORS ? g_card_sectors : MSC_MAX_SECTORS;
 }
 
+// ── Dual-partition SD layout ────────────────────────────────────────────────
+// Partition 1 (8 GB): DSU-facing, presented via MSC raw sectors
+// Partition 2 (rest): firmware internal (upload/, logs/)
+static bool     g_dual_partition   = false;
+static uint32_t g_p2_start_sector  = 0;  // partition 2 LBA start
+static uint32_t g_p2_sectors       = 0;  // partition 2 size in sectors
+static FATFS*   g_p2_fs            = nullptr; // partition 2 FATFS object
+static const char* DSU_MOUNT       = "/dsu";  // temp mount point for partition 1
+
+// Custom diskio driver for partition 2: offsets all sector addresses
+static DSTATUS p2_diskio_init(BYTE pdrv) { (void)pdrv; return 0; }
+static DSTATUS p2_diskio_status(BYTE pdrv) { (void)pdrv; return 0; }
+
+static DRESULT p2_diskio_read(BYTE pdrv, BYTE* buff, DWORD sector, UINT count) {
+    (void)pdrv;
+    esp_err_t err = sdmmc_read_sectors(g_card, buff, sector + g_p2_start_sector, count);
+    return (err == ESP_OK) ? RES_OK : RES_ERROR;
+}
+
+static DRESULT p2_diskio_write(BYTE pdrv, const BYTE* buff, DWORD sector, UINT count) {
+    (void)pdrv;
+    esp_err_t err = sdmmc_write_sectors(g_card, (void*)buff, sector + g_p2_start_sector, count);
+    return (err == ESP_OK) ? RES_OK : RES_ERROR;
+}
+
+static DRESULT p2_diskio_ioctl(BYTE pdrv, BYTE cmd, void* buff) {
+    (void)pdrv;
+    switch (cmd) {
+        case CTRL_SYNC: return RES_OK;
+        case GET_SECTOR_COUNT: *(DWORD*)buff = g_p2_sectors; return RES_OK;
+        case GET_SECTOR_SIZE:  *(WORD*)buff = 512; return RES_OK;
+        case GET_BLOCK_SIZE:   *(DWORD*)buff = 1; return RES_OK;
+        default: return RES_PARERR;
+    }
+}
+
+static const ff_diskio_impl_t g_p2_diskio_impl = {
+    .init   = p2_diskio_init,
+    .status = p2_diskio_status,
+    .read   = p2_diskio_read,
+    .write  = p2_diskio_write,
+    .ioctl  = p2_diskio_ioctl,
+};
+
+// Helper: read LE uint32 from byte array (MBR partition table parsing)
+static inline uint32_t le32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+// Helper: temp-mount partition 1 at /dsu for harvest/cookie operations
+static bool mount_dsu() {
+    esp_vfs_fat_conf_t conf = {};
+    conf.base_path = DSU_MOUNT;
+    conf.fat_drive = "0:";
+    conf.max_files = 3;
+    FATFS* fs = nullptr;
+    if (esp_vfs_fat_register_cfg(&conf, &fs) != ESP_OK) return false;
+    if (f_mount(fs, "0:", 1) != FR_OK) {
+        esp_vfs_fat_unregister_path(DSU_MOUNT);
+        return false;
+    }
+    return true;
+}
+
+static void unmount_dsu() {
+    f_mount(NULL, "0:", 0);
+    esp_vfs_fat_unregister_path(DSU_MOUNT);
+}
+
+// Helper: write cookie binary to DSU partition (P1 if dual, /sdcard if single)
+static bool write_cookie_to_dsu(const uint8_t* cookie, size_t len) {
+    if (!g_dual_partition) {
+        char path[64];
+        snprintf(path, sizeof(path), "%s/dsuCookie.easdf", SD_MOUNT);
+        FILE* cf = fopen(path, "wb");
+        if (!cf) return false;
+        fwrite(cookie, 1, len, cf);
+        fclose(cf);
+        return true;
+    }
+    if (!mount_dsu()) return false;
+    char path[64];
+    snprintf(path, sizeof(path), "%s/dsuCookie.easdf", DSU_MOUNT);
+    FILE* cf = fopen(path, "wb");
+    bool ok = false;
+    if (cf) { fwrite(cookie, 1, len, cf); fclose(cf); ok = true; }
+    unmount_dsu();
+    return ok;
+}
+
 // Deferred harvest log
 static char g_harvest_log[512] = "";
 static char g_sd_error[128] = "";  // persists SD init errors for STATUS display
@@ -694,41 +784,95 @@ static bool sd_init() {
         return false;
     }
 
-    // Card works — now clean up and let esp_vfs_fat_sdspi_mount handle FATFS.
-    // We need to remove the SPI device first since sdspi_mount will re-add it.
-    free(tmp_card); tmp_card = nullptr;
-    sdspi_host_remove_device(card_handle);
+    // Card works. Check MBR for dual-partition layout before deciding mount strategy.
+    g_card_sectors = tmp_card->csd.capacity;
+    g_card = tmp_card; tmp_card = nullptr;
+    // Keep card_handle — we'll use it for raw access
 
-    esp_vfs_fat_mount_config_t mount_cfg = {};
-    mount_cfg.format_if_mount_failed = false;  // card already formatted
-    mount_cfg.max_files = 5;
-    mount_cfg.allocation_unit_size = 16 * 1024;
-
-    ret = esp_vfs_fat_sdspi_mount(SD_MOUNT, &g_sd_host,
-                                   &g_slot_config, &mount_cfg, &g_card);
-    if (ret == ESP_OK) {
-        g_fatfs_mounted = true;
-        g_card_sectors = g_card->csd.capacity;
-    } else {
-        snprintf(g_sd_error, sizeof(g_sd_error), "mount: %s", esp_err_to_name(ret));
-        // Fall back: re-init for MSC-only
-        sdspi_host_init_device(&g_slot_config, &card_handle);
-        g_sd_host.slot = card_handle;
-        g_card = (sdmmc_card_t *)calloc(1, sizeof(sdmmc_card_t));
-        if (g_card) {
-            sdmmc_card_init(&g_sd_host, g_card);
-            g_card_sectors = g_card->csd.capacity;
+    // Parse MBR to detect partition 2
+    uint8_t mbr[512];
+    if (sdmmc_read_sectors(g_card, mbr, 0, 1) == ESP_OK &&
+        mbr[510] == 0x55 && mbr[511] == 0xAA) {
+        uint32_t p2_start = le32(mbr + 0x1CE + 8);
+        uint32_t p2_size  = le32(mbr + 0x1CE + 12);
+        if (p2_start > 0 && p2_size > 0 && p2_start + p2_size <= g_card_sectors) {
+            g_p2_start_sector = p2_start;
+            g_p2_sectors = p2_size;
+            g_dual_partition = true;
+            ESP_LOGI(TAG, "SD: dual partition detected — P2 start=%lu size=%lu",
+                     (unsigned long)g_p2_start_sector, (unsigned long)g_p2_sectors);
         }
     }
 
-    ESP_LOGI(TAG, "SD: %lu sectors, fatfs=%s",
-             (unsigned long)g_card_sectors, g_fatfs_mounted ? "ok" : "FAIL");
+    if (g_dual_partition) {
+        // ── Dual-partition: mount partition 2 at /sdcard ────────────────
+        // pdrv 0: standard sdmmc (whole card) — for temp partition 1 access
+        ff_diskio_register_sdmmc(0, g_card);
+        // pdrv 1: offset diskio for partition 2
+        ff_diskio_register(1, &g_p2_diskio_impl);
+
+        // Mount partition 2 at /sdcard via VFS
+        esp_vfs_fat_conf_t conf = {};
+        conf.base_path = SD_MOUNT;
+        conf.fat_drive = "1:";
+        conf.max_files = 5;
+        esp_err_t vfs_ret = esp_vfs_fat_register_cfg(&conf, &g_p2_fs);
+        if (vfs_ret == ESP_OK && g_p2_fs) {
+            FRESULT fr = f_mount(g_p2_fs, "1:", 1);
+            if (fr == FR_OK) {
+                g_fatfs_mounted = true;
+                ESP_LOGI(TAG, "SD: partition 2 mounted at %s", SD_MOUNT);
+            } else {
+                snprintf(g_sd_error, sizeof(g_sd_error), "P2 mount: FR=%d", fr);
+                esp_vfs_fat_unregister_path(SD_MOUNT);
+            }
+        } else {
+            snprintf(g_sd_error, sizeof(g_sd_error), "P2 vfs: %s", esp_err_to_name(vfs_ret));
+        }
+    } else {
+        // ── Single partition (legacy): use esp_vfs_fat_sdspi_mount ─────
+        // Need to clean up manual card init first
+        free(g_card); g_card = nullptr;
+        sdspi_host_remove_device(card_handle);
+
+        esp_vfs_fat_mount_config_t mount_cfg = {};
+        mount_cfg.format_if_mount_failed = false;
+        mount_cfg.max_files = 5;
+        mount_cfg.allocation_unit_size = 16 * 1024;
+
+        ret = esp_vfs_fat_sdspi_mount(SD_MOUNT, &g_sd_host,
+                                       &g_slot_config, &mount_cfg, &g_card);
+        if (ret == ESP_OK) {
+            g_fatfs_mounted = true;
+            g_card_sectors = g_card->csd.capacity;
+        } else {
+            snprintf(g_sd_error, sizeof(g_sd_error), "mount: %s", esp_err_to_name(ret));
+            sdspi_host_init_device(&g_slot_config, &card_handle);
+            g_sd_host.slot = card_handle;
+            g_card = (sdmmc_card_t *)calloc(1, sizeof(sdmmc_card_t));
+            if (g_card) {
+                sdmmc_card_init(&g_sd_host, g_card);
+                g_card_sectors = g_card->csd.capacity;
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "SD: %lu sectors, fatfs=%s, dual=%d",
+             (unsigned long)g_card_sectors, g_fatfs_mounted ? "ok" : "FAIL", g_dual_partition);
     return true;
 }
 
 static bool sd_mount_fatfs() {
     if (g_fatfs_mounted) return true;
 
+    if (g_dual_partition && g_p2_fs) {
+        // Partition 2: just remount the FATFS volume
+        FRESULT fr = f_mount(g_p2_fs, "1:", 1);
+        g_fatfs_mounted = (fr == FR_OK);
+        return g_fatfs_mounted;
+    }
+
+    // Single partition (legacy)
     esp_vfs_fat_mount_config_t mount_cfg = {};
     mount_cfg.format_if_mount_failed = false;
     mount_cfg.max_files = 5;
@@ -746,7 +890,12 @@ static bool sd_mount_fatfs() {
 
 static void sd_unmount_fatfs() {
     if (!g_fatfs_mounted) return;
-    esp_vfs_fat_sdcard_unmount(SD_MOUNT, g_card);
+
+    if (g_dual_partition) {
+        f_mount(NULL, "1:", 0);
+    } else {
+        esp_vfs_fat_sdcard_unmount(SD_MOUNT, g_card);
+    }
     g_fatfs_mounted = false;
 }
 
@@ -3168,12 +3317,7 @@ static void uploadTask(void* param) {
                     // Verify magic
                     if (cookie[0] == 0xEA && cookie[1] == 0x1E) {
                         xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-                        char cookiePath[64];
-                        snprintf(cookiePath, sizeof(cookiePath), "%s/dsuCookie.easdf", SD_MOUNT);
-                        FILE* cf = fopen(cookiePath, "wb");
-                        if (cf) {
-                            fwrite(cookie, 1, 78, cf);
-                            fclose(cf);
+                        if (write_cookie_to_dsu(cookie, 78)) {
                             g_s3CookieActive = true;
                             log_write("S3 cookie applied (overrides harvest cookie)");
                             cdc_printf("S3 cookie: applied\r\n");
@@ -3342,47 +3486,85 @@ static void doHarvest() {
 
     // Take mutex to exclude uploadTask from SD for entire harvest
     xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-    ESP_LOGI(TAG, "doHarvest: got mutex, re-initializing SD");
+    ESP_LOGI(TAG, "doHarvest: got mutex");
 
-    // Re-initialize card and remount FATFS to get fresh filesystem view
-    bool ok = false;
-    for (int i = 0; i < 3 && !ok; i++) {
-        ok = sd_reinit_and_mount();
-        cdc_printf("doHarvest: reinit attempt %d = %s\r\n", i+1, ok ? "OK" : "FAIL");
-        if (!ok) vTaskDelay(pdMS_TO_TICKS(500));
-    }
+    // Determine harvest source and destination based on partition layout
+    const char* harvestSrc = SD_MOUNT;  // default: single partition
+    char harvDir[64];
+    snprintf(harvDir, sizeof(harvDir), "%s/upload", SD_MOUNT);
+    bool dsu_mounted = false;
 
-    if (!ok) {
-        xSemaphoreGive(g_sd_mutex);
-        g_writeDetected = false; g_lastWriteMs = 0;
-        g_hostWasConnected = false; g_hostConnected = false;
-        g_harvesting = false;
-        g_msc_ejected = false;
-        ESP_LOGI(TAG, "doHarvest: sd reinit failed, media re-inserted");
-        return;
+    if (g_dual_partition) {
+        // Dual-partition: harvest from P1 (/dsu), store on P2 (/sdcard/upload)
+        // Mount P1 fresh to get current view of DSU-written files
+        if (mount_dsu()) {
+            harvestSrc = DSU_MOUNT;
+            dsu_mounted = true;
+            cdc_printf("doHarvest: P1 mounted at %s\r\n", DSU_MOUNT);
+            log_write("doHarvest: P1 mounted OK");
+        } else {
+            cdc_printf("doHarvest: P1 mount FAILED\r\n");
+            log_write("doHarvest: P1 mount failed");
+        }
+    } else {
+        // Single partition: reinit FATFS to get fresh view after MSC writes
+        bool ok = false;
+        for (int i = 0; i < 3 && !ok; i++) {
+            ok = sd_reinit_and_mount();
+            cdc_printf("doHarvest: reinit attempt %d = %s\r\n", i+1, ok ? "OK" : "FAIL");
+            if (!ok) vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        if (!ok) {
+            xSemaphoreGive(g_sd_mutex);
+            g_writeDetected = false; g_lastWriteMs = 0;
+            g_hostWasConnected = false; g_hostConnected = false;
+            g_harvesting = false;
+            g_msc_ejected = false;
+            ESP_LOGI(TAG, "doHarvest: sd reinit failed");
+            return;
+        }
     }
 
     // Harvest files using shared harvestFiles() from airbridge_harvest.h
-    char harvDir[64];
-    snprintf(harvDir, sizeof(harvDir), "%s/upload", SD_MOUNT);
     uint32_t harvestNum = 0;
     g_hal->nvs->get_u32("harvest", "count", &harvestNum);
     harvestNum++;
     g_hal->nvs->set_u32("harvest", "count", harvestNum);
-    HarvestResult hr = harvestFiles(SD_MOUNT, harvDir, (uint16_t)harvestNum);
+    HarvestResult hr = harvestFiles(harvestSrc, harvDir, (uint16_t)harvestNum);
     uint16_t count = hr.count;
     float usedMb = hr.usedMb;
+
+    // Write DSU cookie to the partition the DSU reads from
+    if (count > 0 && !g_s3CookieActive && hr.maxFlight > 0 && hr.dsuSerial[0]) {
+        uint8_t cookie[78];
+        buildDsuCookie(hr.dsuSerial, hr.maxFlight, cookie);
+        if (g_dual_partition && dsu_mounted) {
+            // Write directly to /dsu (P1 is still mounted)
+            char cookiePath[64];
+            snprintf(cookiePath, sizeof(cookiePath), "%s/dsuCookie.easdf", DSU_MOUNT);
+            FILE* cf = fopen(cookiePath, "wb");
+            if (cf) { fwrite(cookie, 1, 78, cf); fclose(cf); }
+        } else {
+            write_cookie_to_dsu(cookie, 78);
+        }
+        log_write("Cookie: %s flight %lu", hr.dsuSerial, (unsigned long)hr.maxFlight);
+        cdc_printf("Cookie: %s flight %lu\r\n", hr.dsuSerial, (unsigned long)hr.maxFlight);
+    }
+
+    // Unmount P1 if we mounted it
+    if (dsu_mounted) unmount_dsu();
 
     xSemaphoreGive(g_sd_mutex);
 
     g_filesQueued += count;
     if (count > 0) g_mbQueued += usedMb;
 
-    // Update SD used space
+    // Update SD used space (from internal partition)
     {
+        const char* drv = g_dual_partition ? "1:" : "0:";
         FATFS* fs;
         DWORD freeClusters;
-        if (f_getfree("0:", &freeClusters, &fs) == FR_OK) {
+        if (f_getfree(drv, &freeClusters, &fs) == FR_OK) {
             DWORD totalSectors = (fs->n_fatent - 2) * fs->csize;
             DWORD freeSectors  = freeClusters * fs->csize;
             g_sdUsedMb = (totalSectors - freeSectors) * 512.0f / 1e6f;
@@ -3393,24 +3575,8 @@ static void doHarvest() {
     log_write("Harvest: %u file(s), %.1f MB", count, usedMb);
     log_flush_to_sd();
 
-    // Write DSU cookie using shared buildDsuCookie() from airbridge_proto.h
-    if (count > 0 && !g_s3CookieActive && hr.maxFlight > 0 && hr.dsuSerial[0]) {
-        uint8_t cookie[78];
-        buildDsuCookie(hr.dsuSerial, hr.maxFlight, cookie);
-        char cookiePath[64];
-        snprintf(cookiePath, sizeof(cookiePath), "%s/dsuCookie.easdf", SD_MOUNT);
-        FILE* cf = fopen(cookiePath, "wb");
-        if (cf) {
-            fwrite(cookie, 1, 78, cf);
-            fclose(cf);
-            log_write("Cookie: %s flight %lu", hr.dsuSerial, (unsigned long)hr.maxFlight);
-            cdc_printf("Cookie: %s flight %lu\r\n", hr.dsuSerial, (unsigned long)hr.maxFlight);
-        }
-    }
-
     g_writeDetected = false; g_lastWriteMs = 0;
     g_hostWasConnected = false; g_hostConnected = false;
-    // Note: g_hostWrittenMb NOT reset — it's a session-cumulative display metric
 
     g_harvesting = false;
     g_msc_ejected = false;
@@ -3491,7 +3657,7 @@ static void processCLI(const char* cmd) {
         }
 
     } else if (strcmp(cmd, "FORMAT") == 0) {
-        cdc_printf("CLI: formatting SD as 8GB FAT32 — ALL DATA WILL BE LOST\r\n");
+        cdc_printf("CLI: formatting SD dual-partition — ALL DATA WILL BE LOST\r\n");
         g_harvesting = true;
         g_msc_ejected = true;
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -3499,80 +3665,128 @@ static void processCLI(const char* cmd) {
         xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
         // Unmount FATFS fully
         if (g_fatfs_mounted) {
-            esp_vfs_fat_sdcard_unmount(SD_MOUNT, g_card);
+            if (g_dual_partition) {
+                f_mount(NULL, "1:", 0);
+                esp_vfs_fat_unregister_path(SD_MOUNT);
+                ff_diskio_unregister(0);
+                ff_diskio_unregister(1);
+            } else {
+                esp_vfs_fat_sdcard_unmount(SD_MOUNT, g_card);
+                g_card = nullptr;
+            }
             g_fatfs_mounted = false;
         }
 
-        // Re-init SPI device + card for raw access
-        int card_handle = -1;
-        sdspi_host_init_device(&g_slot_config, &card_handle);
-        g_sd_host.slot = card_handle;
-        g_card = (sdmmc_card_t *)calloc(1, sizeof(sdmmc_card_t));
+        // Re-init SPI device + card for raw access (if card was freed by unmount)
         bool fmt_ok = false;
-        if (g_card && sdmmc_card_init(&g_sd_host, g_card) == ESP_OK) {
+        if (!g_card) {
+            int fh = -1;
+            sdspi_host_init_device(&g_slot_config, &fh);
+            g_sd_host.slot = fh;
+            g_card = (sdmmc_card_t *)calloc(1, sizeof(sdmmc_card_t));
+            if (g_card) sdmmc_card_init(&g_sd_host, g_card);
+        }
+        if (g_card) {
             g_card_sectors = g_card->csd.capacity;
 
-            // Register diskio so f_fdisk/f_mkfs can access the card
-            BYTE pdrv = 0xFF;
-            ff_diskio_get_drive(&pdrv);
-            if (pdrv != 0xFF) {
-                ff_diskio_register_sdmmc(pdrv, g_card);
-                char drv[3] = {(char)('0' + pdrv), ':', 0};
+            BYTE pdrv = 0;
+            ff_diskio_register_sdmmc(pdrv, g_card);
+            char drv0[3] = {'0', ':', 0};
 
-                // Partition: cap at 8 GB for avionics compatibility
-                // f_fdisk plist values: percentage (1-100) or absolute sector count (>100)
-                uint32_t fmt_sectors = msc_visible_sectors();
-                cdc_printf("CLI: fdisk %lu sectors (%.1f GB of %.1f GB card)\r\n",
-                           (unsigned long)fmt_sectors,
-                           fmt_sectors * 512.0 / 1e9,
-                           g_card_sectors * 512.0 / 1e9);
+            uint32_t p1_sectors = msc_visible_sectors();
+            uint32_t p2_sectors = (g_card_sectors > p1_sectors + 2048)
+                                   ? g_card_sectors - p1_sectors : 0;
 
-                LBA_t plist[] = {(LBA_t)fmt_sectors, 0, 0, 0};
-                void *work = malloc(4096);
-                if (work) {
-                    FRESULT fr = f_fdisk(pdrv, plist, work);
+            cdc_printf("CLI: fdisk P1=%luMB P2=%luMB\r\n",
+                       (unsigned long)(p1_sectors / 2048),
+                       (unsigned long)(p2_sectors / 2048));
+
+            LBA_t plist[] = {(LBA_t)p1_sectors, (LBA_t)p2_sectors, 0, 0};
+            void *work = malloc(4096);
+            if (work) {
+                FRESULT fr = f_fdisk(pdrv, plist, work);
+                if (fr == FR_OK) {
+                    cdc_printf("CLI: fdisk OK, formatting P1...\r\n");
+                    MKFS_PARM opt = {};
+                    opt.fmt = FM_FAT32;
+                    opt.n_fat = 2;
+                    opt.au_size = 16 * 1024;
+                    fr = f_mkfs(drv0, &opt, work, 4096);
                     if (fr == FR_OK) {
-                        cdc_printf("CLI: fdisk OK, formatting FAT32...\r\n");
-                        MKFS_PARM opt = {};
-                        opt.fmt = FM_FAT32;
-                        opt.n_fat = 2;
-                        opt.au_size = 16 * 1024;
-                        fr = f_mkfs(drv, &opt, work, 4096);
-                        if (fr == FR_OK) {
-                            cdc_printf("CLI: mkfs OK\r\n");
-                            fmt_ok = true;
-                        } else {
-                            cdc_printf("CLI: mkfs FAILED (%d)\r\n", fr);
-                        }
+                        cdc_printf("CLI: P1 mkfs OK\r\n");
+                        fmt_ok = true;
                     } else {
-                        cdc_printf("CLI: fdisk FAILED (%d)\r\n", fr);
+                        cdc_printf("CLI: P1 mkfs FAILED (%d)\r\n", fr);
                     }
-                    free(work);
+
+                    // Format partition 2 if card is large enough
+                    if (fmt_ok && p2_sectors > 0) {
+                        // Parse MBR for partition 2 geometry
+                        uint8_t mbr[512];
+                        sdmmc_read_sectors(g_card, mbr, 0, 1);
+                        g_p2_start_sector = le32(mbr + 0x1CE + 8);
+                        g_p2_sectors = le32(mbr + 0x1CE + 12);
+
+                        if (g_p2_start_sector > 0 && g_p2_sectors > 0) {
+                            ff_diskio_register(1, &g_p2_diskio_impl);
+                            cdc_printf("CLI: formatting P2 (start=%lu, %luMB)...\r\n",
+                                       (unsigned long)g_p2_start_sector,
+                                       (unsigned long)(g_p2_sectors / 2048));
+                            char drv1[3] = {'1', ':', 0};
+                            fr = f_mkfs(drv1, &opt, work, 4096);
+                            if (fr == FR_OK) {
+                                cdc_printf("CLI: P2 mkfs OK\r\n");
+                                g_dual_partition = true;
+                            } else {
+                                cdc_printf("CLI: P2 mkfs FAILED (%d)\r\n", fr);
+                                ff_diskio_unregister(1);
+                                g_dual_partition = false;
+                            }
+                        }
+                    }
+                } else {
+                    cdc_printf("CLI: fdisk FAILED (%d)\r\n", fr);
                 }
-                ff_diskio_unregister(pdrv);
+                free(work);
             }
-            // Clean up raw SPI device so sdspi_mount can re-add it
-            sdspi_host_remove_device(card_handle);
-            free(g_card); g_card = nullptr;
         }
 
-        // Remount via standard path
-        if (fmt_ok) {
+        // Remount
+        if (fmt_ok && g_dual_partition) {
+            // pdrv 0 already registered (sdmmc), pdrv 1 already registered (offset)
+            esp_vfs_fat_conf_t conf = {};
+            conf.base_path = SD_MOUNT;
+            conf.fat_drive = "1:";
+            conf.max_files = 5;
+            g_p2_fs = nullptr;
+            if (esp_vfs_fat_register_cfg(&conf, &g_p2_fs) == ESP_OK && g_p2_fs) {
+                if (f_mount(g_p2_fs, "1:", 1) == FR_OK) {
+                    g_fatfs_mounted = true;
+                    g_sd_ready = true;
+                    mkdir("/sdcard/upload", 0775);
+                    mkdir("/sdcard/logs", 0775);
+                    cdc_printf("CLI: format complete — dual partition ready\r\n");
+                }
+            }
+        } else if (fmt_ok) {
+            // Single partition fallback (card too small for P2)
+            ff_diskio_unregister(0);
+            // Re-init via standard path
+            int fh2 = -1;
+            sdspi_host_init_device(&g_slot_config, &fh2);
+            g_sd_host.slot = fh2;
+            free(g_card); g_card = nullptr;
+
             esp_vfs_fat_mount_config_t mount_cfg = {};
             mount_cfg.format_if_mount_failed = false;
             mount_cfg.max_files = 5;
             mount_cfg.allocation_unit_size = 16 * 1024;
-            esp_err_t ret = esp_vfs_fat_sdspi_mount(SD_MOUNT, &g_sd_host,
-                                                      &g_slot_config, &mount_cfg, &g_card);
-            if (ret == ESP_OK) {
+            if (esp_vfs_fat_sdspi_mount(SD_MOUNT, &g_sd_host, &g_slot_config, &mount_cfg, &g_card) == ESP_OK) {
                 g_fatfs_mounted = true;
                 g_card_sectors = g_card->csd.capacity;
                 g_sd_ready = true;
-                // Create upload directory
                 mkdir("/sdcard/upload", 0775);
-                cdc_printf("CLI: format complete, 8GB FAT32 ready\r\n");
-            } else {
-                cdc_printf("CLI: remount FAILED: %s\r\n", esp_err_to_name(ret));
+                cdc_printf("CLI: format complete — single partition ready\r\n");
             }
         }
         xSemaphoreGive(g_sd_mutex);
@@ -3819,7 +4033,7 @@ static void main_loop_task(void* param) {
                 xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 FATFS* fs;
                 DWORD freeClusters;
-                if (f_getfree("0:", &freeClusters, &fs) == FR_OK) {
+                if (f_getfree(g_dual_partition ? "1:" : "0:", &freeClusters, &fs) == FR_OK) {
                     DWORD totalSectors = (fs->n_fatent - 2) * fs->csize;
                     DWORD freeSectors  = freeClusters * fs->csize;
                     g_sdUsedMb = (totalSectors - freeSectors) * 512.0f / 1e6f;
@@ -4278,29 +4492,33 @@ extern "C" void app_main(void) {
         }
     }
 
-    // ── Scan SD for unharvested files (from previous session) ──────────
-    // Checks root AND DSU subdirectories (e.g. flightHistory/) — the aircraft
-    // writes .eaofh files into flightHistory/, not flat to root, so a root-only
-    // scan would miss them and never trigger a boot-time harvest.
-    // Always scan regardless of queued count — files in /upload/ don't mean
-    // root is clean (e.g. aircraft wrote 60 MB after last harvest).
+    // ── Scan for unharvested files (from previous session) ─────────────
+    // For dual-partition: scan partition 1 (DSU side) by temp-mounting at /dsu.
+    // For single partition: scan /sdcard root as before.
     if (g_fatfs_mounted) {
         bool found = false;
         const char* foundPath = nullptr;
         static char foundPathBuf[96];
 
-        DIR* rootDir = opendir(SD_MOUNT);
+        const char* scanRoot = SD_MOUNT;
+        bool dsu_tmp = false;
+        if (g_dual_partition) {
+            if (mount_dsu()) {
+                scanRoot = DSU_MOUNT;
+                dsu_tmp = true;
+            }
+        }
+
+        DIR* rootDir = opendir(scanRoot);
         if (rootDir) {
             struct dirent* ent;
             while ((ent = readdir(rootDir)) != nullptr) {
                 if (ent->d_name[0] == '.') continue;
-                if (isSkipped(ent->d_name)) continue;  // upload/, logs/, dsuCookie, magic files, etc.
+                if (isSkipped(ent->d_name)) continue;
 
                 if (ent->d_type == DT_DIR) {
-                    // Peek one level into this subdirectory — if it has any
-                    // non-hidden file, there's work to harvest.
                     char subPath[96];
-                    snprintf(subPath, sizeof(subPath), "%s/%s", SD_MOUNT, ent->d_name);
+                    snprintf(subPath, sizeof(subPath), "%s/%s", scanRoot, ent->d_name);
                     DIR* sub = opendir(subPath);
                     if (!sub) continue;
                     struct dirent* subEnt;
@@ -4322,6 +4540,8 @@ extern "C" void app_main(void) {
             }
             closedir(rootDir);
         }
+
+        if (dsu_tmp) unmount_dsu();
 
         if (found) {
             ESP_LOGI(TAG, "Boot: unharvested file: %s — triggering harvest",

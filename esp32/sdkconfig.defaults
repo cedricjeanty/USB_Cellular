@@ -48,6 +48,7 @@ CONFIG_TINYUSB_DESC_MSC_STRING="Mass Storage"
 CONFIG_TINYUSB_DESC_CDC_STRING="Serial Port"
 
 # ── FAT filesystem ──────────────────────────────────────────────
+CONFIG_FATFS_VOLUME_COUNT=2
 CONFIG_FATFS_LFN_HEAP=y
 # SD card uses 512-byte sectors (default 4096 breaks MBR parsing)
 CONFIG_FATFS_SECTOR_4096=n
