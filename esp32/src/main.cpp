@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260503195500"
+#define FW_VERSION "20260504120000"
 
 #include <cstring>
 #include <ctime>
@@ -378,7 +378,8 @@ static uint32_t msc_visible_sectors() {
 // Partition 1 (8 GB): DSU-facing, presented via MSC raw sectors
 // Partition 2 (rest): firmware internal (upload/, logs/)
 static bool     g_dual_partition   = false;
-static bool     g_p2_needs_format  = false; // deferred: format P2 in upload task (has 16KB stack)
+static bool     g_p2_needs_format  = false; // deferred: format P2 only in upload task
+static bool     g_needs_full_format = false; // deferred: full repartition in upload task
 static uint32_t g_p2_start_sector  = 0;  // partition 2 LBA start
 static uint32_t g_p2_sectors       = 0;  // partition 2 size in sectors
 static FATFS*   g_p2_fs            = nullptr; // partition 2 FATFS object
@@ -836,7 +837,8 @@ static bool sd_init() {
                 ESP_LOGI(TAG, "SD: MBR updated — P2 format deferred to upload task");
             }
         } else if (p1_size > 0 && !p1_is_capped) {
-            ESP_LOGI(TAG, "SD: single partition uses full card — no migration");
+            ESP_LOGW(TAG, "SD: full-card partition — deferring full reformat to upload task");
+            g_needs_full_format = true;
         }
     }
     free(mbr);
@@ -862,8 +864,11 @@ static bool sd_init() {
                 mkdir("/sdcard/logs", 0775);
                 ESP_LOGI(TAG, "SD: partition 2 mounted at %s", SD_MOUNT);
             } else {
-                snprintf(g_sd_error, sizeof(g_sd_error), "P2 mount: FR=%d", fr);
+                // P2 exists in MBR but isn't formatted — defer format to upload task
+                ESP_LOGW(TAG, "SD: P2 mount failed (FR=%d) — deferring format", fr);
+                snprintf(g_sd_error, sizeof(g_sd_error), "P2 mount: FR=%d (will format)", fr);
                 esp_vfs_fat_unregister_path(SD_MOUNT);
+                g_p2_needs_format = true;
             }
         } else {
             snprintf(g_sd_error, sizeof(g_sd_error), "P2 vfs: %s", esp_err_to_name(vfs_ret));
@@ -3220,45 +3225,7 @@ static void uploadTask(void* param) {
     (void)param;
     static bool otaDone = false;
 
-    // ── Deferred P2 format (from auto-migration in sd_init) ─────────────
-    // f_mkfs needs significant stack — safe here in upload task (16KB stack)
-    if (g_p2_needs_format && g_dual_partition) {
-        ESP_LOGI(TAG, "Upload: formatting P2 (deferred from sd_init)");
-        cdc_printf("SD: formatting partition 2...\r\n");
-        ff_diskio_register(1, &g_p2_diskio_impl);
-        MKFS_PARM opt = {};
-        opt.fmt = FM_FAT32;
-        opt.n_fat = 2;
-        opt.au_size = 16 * 1024;
-        void* work = malloc(4096);
-        if (work) {
-            FRESULT fr = f_mkfs("1:", &opt, work, 4096);
-            free(work);
-            if (fr == FR_OK) {
-                // Mount P2 at /sdcard
-                ff_diskio_register_sdmmc(0, g_card);  // pdrv 0 for P1 access
-                esp_vfs_fat_conf_t conf = {};
-                conf.base_path = SD_MOUNT;
-                conf.fat_drive = "1:";
-                conf.max_files = 5;
-                g_p2_fs = nullptr;
-                if (esp_vfs_fat_register_cfg(&conf, &g_p2_fs) == ESP_OK && g_p2_fs) {
-                    if (f_mount(g_p2_fs, "1:", 1) == FR_OK) {
-                        g_fatfs_mounted = true;
-                        mkdir("/sdcard/upload", 0775);
-                        mkdir("/sdcard/logs", 0775);
-                        log_write("SD: P2 formatted and mounted OK");
-                        cdc_printf("SD: partition 2 ready\r\n");
-                    }
-                }
-            } else {
-                ESP_LOGE(TAG, "SD: P2 mkfs failed FR=%d", fr);
-                ff_diskio_unregister(1);
-                g_dual_partition = false;
-            }
-        }
-        g_p2_needs_format = false;
-    }
+    // Deferred format now runs at boot (before task creation) — see app_main.
 
     // ── SD flash: firmware.bin on SD (runs before network, instant) ────
     if (g_fatfs_mounted) {
@@ -4500,6 +4467,109 @@ extern "C" void app_main(void) {
     // Initialize event loop + netif (needed for PPP even without WiFi)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // ── Deferred SD format (needs 16KB stack, can't run in app_main) ────
+    // Runs BEFORE task creation so USB hasn't been presented yet.
+    ESP_LOGW(TAG, "SD: format flags — full=%d p2=%d dual=%d fatfs=%d card=%p",
+             g_needs_full_format, g_p2_needs_format, g_dual_partition, g_fatfs_mounted, g_card);
+    if (g_needs_full_format || g_p2_needs_format) {
+        ESP_LOGW(TAG, "SD: deferred format needed — spawning format task");
+        static volatile bool fmt_done = false;
+        xTaskCreatePinnedToCore([](void*) {
+            if (g_needs_full_format) {
+                g_needs_full_format = false;
+                ESP_LOGW(TAG, "FmtTask: full reformat — dual partition");
+                cdc_printf("SD: reformatting as dual-partition...\r\n");
+
+                // Unmount without destroying g_card
+                if (g_fatfs_mounted) {
+                    if (g_dual_partition) { f_mount(NULL, "1:", 0); }
+                    else { f_mount(NULL, "0:", 0); }
+                    esp_vfs_fat_unregister_path(SD_MOUNT);
+                    g_fatfs_mounted = false;
+                }
+
+                ff_diskio_unregister(0);  // clear any stale registration
+                ff_diskio_register_sdmmc(0, g_card);
+                uint32_t p1_sectors = MSC_MAX_SECTORS;
+                uint32_t p2_sectors = (g_card_sectors > p1_sectors + 2048)
+                                       ? g_card_sectors - p1_sectors : 0;
+                ESP_LOGW(TAG, "FmtTask: fdisk P1=%lu P2=%lu card=%lu",
+                         (unsigned long)p1_sectors, (unsigned long)p2_sectors,
+                         (unsigned long)g_card_sectors);
+                LBA_t plist[] = {(LBA_t)p1_sectors, (LBA_t)p2_sectors, 0, 0};
+                void* work = malloc(4096);
+                bool ok = false;
+                if (work) {
+                    FRESULT fr = f_fdisk(0, plist, work);
+                    ESP_LOGW(TAG, "FmtTask: fdisk result=%d", fr);
+                    if (fr == FR_OK) {
+                        MKFS_PARM opt = { .fmt = FM_FAT32, .n_fat = 2, .au_size = 16 * 1024 };
+                        fr = f_mkfs("0:", &opt, work, 4096);
+                        ESP_LOGW(TAG, "FmtTask: mkfs P1 result=%d", fr);
+                        if (fr == FR_OK) {
+                            uint8_t* mbr = (uint8_t*)malloc(512);
+                            if (mbr && sdmmc_read_sectors(g_card, mbr, 0, 1) == ESP_OK) {
+                                g_p2_start_sector = le32(mbr + 0x1CE + 8);
+                                g_p2_sectors = le32(mbr + 0x1CE + 12);
+                            }
+                            free(mbr);
+                            if (g_p2_start_sector > 0 && g_p2_sectors > 0) {
+                                ff_diskio_register(1, &g_p2_diskio_impl);
+                                fr = f_mkfs("1:", &opt, work, 4096);
+                                if (fr == FR_OK) { g_dual_partition = true; ok = true; }
+                            }
+                        }
+                    }
+                    free(work);
+                }
+                if (ok) {
+                    // Mount P2
+                    esp_vfs_fat_conf_t conf = {};
+                    conf.base_path = SD_MOUNT; conf.fat_drive = "1:"; conf.max_files = 5;
+                    g_p2_fs = nullptr;
+                    if (esp_vfs_fat_register_cfg(&conf, &g_p2_fs) == ESP_OK && g_p2_fs &&
+                        f_mount(g_p2_fs, "1:", 1) == FR_OK) {
+                        g_fatfs_mounted = true;
+                        mkdir("/sdcard/upload", 0775);
+                        mkdir("/sdcard/logs", 0775);
+                        ESP_LOGI(TAG, "FmtTask: dual-partition ready");
+                    }
+                } else {
+                    ESP_LOGE(TAG, "FmtTask: full reformat failed");
+                }
+            } else if (g_p2_needs_format) {
+                g_p2_needs_format = false;
+                ESP_LOGW(TAG, "FmtTask: formatting P2 only");
+                ff_diskio_register(1, &g_p2_diskio_impl);
+                MKFS_PARM opt = { .fmt = FM_FAT32, .n_fat = 2, .au_size = 16 * 1024 };
+                void* work = malloc(4096);
+                if (work) {
+                    FRESULT fr = f_mkfs("1:", &opt, work, 4096);
+                    free(work);
+                    if (fr == FR_OK) {
+                        ff_diskio_register_sdmmc(0, g_card);
+                        esp_vfs_fat_conf_t conf = {};
+                        conf.base_path = SD_MOUNT; conf.fat_drive = "1:"; conf.max_files = 5;
+                        g_p2_fs = nullptr;
+                        if (esp_vfs_fat_register_cfg(&conf, &g_p2_fs) == ESP_OK && g_p2_fs &&
+                            f_mount(g_p2_fs, "1:", 1) == FR_OK) {
+                            g_fatfs_mounted = true;
+                            mkdir("/sdcard/upload", 0775);
+                            mkdir("/sdcard/logs", 0775);
+                            ESP_LOGI(TAG, "FmtTask: P2 formatted and mounted");
+                        }
+                    }
+                }
+            }
+            fmt_done = true;
+            vTaskDelete(nullptr);
+        }, "sd_fmt", 16384, nullptr, 5, nullptr, 1);  // high priority, 16KB stack
+
+        // Wait for format to complete (blocks app_main — no USB yet)
+        while (!fmt_done) vTaskDelay(pdMS_TO_TICKS(100));
+        ESP_LOGI(TAG, "SD: deferred format complete");
+    }
 
     // ── Create tasks ────────────────────────────────────────────────────
     xTaskCreatePinnedToCore(uploadTask,    "upload",    16384, nullptr, 1, &g_upload_task,  1);
