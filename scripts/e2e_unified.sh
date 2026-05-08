@@ -105,7 +105,28 @@ power_cut() {
     sleep "${1:-5}"
 }
 
-# Write a DSU-style flight file (realistic directory structure)
+# Append a valid DSU 0x4C summary record (28 bytes) so the firmware's
+# content-based parser can extract serial+flight from the file.
+# Usage: append_eaofh_trailer <path> <serial> <flight_num>
+append_eaofh_trailer() {
+    local path="$1" serial="$2" flight="$3"
+    local sudo_cmd="${4:-}"
+    $sudo_cmd python3 -c "
+import sys
+serial = b'$serial'
+flight = int('$flight')
+body = bytearray(24)
+body[5:5+min(12, len(serial))] = serial[:12]
+body[20] = (flight >> 8) & 0xFF
+body[21] = flight & 0xFF
+rec = bytes([0xEA, 0x4C, 0x00, 0x1C]) + bytes(body)
+with open('$path', 'ab') as f: f.write(rec)
+"
+}
+
+# Write a DSU-style flight file (realistic directory structure).
+# File ends with a valid 0x4C record so the content-based parser extracts
+# serial+flight from it (replicates how a real DSU file looks at the tail).
 write_dsu_file() {
     local flight="$1" size_kb="$2"
     local date_str=$(date +%Y%m%d)
@@ -114,7 +135,8 @@ write_dsu_file() {
     if [ "$TARGET" = "emulator" ]; then
         mkdir -p "$SD_EMU/flightHistory"
         dd if=/dev/urandom of="$SD_EMU/flightHistory/$fname" bs=1K count="$size_kb" 2>/dev/null
-        log "  Wrote flightHistory/$fname (${size_kb}KB)"
+        append_eaofh_trailer "$SD_EMU/flightHistory/$fname" "$SERIAL" "$flight"
+        log "  Wrote flightHistory/$fname (${size_kb}KB + 28B trailer)"
     else
         local sddev=""
         for w in $(seq 1 90); do
@@ -125,8 +147,9 @@ write_dsu_file() {
         sudo mount -o noatime "$sddev" /mnt 2>/dev/null || return 1
         sudo mkdir -p /mnt/flightHistory
         sudo dd if=/dev/urandom of="/mnt/flightHistory/$fname" bs=1K count="$size_kb" 2>/dev/null
+        append_eaofh_trailer "/mnt/flightHistory/$fname" "$SERIAL" "$flight" "sudo"
         sync; sudo umount /mnt 2>/dev/null
-        log "  Wrote flightHistory/$fname (${size_kb}KB) to USB drive"
+        log "  Wrote flightHistory/$fname (${size_kb}KB + 28B trailer) to USB drive"
     fi
 }
 
@@ -394,6 +417,7 @@ else
         echo "skip" | sudo tee /mnt/Thumbs.db >/dev/null
         sudo mkdir -p /mnt/flightHistory
         sudo dd if=/dev/urandom of="/mnt/flightHistory/${SERIAL}_01506_$(date +%Y%m%d).eaofh" bs=1K count=100 2>/dev/null
+        append_eaofh_trailer "/mnt/flightHistory/${SERIAL}_01506_$(date +%Y%m%d).eaofh" "$SERIAL" "01506" "sudo"
         sync; sudo umount /mnt 2>/dev/null
         if wait_for_s3_file "flightHistory__${SERIAL}_01506" 180; then
             pass "System files: real file uploaded"
@@ -459,9 +483,10 @@ if [ "$TARGET" = "emulator" ]; then
     rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory" "$SD_EMU/metrics"
     rm -f "$SD_EMU/dsuCookie.easdf" "$SD_EMU"/*.bin
     start_device 5
-    # Write DSU-style files
+    # Write DSU-style files (with valid 0x4C trailer for content parser)
     mkdir -p "$SD_EMU/flightHistory"
     dd if=/dev/urandom of="$SD_EMU/flightHistory/${SERIAL}_01601_$(date +%Y%m%d).eaofh" bs=1K count=100 2>/dev/null
+    append_eaofh_trailer "$SD_EMU/flightHistory/${SERIAL}_01601_$(date +%Y%m%d).eaofh" "$SERIAL" "01601"
     log "  Flight file dropped..."
     sleep 30  # detect + quiet window + harvest
     if [ -f "$SD_EMU/dsuCookie.easdf" ]; then

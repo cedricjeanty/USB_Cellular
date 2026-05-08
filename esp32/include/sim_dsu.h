@@ -10,7 +10,7 @@
 #include <string>
 #include <sys/stat.h>
 
-#include "airbridge_proto.h"  // for buildDsuCookie, parseDsuFilename
+#include "airbridge_proto.h"  // for buildDsuCookie, lastRecordFromLog
 
 class SimDSU {
 public:
@@ -96,9 +96,11 @@ public:
             // Copy from real data file
             r.bytesWritten = copyFile(sourceFile, fhPath);
         } else {
-            // Generate random data
+            // Generate random data with a valid 0x4C trailer record so the
+            // firmware's content-based parser can extract serial+flight.
             uint32_t targetBytes = (uint32_t)(sizeMb * 1024 * 1024);
-            r.bytesWritten = generateFile(fhPath, targetBytes);
+            if (targetBytes < 28) targetBytes = 28;
+            r.bytesWritten = generateFile(fhPath, targetBytes, serial, nextFlight);
         }
 
         if (r.bytesWritten == 0) {
@@ -146,12 +148,20 @@ private:
         return total;
     }
 
-    uint32_t generateFile(const char* path, uint32_t size) {
+    // Generate random bytes ending in a valid DSU 0x4C summary record so the
+    // backward-scan content parser can extract serial+flight. Total file size
+    // is exactly `size` bytes (random portion shrinks to make room for the
+    // 28-byte trailer). Pass nullptr/0 to skip the trailer.
+    uint32_t generateFile(const char* path, uint32_t size,
+                          const char* sn = nullptr, uint32_t flight = 0) {
         FILE* f = fopen(path, "wb");
         if (!f) return 0;
 
+        const uint32_t TRAILER_LEN = 28;
+        uint32_t randomBytes = (sn && size >= TRAILER_LEN) ? (size - TRAILER_LEN) : size;
+
         uint8_t buf[8192];
-        uint32_t rem = size;
+        uint32_t rem = randomBytes;
         uint32_t seed = (uint32_t)time(nullptr);
         while (rem > 0) {
             uint32_t chunk = (rem < sizeof(buf)) ? rem : sizeof(buf);
@@ -166,6 +176,23 @@ private:
             if (writeSpeedKBps > 0) {
                 usleep(chunk * 1000 / writeSpeedKBps);
             }
+        }
+
+        if (sn && size >= TRAILER_LEN) {
+            uint8_t rec[TRAILER_LEN] = {};
+            rec[0] = 0xEA;            // sync
+            rec[1] = 0x4C;            // record type
+            rec[2] = (TRAILER_LEN >> 8) & 0xFF;
+            rec[3] = TRAILER_LEN & 0xFF;
+            // body[5:17] = serial ASCII NUL-padded
+            size_t snLen = strnlen(sn, 12);
+            memcpy(rec + 4 + 5, sn, snLen);
+            // body[20:22] = flight number BE16
+            uint16_t f16 = (uint16_t)flight;
+            rec[4 + 20] = (f16 >> 8) & 0xFF;
+            rec[4 + 21] = f16 & 0xFF;
+            fwrite(rec, 1, TRAILER_LEN, f);
+            fflush(f);
         }
         fclose(f);
         return size;

@@ -17,6 +17,22 @@ HAL* g_hal = nullptr;
 void setUp(void) { g_hal = &s_hal; s_fs.clear_all(); }
 void tearDown(void) {}
 
+// Build a minimal valid .eaofh payload: a single 0x4C record with the given
+// serial at body[5:17] and flight number at body[20:22].
+static std::string makeEaofh(const char* serial, uint16_t flight) {
+    const uint16_t RLEN = 28;  // 4-byte prefix + 24-byte body
+    std::string s(RLEN, '\0');
+    s[0] = (char)0xEA;
+    s[1] = (char)0x4C;
+    s[2] = (char)((RLEN >> 8) & 0xFF);
+    s[3] = (char)(RLEN & 0xFF);
+    size_t snLen = strnlen(serial, 12);
+    memcpy(&s[4 + 5], serial, snLen);
+    s[4 + 20] = (char)((flight >> 8) & 0xFF);
+    s[4 + 21] = (char)(flight & 0xFF);
+    return s;
+}
+
 // ── Harvest tests ───────────────────────────────────────────────────────────
 
 void test_harvest_empty_dir(void) {
@@ -76,13 +92,41 @@ void test_harvest_subdirectory_flattening(void) {
 }
 
 void test_harvest_eaofh_tracking(void) {
+    // Serial + flight come from the file *contents* (last 0x4C record),
+    // not from the filename. The filename is intentionally wrong here
+    // to prove content parsing is what's actually used.
     s_fs.add_dir("/sd");
-    s_fs.add_file_str("/sd/EA500.000243_01218_20260406.eaofh", "flight data");
-    s_fs.add_file_str("/sd/EA500.000243_01220_20260407.eaofh", "more data");
+    auto a = makeEaofh("EA500.000243", 1218);
+    auto b = makeEaofh("EA500.000243", 1220);
+    s_fs.add_file("/sd/wrong_filename_1.eaofh", a.data(), a.size());
+    s_fs.add_file("/sd/wrong_filename_2.eaofh", b.data(), b.size());
     HarvestResult r = harvestFiles("/sd", "/sd/upload", 1);
     TEST_ASSERT_EQUAL_UINT16(2, r.count);
     TEST_ASSERT_EQUAL_UINT32(1220, r.maxFlight);
     TEST_ASSERT_EQUAL_STRING("EA500.000243", r.dsuSerial);
+}
+void test_harvest_eaofh_partial_unparseable(void) {
+    // File is .eaofh but contains no valid record (e.g. write interrupted
+    // before any 0x0E/0x4C completed). Harvest should still copy the file
+    // but maxFlight/serial remain unset.
+    s_fs.add_dir("/sd");
+    s_fs.add_file_str("/sd/partial.eaofh", "garbage with no record");
+    HarvestResult r = harvestFiles("/sd", "/sd/upload", 1);
+    TEST_ASSERT_EQUAL_UINT16(1, r.count);
+    TEST_ASSERT_EQUAL_UINT32(0, r.maxFlight);
+    TEST_ASSERT_EQUAL_STRING("", r.dsuSerial);
+}
+void test_harvest_eaofh_serial_from_first_valid_file(void) {
+    // First file has no valid record (interrupted), second file has one.
+    // Harvest should report serial+flight from the second file.
+    s_fs.add_dir("/sd");
+    s_fs.add_file_str("/sd/aaa_first.eaofh", "interrupted no record here");
+    auto b = makeEaofh("EA500.000179", 2090);
+    s_fs.add_file("/sd/bbb_second.eaofh", b.data(), b.size());
+    HarvestResult r = harvestFiles("/sd", "/sd/upload", 1);
+    TEST_ASSERT_EQUAL_UINT16(2, r.count);
+    TEST_ASSERT_EQUAL_UINT32(2090, r.maxFlight);
+    TEST_ASSERT_EQUAL_STRING("EA500.000179", r.dsuSerial);
 }
 
 void test_harvest_multiple_files(void) {
@@ -157,8 +201,10 @@ void test_harvest_root_subdirectory_files(void) {
     // metrics/ is in skip list (DSU system files) — should NOT be harvested
     s_fs.add_dir("/sd");
     s_fs.add_dir("/sd/flightHistory");
-    s_fs.add_file_str("/sd/flightHistory/EA500.000243_01210_20260406.eaofh", "data1");
-    s_fs.add_file_str("/sd/flightHistory/EA500.000243_01211_20260407.eaofh", "data2");
+    auto a = makeEaofh("EA500.000243", 1210);
+    auto b = makeEaofh("EA500.000243", 1211);
+    s_fs.add_file("/sd/flightHistory/EA500.000243_01210_20260406.eaofh", a.data(), a.size());
+    s_fs.add_file("/sd/flightHistory/EA500.000243_01211_20260407.eaofh", b.data(), b.size());
     s_fs.add_file_str("/sd/metrics/dsuUsage.eacuf", "metrics");
     s_fs.add_dir("/sd/metrics");
 
@@ -181,6 +227,8 @@ int main(int argc, char** argv) {
     RUN_TEST(test_harvest_skips_empty_files);
     RUN_TEST(test_harvest_subdirectory_flattening);
     RUN_TEST(test_harvest_eaofh_tracking);
+    RUN_TEST(test_harvest_eaofh_partial_unparseable);
+    RUN_TEST(test_harvest_eaofh_serial_from_first_valid_file);
     RUN_TEST(test_harvest_multiple_files);
     RUN_TEST(test_harvest_sequential_folders);
     RUN_TEST(test_harvest_root_clean_after);

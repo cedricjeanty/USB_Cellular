@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260504130000"
+#define FW_VERSION "20260508093159"
 
 #include <cstring>
 #include <ctime>
@@ -613,6 +613,13 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
 
 static uint32_t g_msc_write_calls = 0;
 static uint32_t g_msc_write_reject = 0;
+// Per-boot MSC write cap. Limits the worst-case bulk transfer when the cookie
+// is missing or the DSU ignores it — prevents accidentally pulling an entire
+// flight history over cellular. Harvest still runs after the cap fires; the
+// next boot resumes from the cookie that harvest writes.
+static const uint64_t MSC_BOOT_CAP_BYTES = 100ULL * 1024 * 1024;
+static volatile uint64_t g_mscBytesWritten = 0;
+static volatile bool     g_mscCapHit = false;
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                             uint8_t *buffer, uint32_t bufsize) {
     (void)lun; (void)offset;
@@ -620,6 +627,7 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
     if (g_msc_write_calls == 1) log_write("SCSI: first WRITE10 lba=%lu len=%lu", (unsigned long)lba, (unsigned long)bufsize);
     if (lba + bufsize / 512 > msc_visible_sectors()) { g_msc_write_reject++; return -1; }
     if (!g_sd_ready || g_harvesting || g_msc_ejected) { g_msc_write_reject++; return -1; }
+    if (g_mscCapHit) { g_msc_write_reject++; return -1; }
     if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return -1;
     esp_err_t err = sdmmc_write_sectors(g_card, buffer, lba, bufsize / 512);
     xSemaphoreGive(g_sd_mutex);
@@ -629,6 +637,13 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
         g_writeDetected    = true;
         g_hostWasConnected = true;  // any write proves a host is connected
         g_hostWrittenMb   += bufsize / 1e6f;
+        g_mscBytesWritten += bufsize;
+        if (!g_mscCapHit && g_mscBytesWritten >= MSC_BOOT_CAP_BYTES) {
+            g_mscCapHit = true;
+            log_write("MSC: %llu MB cap reached — disconnecting USB; harvest will resume next boot",
+                      (unsigned long long)(g_mscBytesWritten / (1024 * 1024)));
+            tud_disconnect();
+        }
     }
     return (err == ESP_OK) ? (int32_t)bufsize : -1;
 }

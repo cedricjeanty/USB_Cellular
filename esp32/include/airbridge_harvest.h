@@ -16,6 +16,18 @@ struct HarvestResult {
     char     folder[8];      // e.g. "0001"
 };
 
+// HAL filesys adapter for lastRecordFromLog. Wraps a HAL file handle so the
+// content parser can do random-access reads via the same I/O abstraction.
+struct HalLogReader {
+    void* fh;            // HAL file handle (g_hal->filesys->open result)
+};
+inline uint32_t hal_read_at(void* ctx, uint64_t off, uint8_t* buf, uint32_t len) {
+    HalLogReader* r = (HalLogReader*)ctx;
+    if (!g_hal || !g_hal->filesys || !r->fh) return 0;
+    if (!g_hal->filesys->seek(r->fh, (long)off, 0 /* SEEK_SET */)) return 0;
+    return (uint32_t)g_hal->filesys->read(r->fh, buf, len);
+}
+
 // Walk srcDir, move files into destBase/NNNN/ (sequential subfolder).
 // Files are copied then deleted from source (move across mount points).
 // harvestNum: caller-provided sequential counter (read+increment NVS).
@@ -113,14 +125,25 @@ inline HarvestResult harvestFiles(const char* srcDir, const char* destBase,
             result.usedMb += fileMb;
             result.count++;
 
-            // Track DSU flight numbers from .eaofh files
+            // Track DSU flight numbers from .eaofh files via content scan.
+            // Backward-scan the *destination* copy (already-flushed) for the
+            // last 0x0E/0x4C record; pull serial + flight from body offsets.
             const char* ext = strrchr(ent.name, '.');
             if (ext && strcmp(ext, ".eaofh") == 0) {
-                char serial[44];
-                uint32_t fnum = 0;
-                if (parseDsuFilename(ent.name, serial, sizeof(serial), &fnum) && fnum > result.maxFlight) {
-                    result.maxFlight = fnum;
-                    strlcpy(result.dsuSerial, serial, sizeof(result.dsuSerial));
+                void* fh = g_hal->filesys->open(dst, "rb");
+                if (fh) {
+                    HalLogReader rdr = { fh };
+                    char serial[13] = {0};
+                    uint32_t fnum = 0;
+                    if (lastRecordFromLog(hal_read_at, &rdr, ent.size,
+                                          &fnum, serial, sizeof(serial))) {
+                        if (fnum > result.maxFlight) result.maxFlight = fnum;
+                        // Serial is identical across all .eaofh from one DSU;
+                        // record the first non-empty one we see.
+                        if (serial[0] && !result.dsuSerial[0])
+                            strlcpy(result.dsuSerial, serial, sizeof(result.dsuSerial));
+                    }
+                    g_hal->filesys->close(fh);
                 }
             }
         } else {
