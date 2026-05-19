@@ -10,7 +10,7 @@ harvest files when idle, and upload via cellular.
 
 **Hardware:** ESP32-S3-DevKitC-1 (4 MB flash, 2 MB PSRAM)
 
-**USB:** TinyUSB — MSC-only (PID 0x0002, avionics mode) or CDC+MSC (PID 0x0001, debug mode). Default is MSC-only. Drop `ENABLE_CDC` on SD to temporarily boot CDC+MSC (file is deleted, next boot reverts to MSC-only). In MSC-only mode, D+ is held low at boot via `tud_disconnect()` — host sees nothing (just power draw) until the 60s presentation delay elapses, then `tud_connect()` triggers first enumeration.
+**USB:** TinyUSB — MSC-only (PID 0x0002, avionics mode) or CDC+MSC (PID 0x0001, debug mode). Default is MSC-only. Drop `ENABLE_CDC` on SD to temporarily boot CDC+MSC (file is deleted, next boot reverts to MSC-only). In MSC-only mode, D+ is held low at boot via `tud_disconnect()` — host sees nothing (just power draw) until the 90s presentation delay elapses, then `tud_connect()` triggers first enumeration.
 
 **Cellular:** SIM7600 modem via UART (TX=43, RX=44, RTS=1, CTS=2), PPPoS. Hologram SIM. Runs at 3 Mbaud + HW flow control on PCB.
 
@@ -30,9 +30,9 @@ harvest files when idle, and upload via cellular.
 
 ### Duty Cycle
 
-1. **Boot:** MSC-only mode holds D+ low (USB invisible) for 60s minimum / 120s max.
+1. **Boot:** MSC-only mode holds D+ low (USB invisible) for 90s.
    Modem connects PPPoS in parallel. OTA check + S3 cookie fetch run first. USB
-   `tud_connect()` fires once OTA+cookie complete (min 60s) or timeout (120s).
+   `tud_connect()` fires once OTA+cookie complete OR 90s elapses, whichever first.
    Boot scan also checks for unharvested files in root AND subdirectories (e.g. `flightHistory/`).
 2. **DSU Cookie:** 78-byte binary (`dsuCookie.easdf`) on SD root tells aircraft DSU
    where to resume downloading flight logs. Written by firmware after harvest via

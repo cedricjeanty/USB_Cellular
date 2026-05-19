@@ -810,13 +810,25 @@ int main(int argc, char* argv[]) {
                     g_hal->filesys->closedir(dir);
                 };
                 countDir(SD_ROOT);
-                if (lastFileCount >= 0 && count > lastFileCount) {
-                    // New files detected — simulate USB write
+                bool newFiles = false;
+                if (lastFileCount < 0) {
+                    // Boot scan: check for files left behind by a power loss
+                    // (mirrors the firmware's app_main boot scan via shared
+                    // hasUnharvestedFiles() in airbridge_harvest.h).
+                    if (hasUnharvestedFiles(SD_ROOT)) {
+                        printf("[Boot] Unharvested files on SD — scheduling harvest\n");
+                        newFiles = true;
+                    }
+                } else if (count > lastFileCount) {
+                    // New files appeared while running — simulate USB write
+                    printf("[USB] New files detected (%d → %d)\n", lastFileCount, count);
+                    newFiles = true;
+                }
+                if (newFiles) {
                     s_writeDetected = true;
                     s_lastWriteMs = now;
                     s_hostWasConnected = true;
                     float newMb = 0;
-                    // Estimate total size
                     void* d2 = g_hal->filesys->opendir(SD_ROOT);
                     if (d2) {
                         FsDirEntry e2;
@@ -830,8 +842,6 @@ int main(int argc, char* argv[]) {
                         g_hal->filesys->closedir(d2);
                     }
                     ds.hostWrittenMb = newMb;
-                    printf("[USB] New files detected (%d → %d), %.1f MB\n",
-                           lastFileCount, count, newMb);
                 }
                 lastFileCount = count;
             }

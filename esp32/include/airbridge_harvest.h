@@ -28,6 +28,44 @@ inline uint32_t hal_read_at(void* ctx, uint64_t off, uint8_t* buf, uint32_t len)
     return (uint32_t)g_hal->filesys->read(r->fh, buf, len);
 }
 
+// Scan srcDir (root + one subdirectory level) for any harvestable files.
+// Returns true immediately on the first non-empty, non-skipped file found.
+// Used at boot to detect files left behind by a power loss mid-transfer.
+inline bool hasUnharvestedFiles(const char* srcDir) {
+    if (!g_hal || !g_hal->filesys) return false;
+    void* dir = g_hal->filesys->opendir(srcDir);
+    if (!dir) return false;
+    bool found = false;
+    FsDirEntry ent;
+    while (!found && g_hal->filesys->readdir(dir, &ent)) {
+        if (ent.name[0] == '.') continue;
+        if (strcmp(ent.name, "upload") == 0) continue;
+        if (isSkipped(ent.name)) continue;
+        char fp[160];
+        snprintf(fp, sizeof(fp), "%s/%s", srcDir, ent.name);
+        uint32_t sz = 0; bool isDir = false;
+        g_hal->filesys->stat(fp, &sz, &isDir);
+        if (isDir) {
+            void* sub = g_hal->filesys->opendir(fp);
+            if (!sub) continue;
+            FsDirEntry se;
+            while (g_hal->filesys->readdir(sub, &se)) {
+                if (se.name[0] == '.') continue;
+                char sfp[256];
+                snprintf(sfp, sizeof(sfp), "%s/%s", fp, se.name);
+                uint32_t ssz = 0; bool sd = false;
+                g_hal->filesys->stat(sfp, &ssz, &sd);
+                if (!sd && ssz > 0) { found = true; break; }
+            }
+            g_hal->filesys->closedir(sub);
+        } else if (sz > 0) {
+            found = true;
+        }
+    }
+    g_hal->filesys->closedir(dir);
+    return found;
+}
+
 // Walk srcDir, move files into destBase/NNNN/ (sequential subfolder).
 // Files are copied then deleted from source (move across mount points).
 // harvestNum: caller-provided sequential counter (read+increment NVS).

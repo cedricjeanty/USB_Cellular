@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260508093159"
+#define FW_VERSION "20260510175521"
 
 #include <cstring>
 #include <ctime>
@@ -4039,10 +4039,11 @@ static void processCLI(const char* cmd) {
 static void main_loop_task(void* param) {
     (void)param;
 
-    // USB presentation: minimum 60s (aircraft DSU timing), maximum 120s.
-    // Present early if upload task signals OTA+cookie are done (g_preUsbDone).
-    #define USB_MIN_DELAY_MS  60000
-    #define USB_MAX_DELAY_MS 120000
+    // USB presentation: 90s after boot (aircraft DSU timing). OTA+cookie checks
+    // share the same deadline — they must complete before USB enumerates, so
+    // there's no benefit to waiting longer if they're still in flight.
+    #define USB_MIN_DELAY_MS 90000
+    #define USB_MAX_DELAY_MS 90000
     uint32_t usbPresentMs = millis();
 
     for (;;) {
@@ -4058,7 +4059,7 @@ static void main_loop_task(void* param) {
             vTaskDelay(pdMS_TO_TICKS(30000));  // 30s cooldown for modem cold boot
         }
 
-        // Enable USB MSC: present when pre-USB tasks done (min 60s) or timeout (120s)
+        // Enable USB MSC: present when pre-USB tasks done OR 90s timeout elapses
         if (!g_sd_ready && g_card_sectors > 0) {
             uint32_t elapsed = millis() - usbPresentMs;
             bool minElapsed = (elapsed >= USB_MIN_DELAY_MS);
@@ -4475,7 +4476,7 @@ extern "C" void app_main(void) {
         }
 
         if (g_card_sectors > 0) {
-            // Delay USB presentation to host by 60s — aircraft DSU needs
+            // Delay USB presentation to host by 90s — aircraft DSU needs
             // the device to appear after boot, not during boot.
             // g_sd_ready stays false; a timer in main_loop_task enables it.
             g_sd_ready = false;
@@ -4694,10 +4695,6 @@ extern "C" void app_main(void) {
     // For dual-partition: scan partition 1 (DSU side) by temp-mounting at /dsu.
     // For single partition: scan /sdcard root as before.
     if (g_fatfs_mounted) {
-        bool found = false;
-        const char* foundPath = nullptr;
-        static char foundPathBuf[96];
-
         const char* scanRoot = SD_MOUNT;
         bool dsu_tmp = false;
         if (g_dual_partition) {
@@ -4707,47 +4704,14 @@ extern "C" void app_main(void) {
             }
         }
 
-        DIR* rootDir = opendir(scanRoot);
-        if (rootDir) {
-            struct dirent* ent;
-            while ((ent = readdir(rootDir)) != nullptr) {
-                if (ent->d_name[0] == '.') continue;
-                if (isSkipped(ent->d_name)) continue;
-
-                if (ent->d_type == DT_DIR) {
-                    char subPath[96];
-                    snprintf(subPath, sizeof(subPath), "%s/%s", scanRoot, ent->d_name);
-                    DIR* sub = opendir(subPath);
-                    if (!sub) continue;
-                    struct dirent* subEnt;
-                    while ((subEnt = readdir(sub)) != nullptr) {
-                        if (subEnt->d_name[0] == '.') continue;
-                        snprintf(foundPathBuf, sizeof(foundPathBuf), "%s/%s",
-                                 ent->d_name, subEnt->d_name);
-                        foundPath = foundPathBuf;
-                        found = true;
-                        break;
-                    }
-                    closedir(sub);
-                    if (found) break;
-                } else {
-                    foundPath = ent->d_name;
-                    found = true;
-                    break;
-                }
-            }
-            closedir(rootDir);
-        }
-
-        if (dsu_tmp) unmount_dsu();
-
-        if (found) {
-            ESP_LOGI(TAG, "Boot: unharvested file: %s — triggering harvest",
-                     foundPath ? foundPath : "?");
+        if (hasUnharvestedFiles(scanRoot)) {
+            log_write("Boot: unharvested files on SD — triggering harvest");
             g_writeDetected = true;
             g_hostWasConnected = true;
             g_lastWriteMs = millis();
         }
+
+        if (dsu_tmp) unmount_dsu();
     }
 
     // ── Boot splash (10s) — uses shared dispBootSplash() ──────────────

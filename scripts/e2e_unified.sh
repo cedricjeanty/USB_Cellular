@@ -721,6 +721,155 @@ else
     log "  (skip test only runs in emulator)"
 fi
 
+# ── TEST 13: Power loss during transfer — partial file harvested on reboot ────
+log ""; log "TEST 13: Power loss mid-transfer + cookie on reboot"
+if [ "$TARGET" = "emulator" ]; then
+    # Clean state
+    rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory"
+    rm -f "$SD_EMU/dsuCookie.easdf" "$FW_DIR/emu_nvs.dat"
+
+    # Phase 1: device is running, DSU drops a partial file into the SD root,
+    # then power is cut before the 15s harvest quiet window closes.
+    start_device
+    mkdir -p "$SD_EMU/flightHistory"
+    PARTIAL_FILE="$SD_EMU/flightHistory/${SERIAL}_01700_$(date +%Y%m%d).eaofh"
+    python3 -c "
+import os
+serial = b'$SERIAL'
+def make_record(flight):
+    body = bytearray(24)
+    body[5:5+min(12,len(serial))] = serial[:12]
+    body[20] = (flight >> 8) & 0xFF
+    body[21] = flight & 0xFF
+    return bytes([0xEA, 0x4C, 0x00, 0x1C]) + bytes(body)
+# 50KB random preamble + last complete record (1700) + truncated header at tail.
+# Backward scanner rejects the truncated header (length overruns EOF), then
+# finds record(1700) whose framing check passes (truncated header starts 0xEA).
+data  = os.urandom(50 * 1024)
+data += make_record(1699)
+data += make_record(1700)
+data += bytes([0xEA, 0x4C, 0x00, 0x1C, 0x00, 0x00])
+open('$PARTIAL_FILE', 'wb').write(data)
+"
+    log "  Partial file written (50KB + record(1699) + record(1700) + truncated tail)"
+    sleep 4  # scanner detects new file within 2s poll interval
+
+    # Hard kill before 15s harvest quiet window fires
+    power_cut
+    sleep 2
+
+    # Phase 2: device reboots with partial file still on SD.
+    # Boot scan (first poll cycle) detects the pre-existing file and schedules
+    # harvest; after 15s quiet window harvest runs and writes the cookie.
+    start_device
+    sleep 20  # boot-scan fires at ~2s, harvest at ~17s, cookie written ~18s
+
+    if [ -f "$SD_EMU/dsuCookie.easdf" ]; then
+        FLIGHT=$(python3 -c "
+import struct
+data = open('$SD_EMU/dsuCookie.easdf', 'rb').read()
+print(struct.unpack('>I', data[62:66])[0])
+")
+        if [ "$FLIGHT" = "1700" ]; then
+            pass "Power-loss recovery: cookie flight=$FLIGHT matches partial file"
+        else
+            fail "Power-loss recovery: cookie flight=$FLIGHT (want 1700)"
+        fi
+    else
+        fail "Power-loss recovery: no cookie written after reboot harvest"
+    fi
+    stop_device
+
+    # Phase 3: next connection resumes from the cookie — new file continues
+    # from flight 1701 and cookie advances.
+    rm -rf "$SD_EMU/flightHistory"
+    start_device
+    write_dsu_file "01701" 50
+    sleep 30  # scanner detects at ~2s, harvest at ~17s
+    if [ -f "$SD_EMU/dsuCookie.easdf" ]; then
+        FLIGHT2=$(python3 -c "
+import struct
+data = open('$SD_EMU/dsuCookie.easdf', 'rb').read()
+print(struct.unpack('>I', data[62:66])[0])
+")
+        if [ "$FLIGHT2" = "1701" ]; then
+            pass "Power-loss recovery: next transfer advances cookie to flight=$FLIGHT2"
+        else
+            fail "Power-loss recovery: next transfer cookie=$FLIGHT2 (want 1701)"
+        fi
+    else
+        fail "Power-loss recovery: no cookie after continuation"
+    fi
+    stop_device
+else
+    skip "Power-loss recovery: emulator-only test"
+fi
+
+# ── TEST 14: OTA power cut + recovery ────────────────────────────────────────
+log ""; log "TEST 14: OTA power cut mid-download + recovery on reboot"
+if [ "$TARGET" = "emulator" ]; then
+    # Deploy a new firmware version so OTA kicks off.
+    V_OTA="$(date +%Y%m%d%H%M%S)"
+    deploy_ota "$V_OTA"
+    rm -f "$FW_DIR/emu_ota_update.bin" "$FW_DIR/emu_nvs.dat"
+
+    # Boot 1: OTA download starts within seconds of PPP up. Cut power after
+    # ~10s so the download is likely in progress but not finished.
+    start_device
+    sleep 10
+    power_cut
+    sleep 2
+    log "  Power cut mid-OTA; emu_ota_update.bin present: $([ -f $FW_DIR/emu_ota_update.bin ] && echo yes || echo no)"
+
+    # Boot 2: OTA should retry and complete (firmware only switches partition
+    # at the very end of a successful download, so a mid-download cut is safe).
+    start_device
+    for i in $(seq 1 30); do
+        sleep 2
+        [ -f "$FW_DIR/emu_ota_update.bin" ] && break
+    done
+    if [ -f "$FW_DIR/emu_ota_update.bin" ]; then
+        pass "OTA power-cut recovery: download completed on reboot"
+    elif grep -q "up to date\|Up to date" /tmp/emu_e2e.log 2>/dev/null; then
+        pass "OTA power-cut recovery: device reports up to date"
+    else
+        fail "OTA power-cut recovery: OTA did not complete on reboot"
+    fi
+    stop_device
+    deploy_ota "$(grep '^#define FW_VERSION' "$FW_DIR/src/main.cpp" | grep -o '"[^"]*"' | tr -d '"')"
+else
+    skip "OTA power-cut recovery: emulator-only test"
+fi
+
+# ── TEST 15: Multipart upload power cut + NVS resume ─────────────────────────
+log ""; log "TEST 15: Multipart upload power cut + NVS resume"
+if [ "$TARGET" = "emulator" ]; then
+    # >5 MB triggers multipart upload (S3_CHUNK_SIZE = 5 MB). Use 10 MB so
+    # the device is reliably mid-first-part when we cut power at ~40s.
+    cleanup_s3
+    rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory"
+    rm -f "$SD_EMU"/*.bin "$SD_EMU"/*.easdf "$FW_DIR/emu_nvs.dat"
+
+    start_device
+    write_dsu_file "01800" 10240  # 10 MB
+    log "  10 MB file written; harvest in ~15s, upload starts after..."
+    sleep 40  # harvest(15s) + upload start + in-progress first 5 MB part
+    power_cut
+    sleep 2
+    log "  Power cut mid-upload; NVS should have multipart resume state"
+
+    # Reboot: upload task reads NVS resume state, continues from last part.
+    start_device
+    if wait_for_upload "flightHistory__${SERIAL}_01800" 300; then
+        pass "Multipart resume: upload completed after power cut"
+    else
+        fail "Multipart resume: upload did not complete after power cut"
+    fi
+    stop_device
+else
+    skip "Multipart resume: emulator-only test"
+fi
+
 # ── TEST 11: Boot splash ─────────────────────────────────────────────────────
 log ""; log "TEST 11: Boot splash"
 if [ "$TARGET" = "emulator" ]; then
