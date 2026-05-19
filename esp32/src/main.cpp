@@ -337,6 +337,7 @@ static volatile bool     g_sd_ready = false;
 
 static volatile bool     g_hostConnected    = false;
 static volatile bool     g_hostWasConnected = false;
+static volatile bool     g_bootHarvestPending = false; // set by boot scan; bypasses quiet window
 static volatile uint32_t g_lastIoMs         = 0;
 static volatile uint32_t g_lastWriteMs      = 0;
 static volatile bool     g_writeDetected    = false;
@@ -4122,10 +4123,12 @@ static void main_loop_task(void* param) {
         // Snapshot volatile write timestamp to avoid race with MSC callback
         uint32_t lastWr = g_lastWriteMs;
         if (shouldHarvest(g_harvesting, g_writeDetected, g_hostWasConnected,
-                          lastWr, g_lastHarvestMs, g_harvestCoolMs, now)) {
-            cdc_printf("Harvest: %.1f KB written, %us idle\r\n",
-                     g_hostWrittenMb * 1024.0f, (now - lastWr) / 1000);
-            log_write("Harvest trigger: %.1fKB, %us idle", g_hostWrittenMb * 1024.0f, (now - lastWr) / 1000);
+                          lastWr, g_lastHarvestMs, g_harvestCoolMs, now, g_bootHarvestPending)) {
+            if (g_bootHarvestPending)
+                log_write("Harvest trigger: boot scan (no quiet window)");
+            else
+                log_write("Harvest trigger: %.1fKB, %us idle", g_hostWrittenMb * 1024.0f, (now - lastWr) / 1000);
+            g_bootHarvestPending = false;
             if (g_harvest_task) xTaskNotifyGive(g_harvest_task);
         }
         // Periodic STATUS log (every 60s) — replaces CLI STATUS command
@@ -4708,7 +4711,7 @@ extern "C" void app_main(void) {
             log_write("Boot: unharvested files on SD — triggering harvest");
             g_writeDetected = true;
             g_hostWasConnected = true;
-            g_lastWriteMs = millis();
+            g_bootHarvestPending = true;  // pre-existing files need no quiet window
         }
 
         if (dsu_tmp) unmount_dsu();

@@ -116,6 +116,7 @@ static bool     s_writeDetected = false;
 static bool     s_hostWasConnected = false;
 static bool     s_harvesting = false;
 static uint32_t s_lastWriteMs = 0;
+static bool     s_bootHarvestPending = false;
 static uint32_t s_lastHarvestMs = 0;
 static uint32_t s_harvestCoolMs = 30000;  // initial cooldown, then QUIET_WINDOW_MS
 
@@ -817,6 +818,7 @@ int main(int argc, char* argv[]) {
                     // hasUnharvestedFiles() in airbridge_harvest.h).
                     if (hasUnharvestedFiles(SD_ROOT)) {
                         printf("[Boot] Unharvested files on SD — scheduling harvest\n");
+                        s_bootHarvestPending = true;  // bypass quiet window
                         newFiles = true;
                     }
                 } else if (count > lastFileCount) {
@@ -826,7 +828,7 @@ int main(int argc, char* argv[]) {
                 }
                 if (newFiles) {
                     s_writeDetected = true;
-                    s_lastWriteMs = now;
+                    if (!s_bootHarvestPending) s_lastWriteMs = now;
                     s_hostWasConnected = true;
                     float newMb = 0;
                     void* d2 = g_hal->filesys->opendir(SD_ROOT);
@@ -849,9 +851,13 @@ int main(int argc, char* argv[]) {
 
         // Harvest trigger — uses shared shouldHarvest() (same logic as firmware)
         if (shouldHarvest(s_harvesting, s_writeDetected, s_hostWasConnected,
-                          s_lastWriteMs, s_lastHarvestMs, s_harvestCoolMs, now)) {
-            printf("[Harvest] Triggering (%.1f MB written, %us idle)\n",
-                   ds.hostWrittenMb, (now - s_lastWriteMs) / 1000);
+                          s_lastWriteMs, s_lastHarvestMs, s_harvestCoolMs, now, s_bootHarvestPending)) {
+            if (s_bootHarvestPending)
+                printf("[Harvest] Triggering (boot scan — no quiet window)\n");
+            else
+                printf("[Harvest] Triggering (%.1f MB written, %us idle)\n",
+                       ds.hostWrittenMb, (now - s_lastWriteMs) / 1000);
+            s_bootHarvestPending = false;
             s_harvesting = true;
 
             char destDir[256];
