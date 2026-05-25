@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260518130000"
+#define FW_VERSION "20260525120000"
 
 #include <cstring>
 #include <ctime>
@@ -3091,6 +3091,10 @@ static void modemTask(void* param) {
                 test_launched = false;
                 cdc_printf("Modem: PPP CONNECT — negotiating...\r\n");
                 log_write("Modem: PPP redial CONNECT");
+                // Restart lwIP PPP state machine — after a drop+CFUN reset the
+                // netif is in DEAD/STOPPED state and ignores incoming LCP frames
+                // until esp_netif_action_connected() puts it back to STARTING.
+                esp_netif_action_connected(g_ppp_netif, nullptr, 0, nullptr);
             } else if (!rr.registered) {
                 cdc_printf("Modem: registration timeout — retry in 60s\r\n");
                 log_write("Modem: reconnect reg timeout");
@@ -3129,12 +3133,14 @@ static void modemTask(void* param) {
         uint32_t sinceConnect = pppConnectMs ? (millis() - pppConnectMs) : 0;
         bool firstUpload = (lastLogUploadMs == 0 && sinceConnect > 30000);
 
-        // Flush RAM log to SD file (every 30s, needs SD mutex, skip if MSC busy)
+        // Flush RAM log to SD file (every 30s, needs SD mutex)
+        // Use 500ms timeout — 50ms was too tight when USB MSC held the SPI bus,
+        // causing silent flush failures and ring-buffer wrap after ~10 minutes.
         {
             static uint32_t lastFlushMs = 0;
             if (s_loglen > 0 && g_fatfs_mounted && !g_harvesting &&
                 (millis() - lastFlushMs) > 30000) {
-                if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
                     log_flush_to_sd();
                     xSemaphoreGive(g_sd_mutex);
                     lastFlushMs = millis();
