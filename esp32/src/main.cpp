@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260525120000"
+#define FW_VERSION "20260525130000"
 
 #include <cstring>
 #include <ctime>
@@ -977,6 +977,28 @@ static void sd_unmount_fatfs() {
 static bool sd_reinit_and_mount() {
     sd_unmount_fatfs();
     return sd_mount_fatfs();
+}
+
+// Call before esp_restart() to tear down SPI cleanly.
+// Without this, soft reset (used by OTA) leaves the SPI DMA channel and GPIO
+// matrix in a partially-initialized state. On next boot, spi_bus_initialize()
+// may fail or the SD card won't respond, blocking FATFS for minutes.
+static void sd_before_restart() {
+    // Unmount FATFS first (flushes and unregisters VFS/diskio)
+    if (g_fatfs_mounted) {
+        if (g_dual_partition) {
+            f_mount(NULL, "1:", 0);
+            esp_vfs_fat_unregister_path(SD_MOUNT);
+            ff_diskio_unregister(1);
+            ff_diskio_unregister(0);
+        } else {
+            esp_vfs_fat_sdcard_unmount(SD_MOUNT, g_card);
+        }
+        g_fatfs_mounted = false;
+    }
+    // Free the SPI bus — resets DMA descriptors and GPIO matrix mux state.
+    // Ignore return value: we're restarting regardless.
+    spi_bus_free(g_spi_host);
 }
 
 // ── NVS helpers ─────────────────────────────────────────────────────────────
@@ -3064,6 +3086,8 @@ static void modemTask(void* param) {
             g_pppNeedsReconnect = true;
         }
         if (pppStale || g_pppNeedsReconnect) {
+            static int s_reconnect_failures = 0;
+
             if (pppStale) {
                 cdc_printf("Modem: no PPP data for 30s — reconnecting\r\n");
                 log_write("Modem: PPP stale — reconnecting");
@@ -3076,8 +3100,22 @@ static void modemTask(void* param) {
             g_pppConnected = false;
             // Keep g_modemRssi — display shows last-known signal during reconnect
 
-            cdc_printf("Modem: reconnecting...\r\n");
-            ModemReconnectResult rr = modemReconnect();
+            // Only do CFUN=0/1 radio reset on first attempt and every 5th after.
+            // Repeated resets degrade the SIM7600 — soft reconnect is tried first.
+            bool doRadioReset = (s_reconnect_failures % 5 == 0);
+            // After 10+ failures (2+ radio resets), add increasing wait before reset.
+            if (doRadioReset && s_reconnect_failures >= 10) {
+                uint32_t backoffS = std::min<uint32_t>(300u, 30u * (uint32_t)(s_reconnect_failures / 5));
+                log_write("Modem: backoff %lus before radio reset (failure #%d)",
+                          (unsigned long)backoffS, s_reconnect_failures);
+                cdc_printf("Modem: backoff %lus before radio reset\r\n", (unsigned long)backoffS);
+                vTaskDelay(pdMS_TO_TICKS(backoffS * 1000));
+            }
+            log_write("Modem: reconnect attempt %d (%s)",
+                      s_reconnect_failures + 1, doRadioReset ? "full reset" : "soft");
+            cdc_printf("Modem: reconnecting (attempt %d, %s)...\r\n",
+                       s_reconnect_failures + 1, doRadioReset ? "full reset" : "soft");
+            ModemReconnectResult rr = modemReconnect(doRadioReset);
 
             if (rr.registered) {
                 g_modemRssi = rr.rssi;
@@ -3087,6 +3125,7 @@ static void modemTask(void* param) {
             }
 
             if (rr.connected) {
+                s_reconnect_failures = 0;
                 lastPppRxMs = millis();
                 test_launched = false;
                 cdc_printf("Modem: PPP CONNECT — negotiating...\r\n");
@@ -3096,11 +3135,13 @@ static void modemTask(void* param) {
                 // until esp_netif_action_connected() puts it back to STARTING.
                 esp_netif_action_connected(g_ppp_netif, nullptr, 0, nullptr);
             } else if (!rr.registered) {
+                s_reconnect_failures++;
                 cdc_printf("Modem: registration timeout — retry in 60s\r\n");
                 log_write("Modem: reconnect reg timeout");
                 vTaskDelay(pdMS_TO_TICKS(60000));
                 g_pppNeedsReconnect = true;
             } else {
+                s_reconnect_failures++;
                 log_write("Modem: reconnect failed — retry in 60s");
                 cdc_printf("Modem: reconnect failed, retry in 60s\r\n");
                 vTaskDelay(pdMS_TO_TICKS(60000));
@@ -3307,6 +3348,7 @@ static void uploadTask(void* param) {
                     log_write("SD flash: success — rebooting");
                     cdc_printf("SD flash: OK — rebooting\r\n");
                     vTaskDelay(pdMS_TO_TICKS(1000));
+                    sd_before_restart();
                     esp_restart();
                 } else {
                     esp_ota_abort(oh);
@@ -3366,6 +3408,7 @@ static void uploadTask(void* param) {
             log_write("OTA: rebooting to apply update");
             cdc_printf("OTA: rebooting...\r\n");
             vTaskDelay(pdMS_TO_TICKS(1000));
+            sd_before_restart();
             esp_restart();
         }
     }
@@ -3888,6 +3931,7 @@ static void processCLI(const char* cmd) {
             if (result == 1) {
                 cdc_printf("OTA: downloaded — rebooting in 3s\r\n");
                 vTaskDelay(pdMS_TO_TICKS(10000));
+                sd_before_restart();
                 esp_restart();
             } else if (result == 0) {
                 cdc_printf("OTA: up to date\r\n");
@@ -3946,6 +3990,7 @@ static void processCLI(const char* cmd) {
                 if (ok && esp_ota_end(oh) == ESP_OK && esp_ota_set_boot_partition(update) == ESP_OK) {
                     cdc_printf("SDFLASH: success — rebooting\r\n");
                     vTaskDelay(pdMS_TO_TICKS(1000));
+                    sd_before_restart();
                     esp_restart();
                 } else {
                     esp_ota_abort(oh);
@@ -3958,6 +4003,7 @@ static void processCLI(const char* cmd) {
     } else if (strcmp(cmd, "REBOOT") == 0) {
         cdc_printf("CLI: rebooting...\r\n");
         vTaskDelay(pdMS_TO_TICKS(200));
+        sd_before_restart();
         esp_restart();
 
     } else if (strcmp(cmd, "MODEM") == 0) {
@@ -4413,6 +4459,7 @@ extern "C" void app_main(void) {
             remove(path);
             airbridge_log("SD: REBOOT found — rebooting");
             vTaskDelay(pdMS_TO_TICKS(500));
+            sd_before_restart();
             esp_restart();
         }
     }

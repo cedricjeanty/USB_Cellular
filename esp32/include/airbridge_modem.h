@@ -27,24 +27,30 @@ struct ModemReconnectResult {
 };
 
 // Reconnect PPP after a connection drop.
-// Escapes data mode, resets radio, waits for registration,
-// re-sets APN, and redials PPP.
-inline ModemReconnectResult modemReconnect() {
+// resetRadio=true: full CFUN=0/1 power-cycle (use sparingly — repeated resets
+//   degrade the SIM7600 and can leave it unresponsive for 30+ minutes).
+// resetRadio=false: soft reconnect — just hang up and re-register without
+//   cycling the radio (preferred for first few retry attempts).
+inline ModemReconnectResult modemReconnect(bool resetRadio = true) {
     ModemReconnectResult r = {};
     char resp[256];
 
-    // 1. Escape PPP data mode
-    g_hal->clock->delay_ms(1100);
-    mdm_write("+++", 3);
-    g_hal->clock->delay_ms(1100);
-    mdm_flush();
-
-    // 2. Hang up + reset radio
-    modem_at_cmd("ATH", resp, sizeof(resp), 2000);
-    modem_at_cmd("AT+CFUN=0", resp, sizeof(resp), 5000);
-    g_hal->clock->delay_ms(10000);
-    modem_at_cmd("AT+CFUN=1", resp, sizeof(resp), 5000);
-    g_hal->clock->delay_ms(5000);
+    if (resetRadio) {
+        // Full reset: escape PPP data mode, hang up, power-cycle radio
+        g_hal->clock->delay_ms(1100);
+        mdm_write("+++", 3);
+        g_hal->clock->delay_ms(1100);
+        mdm_flush();
+        modem_at_cmd("ATH", resp, sizeof(resp), 2000);
+        modem_at_cmd("AT+CFUN=0", resp, sizeof(resp), 5000);
+        g_hal->clock->delay_ms(10000);
+        modem_at_cmd("AT+CFUN=1", resp, sizeof(resp), 5000);
+        g_hal->clock->delay_ms(5000);
+    } else {
+        // Soft reconnect: hang up (in case still in dial state) and re-register
+        modem_at_cmd("ATH", resp, sizeof(resp), 2000);
+        g_hal->clock->delay_ms(1000);
+    }
 
     // 3. Wait for registration (up to 60s)
     for (int w = 0; w < 30; w++) {
