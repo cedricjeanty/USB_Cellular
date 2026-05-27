@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260526130000"
+#define FW_VERSION "20260526140000"
 
 #include <cstring>
 #include <ctime>
@@ -2564,19 +2564,10 @@ static void modem_ip_event_handler(void* arg, esp_event_base_t event_base,
         cdc_printf("Modem: PPP IP=" IPSTR "\r\n", IP2STR(&event->ip_info.ip));
         log_write("PPP got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         g_pppConnected = true;
-
-        // Log carrier-assigned DNS servers and inject 8.8.8.8 as backup.
-        // T-Mobile/Hologram NAT tables expire UDP/53 state after ~5 minutes,
-        // causing carrier DNS to fail mid-session. 8.8.8.8 bypasses this.
-        esp_netif_dns_info_t dns_main = {}, dns_backup = {};
-        if (esp_netif_get_dns_info(g_ppp_netif, ESP_NETIF_DNS_MAIN, &dns_main) == ESP_OK) {
-            log_write("PPP DNS main: " IPSTR, IP2STR(&dns_main.ip.u_addr.ip4));
-        }
-        dns_backup.ip.u_addr.ip4.addr = ipaddr_addr("8.8.8.8");
-        dns_backup.ip.type = ESP_IPADDR_TYPE_V4;
-        esp_netif_set_dns_info(g_ppp_netif, ESP_NETIF_DNS_BACKUP, &dns_backup);
-        log_write("PPP DNS backup: 8.8.8.8");
-
+        // DNS backup (8.8.8.8) is configured in the modem task loop after the
+        // interface is fully set up — not here, to avoid potential IPC deadlock
+        // if esp_netif_set_dns_info dispatches to the lwIP core while the event
+        // loop is already holding related locks.
     } else if (event_id == IP_EVENT_PPP_LOST_IP) {
         cdc_printf("Modem: PPP lost IP\r\n");
         log_write("PPP lost IP");
@@ -3081,6 +3072,19 @@ static void modemTask(void* param) {
             if (ppp_lwip_netif) netif_set_default(ppp_lwip_netif);
             esp_netif_set_default_netif(g_ppp_netif);
             cdc_printf("Modem: cellular ready — set as default route\r\n");
+
+            // Log carrier DNS and inject 8.8.8.8 as backup.
+            // Done here (modem task) rather than in the IP event handler to avoid
+            // potential IPC deadlock in the event loop context.
+            {
+                esp_netif_dns_info_t d = {};
+                if (esp_netif_get_dns_info(g_ppp_netif, ESP_NETIF_DNS_MAIN, &d) == ESP_OK)
+                    log_write("PPP DNS main: " IPSTR, IP2STR(&d.ip.u_addr.ip4));
+                d.ip.u_addr.ip4.addr = ipaddr_addr("8.8.8.8");
+                d.ip.type = ESP_IPADDR_TYPE_V4;
+                if (esp_netif_set_dns_info(g_ppp_netif, ESP_NETIF_DNS_BACKUP, &d) == ESP_OK)
+                    log_write("PPP DNS backup: 8.8.8.8");
+            }
             // Log filename already set at boot (boot_NNNN)
         }
 
