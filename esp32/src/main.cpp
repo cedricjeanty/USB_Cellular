@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260526170000"
+#define FW_VERSION "20260526180000"
 
 #include <cstring>
 #include <ctime>
@@ -386,7 +386,43 @@ static uint32_t g_p2_sectors       = 0;  // partition 2 size in sectors
 static FATFS*   g_p2_fs            = nullptr; // partition 2 FATFS object
 static const char* DSU_MOUNT       = "/dsu";  // temp mount point for partition 1
 
-// Custom diskio driver for partition 2: offsets all sector addresses
+// Custom diskio drivers for P1 and P2: each offsets sector addresses by the
+// partition's LBA start so f_mkfs/f_mount see a "disk" starting at the
+// partition data, not at the raw MBR.  Using FM_FAT32|FM_SFD with these
+// drivers places the FAT VBR directly at the partition start sector —
+// no nested "sub-MBR" is created inside the partition data area.
+static uint32_t g_p1_start_sector = 63;  // default; updated after f_fdisk
+
+// ── P1 (DSU partition) diskio ─────────────────────────────────────────────
+static DSTATUS p1_diskio_init(BYTE pdrv) { (void)pdrv; return 0; }
+static DSTATUS p1_diskio_status(BYTE pdrv) { (void)pdrv; return 0; }
+static DRESULT p1_diskio_read(BYTE pdrv, BYTE* buff, DWORD sector, UINT count) {
+    (void)pdrv;
+    return sdmmc_read_sectors(g_card, buff, sector + g_p1_start_sector, count)
+           == ESP_OK ? RES_OK : RES_ERROR;
+}
+static DRESULT p1_diskio_write(BYTE pdrv, const BYTE* buff, DWORD sector, UINT count) {
+    (void)pdrv;
+    return sdmmc_write_sectors(g_card, (void*)buff, sector + g_p1_start_sector, count)
+           == ESP_OK ? RES_OK : RES_ERROR;
+}
+static DRESULT p1_diskio_ioctl(BYTE pdrv, BYTE cmd, void* buff) {
+    (void)pdrv;
+    switch (cmd) {
+        case CTRL_SYNC: return RES_OK;
+        case GET_SECTOR_COUNT: *(DWORD*)buff = MSC_MAX_SECTORS; return RES_OK;
+        case GET_SECTOR_SIZE:  *(WORD*)buff = 512; return RES_OK;
+        case GET_BLOCK_SIZE:   *(DWORD*)buff = 1; return RES_OK;
+        default: return RES_PARERR;
+    }
+}
+static const ff_diskio_impl_t g_p1_diskio_impl = {
+    .init = p1_diskio_init, .status = p1_diskio_status,
+    .read = p1_diskio_read, .write  = p1_diskio_write,
+    .ioctl = p1_diskio_ioctl,
+};
+
+// ── P2 (firmware-internal) diskio ─────────────────────────────────────────
 static DSTATUS p2_diskio_init(BYTE pdrv) { (void)pdrv; return 0; }
 static DSTATUS p2_diskio_status(BYTE pdrv) { (void)pdrv; return 0; }
 
@@ -836,11 +872,21 @@ static bool sd_init() {
                 ESP_LOGI(TAG, "SD: dual partition OK — P2 start=%lu size=%lu",
                          (unsigned long)p2_start, (unsigned long)p2_size);
             } else if (p1_is_ours && g_card_sectors >= MIN_DUAL_SECTORS) {
-                // Case 2: our P1 exists but no valid P2 — add P2 to MBR
+                // Case 2: our P1 exists but no valid P2 — add P2 to MBR.
+                // Also fix P1's partition type if it's not a FAT type (e.g. 0x07
+                // written by mkfs.fat on Linux or by f_fdisk).  This prevents
+                // FATFS mount failures in the single-partition fallback path and
+                // ensures the MBR is self-consistent after migration.
                 uint64_t p1_end = (uint64_t)p1_start + p1_size;
                 uint32_t avail = (p1_end < g_card_sectors) ? (uint32_t)(g_card_sectors - p1_end) : 0;
                 if (avail > 1024000) {
                     ESP_LOGW(TAG, "SD: P1 OK but no P2 — adding P2 to MBR");
+                    // Fix P1 type if not already 0x0B/0x0C/0x0E (FAT32)
+                    const int P1E = 0x1BE;
+                    if (mbr[P1E+4] != 0x0B && mbr[P1E+4] != 0x0C && mbr[P1E+4] != 0x0E) {
+                        mbr[P1E+4] = 0x0C;  // FAT32 LBA
+                        ESP_LOGW(TAG, "SD: fixed P1 partition type 0x%02x→0x0C", mbr[P1E+4]);
+                    }
                     uint32_t p2s = (uint32_t)p1_end;
                     const int P2E = 0x1CE;
                     mbr[P2E] = 0x00;
@@ -4666,24 +4712,48 @@ extern "C" void app_main(void) {
                 void* work = malloc(4096);
                 bool ok = false;
                 if (work) {
+                    // Step 1: create the partition table
                     FRESULT fr = f_fdisk(0, plist, work);
-                    ESP_LOGW(TAG, "FmtTask: fdisk result=%d", fr);
+                    airbridge_log("FmtTask: fdisk=%d", fr);
                     if (fr == FR_OK) {
-                        MKFS_PARM opt = { .fmt = FM_FAT32, .n_fat = 2, .au_size = 16 * 1024 };
-                        fr = f_mkfs("0:", &opt, work, 4096);
-                        ESP_LOGW(TAG, "FmtTask: mkfs P1 result=%d", fr);
-                        if (fr == FR_OK) {
-                            uint8_t* mbr = (uint8_t*)malloc(512);
-                            if (mbr && sdmmc_read_sectors(g_card, mbr, 0, 1) == ESP_OK) {
-                                g_p2_start_sector = le32(mbr + 0x1CE + 8);
-                                g_p2_sectors = le32(mbr + 0x1CE + 12);
-                            }
-                            free(mbr);
-                            if (g_p2_start_sector > 0 && g_p2_sectors > 0) {
-                                ff_diskio_register(1, &g_p2_diskio_impl);
-                                fr = f_mkfs("1:", &opt, work, 4096);
-                                if (fr == FR_OK) { g_dual_partition = true; ok = true; }
-                            }
+                        // Step 2: read back the MBR to get the exact LBA starts that
+                        // f_fdisk placed the partitions at (may differ from requested
+                        // sizes due to CHS alignment).
+                        uint8_t* mbr = (uint8_t*)malloc(512);
+                        if (mbr && sdmmc_read_sectors(g_card, mbr, 0, 1) == ESP_OK) {
+                            g_p1_start_sector = le32(mbr + 0x1BE + 8);
+                            uint32_t p1_sz    = le32(mbr + 0x1BE + 12);
+                            g_p2_start_sector = le32(mbr + 0x1CE + 8);
+                            g_p2_sectors      = le32(mbr + 0x1CE + 12);
+                            // Fix partition types: f_fdisk always writes 0x07 (exFAT).
+                            // Update to 0x0C (FAT32 LBA) so the partition table is
+                            // self-consistent and recognised by host OSes.
+                            mbr[0x1BE + 4] = 0x0C;
+                            if (g_p2_sectors > 0) mbr[0x1CE + 4] = 0x0C;
+                            sdmmc_write_sectors(g_card, mbr, 0, 1);
+                            airbridge_log("FmtTask: P1 start=%lu P2 start=%lu",
+                                         (unsigned long)g_p1_start_sector,
+                                         (unsigned long)g_p2_start_sector);
+                            (void)p1_sz;
+                        }
+                        free(mbr);
+
+                        // Step 3: format P1 using the P1 offset diskio + FM_SFD so
+                        // f_mkfs writes the FAT VBR directly at P1's data start sector
+                        // rather than auto-detecting partitions (which fails on blank
+                        // sectors) and overwriting the MBR with a single-partition table.
+                        MKFS_PARM opt = { .fmt = FM_FAT32 | FM_SFD, .n_fat = 2, .au_size = 16 * 1024 };
+                        ff_diskio_register(2, &g_p1_diskio_impl);
+                        fr = f_mkfs("2:", &opt, work, 4096);
+                        ff_diskio_unregister(2);
+                        airbridge_log("FmtTask: mkfs P1=%d", fr);
+
+                        if (fr == FR_OK && g_p2_start_sector > 0 && g_p2_sectors > 0) {
+                            // Step 4: format P2 the same way
+                            ff_diskio_register(1, &g_p2_diskio_impl);
+                            fr = f_mkfs("1:", &opt, work, 4096);
+                            airbridge_log("FmtTask: mkfs P2=%d", fr);
+                            if (fr == FR_OK) { g_dual_partition = true; ok = true; }
                         }
                     }
                     free(work);
@@ -4707,10 +4777,14 @@ extern "C" void app_main(void) {
                 g_p2_needs_format = false;
                 ESP_LOGW(TAG, "FmtTask: formatting P2 only");
                 ff_diskio_register(1, &g_p2_diskio_impl);
-                MKFS_PARM opt = { .fmt = FM_FAT32, .n_fat = 2, .au_size = 16 * 1024 };
+                // FM_FAT32|FM_SFD: write FAT VBR at sector 0 of the P2 diskio
+                // (= P2's LBA start on the physical card) without creating a
+                // nested partition table inside the partition data area.
+                MKFS_PARM opt = { .fmt = FM_FAT32 | FM_SFD, .n_fat = 2, .au_size = 16 * 1024 };
                 void* work = malloc(4096);
                 if (work) {
                     FRESULT fr = f_mkfs("1:", &opt, work, 4096);
+                    airbridge_log("FmtTask: P2-only mkfs=%d", fr);
                     free(work);
                     if (fr == FR_OK) {
                         ff_diskio_register_sdmmc(0, g_card);
