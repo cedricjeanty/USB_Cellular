@@ -1,0 +1,11 @@
+{
+  "name": "fatfs_native",
+  "description": "FatFs for native (unit test) builds — no ESP-IDF/FreeRTOS dependencies",
+  "version": "0.15.0",
+  "build": {
+    "srcDirs": ["src"],
+    "includeDir": "include",
+    "flags": ["-I include"]
+  },
+  "frameworks": "native"
+}

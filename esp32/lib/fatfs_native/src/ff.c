@@ -1,0 +1,1 @@
+/home/cedric/.platformio/packages/framework-espidf/components/fatfs/src/ff.c
