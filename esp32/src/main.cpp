@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260526120000"
+#define FW_VERSION "20260526130000"
 
 #include <cstring>
 #include <ctime>
@@ -984,20 +984,26 @@ static bool sd_reinit_and_mount() {
 // matrix in a partially-initialized state. On next boot, spi_bus_initialize()
 // may fail or the SD card won't respond, blocking FATFS for minutes.
 static void sd_before_restart() {
-    // Unmount FATFS first (flushes and unregisters VFS/diskio)
-    if (g_fatfs_mounted) {
-        if (g_dual_partition) {
+    // Tear down FATFS and SPI so next boot initializes cleanly after soft reset.
+    if (g_dual_partition) {
+        // Dual-partition: manual teardown. ff_diskio and the SPI device are
+        // registered independently; must remove both before spi_bus_free.
+        if (g_fatfs_mounted) {
             f_mount(NULL, "1:", 0);
             esp_vfs_fat_unregister_path(SD_MOUNT);
-            ff_diskio_unregister(1);
-            ff_diskio_unregister(0);
-        } else {
-            esp_vfs_fat_sdcard_unmount(SD_MOUNT, g_card);
         }
-        g_fatfs_mounted = false;
+        ff_diskio_unregister(1);  // P2 offset diskio
+        ff_diskio_unregister(0);  // raw card diskio (drive 0)
+        // Remove the SPI device — required before spi_bus_free().
+        // In dual-partition mode, g_sd_host.slot holds the handle from the
+        // original sdspi_host_init_device() call and is never removed elsewhere.
+        sdspi_host_remove_device((sdspi_dev_handle_t)g_sd_host.slot);
+    } else if (g_fatfs_mounted) {
+        // Single-partition: unmount handles VFS, diskio, and device removal.
+        esp_vfs_fat_sdcard_unmount(SD_MOUNT, g_card);
     }
+    g_fatfs_mounted = false;
     // Free the SPI bus — resets DMA descriptors and GPIO matrix mux state.
-    // Ignore return value: we're restarting regardless.
     spi_bus_free(g_spi_host);
 }
 
