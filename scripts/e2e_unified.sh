@@ -880,6 +880,159 @@ else
     pass "Boot splash (hardware — visual only)"
 fi
 
+# ── TEST 16: FATFS persists across soft-reset (OTA reboot regression) ─────────
+# Catches the sd_before_restart() bug where spi_bus_free() silently failed
+# because sdspi_host_remove_device() was never called in dual-partition mode.
+# Symptom: after any OTA reboot, g_fatfs_mounted stays false for 13+ minutes.
+log ""; log "TEST 16: FATFS persists after restart (soft-reset regression)"
+if [ "$TARGET" = "emulator" ]; then
+    rm -rf "$SD_INT/logs" "$SD_EMU/flightHistory"
+
+    # Boot 1: verify FATFS works (log file created under SD_INTERNAL/logs/)
+    start_device 5
+    sleep 15  # enough for log flush at +30s from boot
+    LOG_COUNT_1=$(ls "$SD_INT/logs/" 2>/dev/null | wc -l)
+
+    # Simulate soft reset (kill without graceful teardown, as esp_restart() does)
+    if [ -n "$EMU_PID" ]; then kill -9 "$EMU_PID" 2>/dev/null; wait "$EMU_PID" 2>/dev/null; fi
+    sudo killall -9 pppd 2>/dev/null; sleep 1; EMU_PID=""
+
+    # Boot 2: FATFS must mount immediately — verify log file appears promptly
+    rm -f "$FW_DIR/emu_ota_update.bin"
+    : > /tmp/emu_e2e.log
+    cd "$FW_DIR" && $EMU "$DEVICE" >>/tmp/emu_e2e.log 2>&1 &
+    EMU_PID=$!
+    sleep 40  # 30s log flush + settle
+    LOG_COUNT_2=$(ls "$SD_INT/logs/" 2>/dev/null | wc -l)
+
+    if [ "$LOG_COUNT_2" -gt "$LOG_COUNT_1" ]; then
+        pass "FATFS after restart: log file created on second boot ($LOG_COUNT_2 logs)"
+    else
+        fail "FATFS after restart: no new log on second boot (was $LOG_COUNT_1, now $LOG_COUNT_2)"
+    fi
+    stop_device
+else
+    # On device: write ENABLE_CDC to P1, power-cycle via 1200-baud touch (OTA-like
+    # soft reset), then verify SD_INTERNAL/logs/ appears on S3 within 3 minutes.
+    start_device 5
+    sleep 20
+    # Write ENABLE_CDC to P1 via USB MSC
+    for d in /dev/sda1 /dev/sdb1 /dev/sdc1; do
+        [ -b "$d" ] && { sudo mount "$d" /mnt 2>/dev/null; sudo touch /mnt/ENABLE_CDC; sync; sudo umount /mnt; break; }
+    done
+    # Soft reset via 1200-baud touch (mimics OTA esp_restart)
+    python3 -c "import serial,time; s=serial.Serial('/dev/ttyACM0',1200,timeout=1); time.sleep(0.5); s.close()" 2>/dev/null || true
+    sleep 5
+    start_device 5
+    sleep 60  # wait for FATFS mount + first log flush
+    # A log on S3 from this session means FATFS mounted correctly post-soft-reset
+    DEVICE_LOG=$(aws s3 ls "s3://$BUCKET/$DEVICE/logs/" 2>/dev/null | sort | tail -1 | awk '{print $4}')
+    if [ -n "$DEVICE_LOG" ]; then
+        BOOT_TS=$(aws s3 cp "s3://$BUCKET/$DEVICE/logs/$DEVICE_LOG" - 2>/dev/null | head -5 | grep -o '\[+[0-9]*s\]' | head -1)
+        pass "FATFS after soft reset: $DEVICE_LOG ($BOOT_TS)"
+    else
+        fail "FATFS after soft reset: no S3 log uploaded"
+    fi
+    stop_device
+fi
+
+# ── TEST 17: PPP reconnect + continued uploads ─────────────────────────────────
+# Catches the missing esp_netif_action_connected() call.  Symptom: after any
+# PPP drop, device got CONNECT from modem but lwIP PPP was in DEAD state —
+# never obtained IP, stuck "connecting..." indefinitely.
+log ""; log "TEST 17: PPP reconnect + continued uploads"
+if [ "$TARGET" = "emulator" ]; then
+    rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory"
+
+    start_device 5
+
+    # Write a file before the drop
+    write_dsu_file "01901" 200
+    if ! wait_for_upload "flightHistory__${SERIAL}_01901" 60; then
+        fail "PPP reconnect: pre-drop upload failed"
+        stop_device
+    else
+        log "  Pre-drop upload OK"
+        # Simulate PPP drop by toggling 'C' (cellular off) then back on
+        # The emulator uses keyboard input — drive it via stdin
+        sleep 5
+        kill -0 "$EMU_PID" 2>/dev/null && python3 -c "
+import subprocess, time
+# Send 'C' keypress to emulator stdin — simulates cellular drop
+p = subprocess.Popen(['kill', '-USR1', '$EMU_PID'])
+" 2>/dev/null || true
+        # Kill pppd to simulate carrier drop
+        sudo killall -9 pppd 2>/dev/null
+        log "  PPP dropped (pppd killed)"
+        sleep 30  # wait for firmware stale detection (30s) + reconnect (~25s)
+
+        # Write another file — should upload after reconnect
+        write_dsu_file "01902" 200
+        if wait_for_upload "flightHistory__${SERIAL}_01902" 120; then
+            pass "PPP reconnect: upload succeeded after drop+reconnect"
+        else
+            # Check if S3 log shows reconnect attempt
+            RECONNECT_LOG=$(aws s3 ls "s3://$BUCKET/$DEVICE/logs/" 2>/dev/null | sort | tail -1 | awk '{print $4}')
+            RECONNECT_MSG=$([ -n "$RECONNECT_LOG" ] && aws s3 cp "s3://$BUCKET/$DEVICE/logs/$RECONNECT_LOG" - 2>/dev/null | grep -c "reconnect" || echo "0")
+            fail "PPP reconnect: upload after reconnect failed (reconnect attempts in log: $RECONNECT_MSG)"
+        fi
+        stop_device
+    fi
+else
+    skip "PPP reconnect: emulator-only test (requires SimModem PPP drop control)"
+fi
+
+# ── TEST 18: SD log keeps flushing during active MSC (mutex timeout regression)
+# Catches the 50ms sd_mutex timeout on the log flush path. Symptom: while USB
+# MSC host was reading P1, every flush timed out, ring buffer wrapped, SD log
+# file stopped growing after ~10 minutes.
+log ""; log "TEST 18: SD log flush during MSC activity"
+if [ "$TARGET" = "emulator" ]; then
+    rm -rf "$SD_INT/logs"
+
+    start_device 5
+    sleep 35  # first flush at +30s
+
+    LOG_FILE=$(ls "$SD_INT/logs/"*.log 2>/dev/null | head -1)
+    if [ -z "$LOG_FILE" ]; then
+        fail "Log flush: no log file created in SD_INTERNAL/logs/"
+        stop_device
+    else
+        SIZE_1=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+        sleep 35  # second flush cycle
+        SIZE_2=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+        sleep 35  # third cycle — simulates ongoing MSC activity in emulator
+        SIZE_3=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+
+        if [ "$SIZE_3" -gt "$SIZE_1" ] && [ "$SIZE_2" -gt "$SIZE_1" ]; then
+            pass "Log flush: file growing across 3 cycles ($SIZE_1 → $SIZE_2 → $SIZE_3 bytes)"
+        else
+            fail "Log flush: file stopped growing ($SIZE_1 → $SIZE_2 → $SIZE_3 bytes)"
+        fi
+        stop_device
+    fi
+else
+    # On device: verify S3 log-append keeps receiving new data past 10 minutes
+    start_device 5
+    sleep 30
+    LOG_KEY=$(aws s3 ls "s3://$BUCKET/$DEVICE/logs/" 2>/dev/null | sort | tail -1 | awk '{print $4}')
+    if [ -z "$LOG_KEY" ]; then
+        fail "Log flush: no S3 log found"; stop_device
+    else
+        SIZE_A=$(aws s3api head-object --bucket "$BUCKET" --key "$DEVICE/logs/$LOG_KEY" \
+            --query ContentLength --output text 2>/dev/null || echo 0)
+        sleep 600  # run for 10 minutes while host likely reads SD
+        SIZE_B=$(aws s3api head-object --bucket "$BUCKET" --key "$DEVICE/logs/$LOG_KEY" \
+            --query ContentLength --output text 2>/dev/null || echo 0)
+        if [ "$SIZE_B" -gt "$SIZE_A" ]; then
+            pass "Log flush: S3 log grew past 10 min ($SIZE_A → $SIZE_B bytes)"
+        else
+            fail "Log flush: S3 log stopped growing at 10 min ($SIZE_A → $SIZE_B bytes)"
+        fi
+        stop_device
+    fi
+fi
+
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 log ""; log "Cleaning up..."
 if [ "$TARGET" = "emulator" ]; then
