@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260526150000"
+#define FW_VERSION "20260526170000"
 
 #include <cstring>
 #include <ctime>
@@ -934,6 +934,11 @@ static bool sd_init() {
 
     ESP_LOGI(TAG, "SD: %lu sectors, fatfs=%s, dual=%d",
              (unsigned long)g_card_sectors, g_fatfs_mounted ? "ok" : "FAIL", g_dual_partition);
+    airbridge_log("SD init: sectors=%lu fatfs=%s dual=%d err='%s'",
+                  (unsigned long)g_card_sectors,
+                  g_fatfs_mounted ? "ok" : "FAIL",
+                  (int)g_dual_partition,
+                  g_sd_error[0] ? g_sd_error : "none");
     return true;
 }
 
@@ -3260,10 +3265,19 @@ static void modemTask(void* param) {
             char logPath[64];
             snprintf(logPath, sizeof(logPath), "/sdcard/logs/%s.log", g_logFileName);
             long fileSize = 0;
-            if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            bool mutexGot = xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(500)) == pdTRUE;
+            if (mutexGot) {
                 FILE* f = fopen(logPath, "r");
                 if (f) { fseek(f, 0, SEEK_END); fileSize = ftell(f); fclose(f); }
                 xSemaphoreGive(g_sd_mutex);
+            }
+            // Diagnostic: log why upload isn't firing (fires once per connect)
+            static bool logAppendDiagDone = false;
+            if (!logAppendDiagDone && firstUpload) {
+                logAppendDiagDone = true;
+                log_write("logAppend: file=%s size=%ld pos=%ld mutex=%d fatfs=%d",
+                          logPath, fileSize, lastUploadPos,
+                          (int)mutexGot, (int)g_fatfs_mounted);
             }
 
             if (fileSize > lastUploadPos) {
