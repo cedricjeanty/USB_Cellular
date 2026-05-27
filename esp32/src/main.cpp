@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260526180000"
+#define FW_VERSION "20260527120000"
 
 #include <cstring>
 #include <ctime>
@@ -3080,6 +3080,10 @@ static void modemTask(void* param) {
     // This loop MUST run continuously — all TCP/IP over cellular depends on it.
     // URCs from the modem (e.g., +CSQ, +CREG) appear as ASCII text between PPP frames.
     bool test_launched = false;
+    // Counts reconnect attempts that got CONNECT but no IP. Reset only when
+    // g_pppConnected fires (IP obtained) — not on CONNECT alone — so the CFUN
+    // backoff engages when stuck in the "no IP after CONNECT" loop all night.
+    static int s_reconnect_failures = 0;
     static char urcBuf[128];
     static int urcLen = 0;
 
@@ -3151,6 +3155,7 @@ static void modemTask(void* param) {
         // Once PPP is up, set as default route for all outgoing traffic
         if (g_pppConnected && !test_launched) {
             test_launched = true;
+            s_reconnect_failures = 0;  // IP obtained — full session up, reset counter
 
             esp_netif_ip_info_t ip_info;
             if (esp_netif_get_ip_info(g_ppp_netif, &ip_info) == ESP_OK) {
@@ -3199,7 +3204,6 @@ static void modemTask(void* param) {
             g_pppNeedsReconnect = true;
         }
         if (pppStale || g_pppNeedsReconnect) {
-            static int s_reconnect_failures = 0;
 
             if (pppStale) {
                 cdc_printf("Modem: no PPP data for 30s — reconnecting\r\n");
@@ -3238,7 +3242,8 @@ static void modemTask(void* param) {
             }
 
             if (rr.connected) {
-                s_reconnect_failures = 0;
+                // Do NOT reset s_reconnect_failures here — we have CONNECT but
+                // no IP yet.  Reset happens below when g_pppConnected fires.
                 lastPppRxMs = millis();
                 test_launched = false;
                 cdc_printf("Modem: PPP CONNECT — negotiating...\r\n");
