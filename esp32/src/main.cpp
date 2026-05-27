@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260526140000"
+#define FW_VERSION "20260526150000"
 
 #include <cstring>
 #include <ctime>
@@ -558,6 +558,7 @@ static void doUpdateDisplay();
 static void disp(const char* line1, const char* line2 = nullptr);
 static bool sd_mount_fatfs();
 static void sd_unmount_fatfs();
+static void sd_before_restart();
 
 // ── TinyUSB MSC callbacks ───────────────────────────────────────────────────
 // These run in the TinyUSB task context (small stack), so use short mutex timeout.
@@ -977,6 +978,44 @@ static void sd_unmount_fatfs() {
 static bool sd_reinit_and_mount() {
     sd_unmount_fatfs();
     return sd_mount_fatfs();
+}
+
+// ── P1 magic files (dual-partition mode) ────────────────────────────────────
+// In dual-partition mode, P2 (logs, config) is invisible to USB MSC.  This
+// makes ENABLE_CDC on P2 unreachable when P2 FATFS is down — breaking the
+// diagnostic catch-22.  Check P1 (USB-visible DSU partition) for the same
+// magic files via a temporary mount_dsu().  Works regardless of P2 state.
+//
+// Usage: drop ENABLE_CDC or REBOOT on P1 via USB MSC; firmware picks it up
+// on the next boot even if P2 FATFS is failing.
+static void check_p1_magic() {
+    if (!g_dual_partition || !g_card) return;
+    if (!mount_dsu()) return;
+
+    char path[64];
+
+    // ENABLE_CDC on P1 — same one-boot CDC override as P2
+    snprintf(path, sizeof(path), "%s/ENABLE_CDC", DSU_MOUNT);
+    if (access(path, F_OK) == 0) {
+        remove(path);
+        g_msc_only = false;
+        airbridge_log("P1: ENABLE_CDC — CDC+MSC for this boot");
+        disp("USB Mode", "CDC (P1 flag)");
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    // REBOOT on P1 — clean restart
+    snprintf(path, sizeof(path), "%s/REBOOT", DSU_MOUNT);
+    if (access(path, F_OK) == 0) {
+        remove(path);
+        airbridge_log("P1: REBOOT found — rebooting");
+        unmount_dsu();
+        vTaskDelay(pdMS_TO_TICKS(500));
+        sd_before_restart();
+        esp_restart();
+    }
+
+    unmount_dsu();
 }
 
 // Call before esp_restart() to tear down SPI cleanly.
@@ -4408,6 +4447,9 @@ extern "C" void app_main(void) {
     }
 
     // Boot splash is shown later, after file scan
+
+    // ── P1 magic files (accessible via USB MSC even when P2 FATFS is down) ──
+    check_p1_magic();
 
     // ── SD magic file: USB mode switch ──────────────────────────────────
     // Drop ENABLE_CDC on SD to temporarily enable CDC+MSC for this boot.
