@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260527120000"
+#define FW_VERSION "20260527130000"
 
 #include <cstring>
 #include <ctime>
@@ -3196,10 +3196,14 @@ static void modemTask(void* param) {
         uint32_t staleMs = g_tlsActive ? 90000 : 30000;
         bool pppStale = g_pppConnected && lastPppRxMs > 0 &&
                         (millis() - lastPppRxMs) > staleMs;
-        // If we got CONNECT but no IP within 30s, force reconnect
+        // If we got CONNECT but no IP within 30s, force reconnect.
+        // Increment failure counter here so the CFUN backoff engages on
+        // repeated "no IP" cycles — rr.connected=true doesn't increment it.
         if (!g_pppConnected && !g_pppNeedsReconnect && lastPppRxMs > 0 &&
             (millis() - lastPppRxMs) > 30000) {
-            log_write("Modem: no IP after CONNECT — forcing reconnect");
+            s_reconnect_failures++;
+            log_write("Modem: no IP after CONNECT — forcing reconnect (failure #%d)",
+                      s_reconnect_failures);
             cdc_printf("Modem: no IP — reconnecting\r\n");
             g_pppNeedsReconnect = true;
         }
