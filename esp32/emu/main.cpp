@@ -8,6 +8,7 @@
 //
 // Keyboard:
 //   C       Toggle cellular connected (enables/disables uploads)
+//   D       Run DSU download session (EMU_DSU_FILE or test/fixtures/EA500.000243_01077.eaofh)
 //   H       Harvest files from emu_sdcard/ to emu_sdcard/upload/
 //   P       Upload files from emu_sdcard/upload/ to S3 (requires C first)
 //   T       Test AT command sequence via simulated UART
@@ -452,7 +453,7 @@ int main(int argc, char* argv[]) {
     printf("Virtual SD card: %s/\n", SD_ROOT);
     printf("NVS storage:     ./emu_nvs.dat\n\n");
     printf("Auto: modem init → OTA check → file detect → harvest → upload\n");
-    printf("Keys: D=DSU-session  I=status  T=test-AT  C=toggle-net  R=reset  Q=quit\n\n");
+    printf("Keys: D=DSU-session  I=status  T=test-AT  C=toggle-net  X=drop-session  R=reset  Q=quit\n\n");
     fflush(stdout);
     setbuf(stdout, nullptr);  // disable buffering for real-time output
     s_log.clear();
@@ -595,6 +596,8 @@ int main(int argc, char* argv[]) {
                     atCmd("AT+CSQ");
                     atCmd("AT+COPS?");
                     atCmd("AT+CREG?");
+                    atCmd("AT+CEREG?");
+                    atCmd("AT+CGREG?");
                     atCmd("AT+CCLK?");
                     printf("[AT] Done\n");
                     break;
@@ -616,17 +619,33 @@ int main(int argc, char* argv[]) {
                     ds.uploadingMb = 2.0f;
                     break;
                 case SDLK_d: {
-                    printf("[DSU] Running download session...\n");
+                    const char* dsuFile = getenv("EMU_DSU_FILE");
+                    if (!dsuFile) dsuFile = "test/fixtures/EA500.000243_01077.eaofh";
+                    printf("[DSU] Running download session from %s\n", dsuFile);
                     SimDSU dsu;
                     dsu.sdRoot = SD_ROOT;
-                    SimDSU::SessionResult sr = dsu.runSession(4.0f);  // 4MB
-                    if (sr.success) {
-                        printf("[DSU] Session complete: %s (%u bytes)\n", sr.filename, sr.bytesWritten);
+                    dsu.internalMemoryPath = dsuFile;
+                    dsu.metricsSource = "test/fixtures/metrics";
+                    SimDSU::SessionResult sr = dsu.runSession();
+                    if (sr.success && sr.bytesWritten > 0) {
+                        printf("[DSU] Session complete: %s (flights %u-%u, %u bytes)\n",
+                               sr.filename, sr.firstFlight, sr.flightNum, sr.bytesWritten);
+                    } else if (sr.success) {
+                        printf("[DSU] Caught up — no new flights\n");
                     } else {
-                        printf("[DSU] Session failed\n");
+                        printf("[DSU] Session failed (check EMU_DSU_FILE)\n");
                     }
                     break;
                 }
+                case SDLK_x:
+                    // Simulate carrier-terminated PPP session (T-Mobile drops every ~4-6h)
+                    if (s_modem && s_modem->pppUp) {
+                        s_modem->dropSession();
+                        printf("[SIM] Carrier session dropped — reconnect loop should fire\n");
+                    } else {
+                        printf("[SIM] No active PPP session to drop\n");
+                    }
+                    break;
                 case SDLK_r:
                     ds = {};
                     strlcpy(ds.modemOp, "Emulator", sizeof(ds.modemOp));

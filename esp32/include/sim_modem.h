@@ -56,6 +56,24 @@ public:
     SimModem(const char* persistPath) : nvsPath(persistPath) { loadState(); }
     ~SimModem() { stop(); }
 
+    // Simulate carrier-terminated PPP session (T-Mobile drops sessions every ~4-6h).
+    // Sends an LCP Terminate-Request which causes lwIP to fire IP_EVENT_PPP_LOST_IP,
+    // setting g_pppNeedsReconnect=true. The modem returns to command mode.
+    // Call from test code or emulator UI (e.g. key 'X') to exercise the reconnect path.
+    void dropSession() {
+        if (!dataMode_) { printf("[SimModem] dropSession: not in data mode\n"); return; }
+        printf("[SimModem] dropSession: sending LCP TERM-REQ (carrier termination)\n");
+        if (lcpUp_) {
+            std::vector<uint8_t> term = {PPP_TERM_REQ, lcpId_++, 0, 4};
+            sendPppFrame(PPP_LCP, term);
+        }
+        dataMode_ = false;
+        lcpUp_    = false;
+        ipcpUp_   = false;
+        pppUp     = false;
+        closeTun();
+    }
+
     bool start() {
 #if !defined(ESP_PLATFORM)
         char sname[64] = "";
@@ -229,7 +247,16 @@ private:
             respond("OK");
         } else if (upper.find("AT+CFUN=") == 0) {
             int func = atoi(c.c_str() + 8);
-            if (func == 0) apnSet = false;  // radio off clears PDP context (like real SIM7600)
+            if (func == 0) {
+                apnSet = false;  // radio off clears PDP context
+                // Real SIM7600 resets UART baud to 115200 on AT+CFUN=0. This is the
+                // hardware bug that caused all-3-minute CEREG timeouts in the reconnect
+                // loop when the ESP32 stayed at 3Mbaud after issuing CFUN. Reproduce it
+                // here so firmware tests can verify the AT+IPR=115200 guard is in place.
+                baudRate = 115200;
+                saveState();
+                printf("[SimModem] CFUN=0: baud reset to 115200 (real SIM7600 behavior)\n");
+            }
             respond("OK");
         } else if (upper == "AT+CSQ") {
             char buf[32];
@@ -247,6 +274,29 @@ private:
             respond(buf);
             respond("OK");
         } else if (upper.find("AT+CREG=") == 0) {
+            respond("OK");
+        } else if (upper == "AT+CEREG?") {
+            // LTE/EPS registration — this is what the firmware polls for reconnect.
+            // Format: +CEREG: <n>,<stat>  (n=0 = unsolicited disabled)
+            char buf[32];
+            snprintf(buf, sizeof(buf), "+CEREG: 0,%d", regStat);
+            respond(buf);
+            respond("OK");
+        } else if (upper.find("AT+CEREG=") == 0) {
+            respond("OK");
+        } else if (upper == "AT+CGREG?") {
+            // GPRS/packet domain registration (fallback after CEREG)
+            char buf[32];
+            snprintf(buf, sizeof(buf), "+CGREG: 0,%d", regStat);
+            respond(buf);
+            respond("OK");
+        } else if (upper.find("AT+CGREG=") == 0) {
+            respond("OK");
+        } else if (upper.find("AT+CGACT=") == 0) {
+            // PDP context activate/deactivate — AT+CGACT=0,1 deactivates context 1
+            int state = -1, cid = -1;
+            sscanf(c.c_str() + 9, "%d,%d", &state, &cid);
+            if (state == 0 && cid == 1) apnSet = false;  // deactivated, need new CGDCONT
             respond("OK");
         } else if (upper.find("AT+AUTOCSQ=") == 0) {
             respond("OK");
