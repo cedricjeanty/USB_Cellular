@@ -10,7 +10,7 @@ harvest files when idle, and upload via cellular.
 
 **Hardware:** ESP32-S3-DevKitC-1 (4 MB flash, 2 MB PSRAM)
 
-**USB:** TinyUSB — MSC-only (PID 0x0002, avionics mode) or CDC+MSC (PID 0x0001, debug mode). Default is MSC-only. Drop `ENABLE_CDC` on SD to temporarily boot CDC+MSC (file is deleted, next boot reverts to MSC-only). In MSC-only mode, D+ is held low at boot via `tud_disconnect()` — host sees nothing (just power draw) until the 90s presentation delay elapses, then `tud_connect()` triggers first enumeration.
+**USB:** TinyUSB — MSC-only (PID 0x0002, avionics mode) or CDC+MSC (PID 0x0001, debug mode). Default is MSC-only. Drop `ENABLE_CDC` on the SD card (P2 internal partition, or P1 USB-visible partition — see SD Magic Files) to temporarily boot CDC+MSC (file is deleted, next boot reverts to MSC-only). In MSC-only mode, D+ is held low at boot via `tud_disconnect()` — host sees nothing (just power draw) until the 90s presentation delay elapses, then `tud_connect()` triggers first enumeration.
 
 **Cellular:** SIM7600 modem via UART (TX=43, RX=44, RTS=1, CTS=2), PPPoS. Hologram SIM. Runs at 3 Mbaud + HW flow control on PCB.
 
@@ -60,7 +60,11 @@ every 60s via `airbridge_log()`.
 
 ### SD Magic Files
 
-Drop any of these on the SD root; firmware processes and deletes them on boot:
+In **dual-partition mode** (16GB+ cards), the SD card has two partitions:
+- **P1** (8GB, USB-visible via MSC): DSU data — `flightHistory/`, `metrics/`, `dsuCookie.easdf`
+- **P2** (rest, firmware-internal): logs, upload queue, magic files processed at boot
+
+Magic files on **P2** (standard path, `SD_MOUNT=/sdcard`):
 | File | Effect |
 |------|--------|
 | `ENABLE_CDC` | Boot CDC+MSC this once (deleted after processing, no NVS change) |
@@ -69,6 +73,15 @@ Drop any of these on the SD root; firmware processes and deletes them on boot:
 | `firmware.bin` | SD-flash: write to OTA partition + reboot |
 | `FORMAT_SD` | Format SD as 8GB FAT32 |
 | `REBOOT` | Reboot device |
+
+Magic files on **P1** (fallback path, accessible via USB MSC even when P2 FATFS is down):
+| File | Effect |
+|------|--------|
+| `ENABLE_CDC` | Same as P2 — works even if P2 FATFS fails to mount |
+| `REBOOT` | Same as P2 |
+
+P1 magic files are checked by `check_p1_magic()` at boot after `sd_init()`. This breaks
+the catch-22 where P2 FATFS failure made ENABLE_CDC unreachable without physical SD removal.
 
 ### NVS Namespaces
 
@@ -93,12 +106,42 @@ Drop any of these on the SD root; firmware processes and deletes them on boot:
 
 ### Modem Recovery
 
-The modem task handles multiple baud/mode scenarios on boot:
+**Boot-time AT sync** (modemAtSync / modemRunInit in `airbridge_modem.h`):
 1. Try AT at 115200 (covers cold boot)
 2. Try +++ escape at 921600/460800/3M without flow control (modem in PPP data mode after soft reboot)
 3. Try +++ at same bauds with hardware flow control
 4. CFUN=0/1 radio reset after AT sync
 5. Watchdog in main_loop restarts modem task if it dies (30s cooldown)
+
+**Mid-session reconnect** (modemReconnect in `airbridge_modem.h`) — after PPP drop:
+
+The correct sequence is **NOT** CFUN=0/1. After a carrier-terminated session the radio
+stays registered; CFUN causes real deregistration + forced 30-60s re-attach (worse).
+
+```
+ATH                              ← hang up / exit PPP mode
+AT+CGACT=0,1                     ← deactivate stale PDP context (critical)
+(5s wait for bearer cleanup)
+AT+CEREG? / AT+CGREG?            ← check LTE data registration — NOT AT+CREG
+AT+CGDCONT=1,"IP","hologram"     ← always re-state APN before redialing
+ATD*99#
+```
+
+**Key AT command notes for T-Mobile/Hologram LTE SIMs:**
+- Use `AT+CEREG?` (LTE/EPS) or `AT+CGREG?` (packet-domain) — **never `AT+CREG?`**
+  T-Mobile denies *voice* registration (CREG returns state 3 = denied) but grants
+  *LTE data* registration (CEREG returns state 5 = roaming). Checking CREG will always
+  time out on T-Mobile/Hologram, causing spurious CFUN resets.
+- `AT+CGACT=0,1` before every redial — without it the modem may give CONNECT on a
+  stale context where IPCP never completes (no IP assigned).
+- CFUN=0/1 is only for genuinely unresponsive modem (not responding to AT at any baud).
+- Carrier (T-Mobile/Hologram) terminates sessions every ~4-6 hours — this is normal.
+
+**Reconnect backoff** (s_reconnect_failures counter in modem task pump loop):
+- Attempts 2-4, 6-9, 11-14 etc.: soft reconnect (CGACT + re-register, no CFUN)
+- Attempts 1, 5, 10, 15 etc.: full CFUN=0/1 reset
+- After 10+ failures: progressive wait before each full reset (30s × failures/5, max 300s)
+- Counter resets only when PPP gets IP (g_pppConnected=true), not on CONNECT alone
 
 ## Detailed Documentation
 
@@ -122,9 +165,13 @@ The modem task handles multiple baud/mode scenarios on boot:
 * `esp32/include/airbridge_proto.h` — DSU cookie builder, CRC-16, filename parser, chunked decode
 * `esp32/include/airbridge_triggers.h` — Harvest trigger logic (15s quiet window)
 * `esp32/include/airbridge_utils.h` — JSON helpers, URL encode/decode, version compare, file skip list
+* `esp32/include/airbridge_modem.h` — modemAtSync(), modemRunInit(), modemReconnect() (CEREG/CGACT reconnect sequence)
 * `esp32/emu/main.cpp` — SDL2 emulator (~870 lines): SimModem via PTY, FileNvs, FakeSD
+* `esp32/lib/fatfs_native/` — Standalone FatFs build for native tests (no ESP-IDF/FreeRTOS deps)
+* `esp32/test/test_native_sd_format/` — Native unit tests: MBR partition type manipulation (no FatFs needed)
+* `esp32/test/test_native_sd_block/` — Native block-level tests: real FatFs against FakeSd in-memory disk
 * `lambda/presign.py` — Lambda: S3 pre-signed URLs, firmware version check, DSU cookie, OTA download URL, log append
-* `scripts/e2e_unified.sh` — Unified E2E test suite (15 emulator / 12 hardware tests). `--target emulator` or `--target device`.
+* `scripts/e2e_unified.sh` — Unified E2E test suite (18 emulator / 12 hardware tests). `--target emulator` or `--target device`.
 * `scripts/commission.sh` — Device commissioning (flash, format SD, verify cellular/OTA/USB)
 * `scripts/coolgear.py` — CoolGear USB hub power control for automated testing
 
