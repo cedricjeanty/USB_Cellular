@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260527140000"
+#define FW_VERSION "20260527170000"
 
 #include <cstring>
 #include <ctime>
@@ -2920,18 +2920,26 @@ static void modemTask(void* param) {
     }
 
     // ── Quick pre-PPP setup (minimal — defer everything else) ──────────
-    modem_at_cmd("AT+CREG=1", resp, sizeof(resp), 1000);   // enable registration URCs
     modem_at_cmd("AT+AUTOCSQ=1,1", resp, sizeof(resp), 1000); // auto RSSI
 
-    // ── Wait for network registration (up to 30s) ────────────────────────
-    // CREG stat: 0=not searching, 1=home, 2=searching, 3=denied, 5=roaming
+    // ── Wait for LTE data registration (up to 30s) ────────────────────────
+    // Use AT+CEREG (LTE/EPS), not AT+CREG. T-Mobile/Hologram SIMs deny voice
+    // registration (CREG returns state 3) but grant LTE data registration
+    // (CEREG returns state 5 = roaming). CREG always times out on T-Mobile.
     {
         bool registered = false;
-        for (int i = 0; i < 15; i++) {
-            modem_at_cmd("AT+CREG?", resp, sizeof(resp), 1000);
+        for (int i = 0; i < 30; i++) {  // up to 90s (was 15→45s)
+            modem_at_cmd("AT+CEREG?", resp, sizeof(resp), 1000);
             if (strstr(resp, ",1") || strstr(resp, ",5")) {
                 registered = true;
                 cdc_printf("Modem: registered (%s)\r\n",
+                           strstr(resp, ",5") ? "roaming" : "home");
+                break;
+            }
+            modem_at_cmd("AT+CGREG?", resp, sizeof(resp), 1000);
+            if (strstr(resp, ",1") || strstr(resp, ",5")) {
+                registered = true;
+                cdc_printf("Modem: registered (CGREG, %s)\r\n",
                            strstr(resp, ",5") ? "roaming" : "home");
                 break;
             }
@@ -2939,7 +2947,7 @@ static void modemTask(void* param) {
         }
         if (!registered) {
             cdc_printf("Modem: registration timeout — dialing anyway\r\n");
-            log_write("Modem: CREG timeout — dialing unregistered");
+            log_write("Modem: CEREG timeout — dialing unregistered");
         }
     }
 
@@ -3011,16 +3019,25 @@ static void modemTask(void* param) {
         }
     }
 
-    // Retry indefinitely if initial PPP dial fails
+    // Retry indefinitely if initial PPP dial fails.
+    // NO CFUN=0/1 here — AT+CFUN=0 resets the SIM7600 UART to 115200 while the
+    // host is still at the upgraded baud (3Mbaud), breaking all subsequent AT
+    // commands silently. Soft reconnect (deactivate stale context, re-state APN,
+    // redial) is sufficient to recover from a failed initial dial.
     while (!connected) {
         cdc_printf("Modem: PPP dial failed — retrying in 30s\r\n");
         log_write("Modem: PPP dial failed — retrying");
         vTaskDelay(pdMS_TO_TICKS(30000));
-        // Re-reset radio and retry
-        modem_at_cmd("AT+CFUN=0", resp, sizeof(resp), 3000);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        modem_at_cmd("AT+CFUN=1", resp, sizeof(resp), 3000);
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        // Wait up to 60s for registration before retrying (covers slow re-attach)
+        for (int ci = 0; ci < 20; ci++) {
+            modem_at_cmd("AT+CEREG?", resp, sizeof(resp), 1000);
+            if (strstr(resp, ",1") || strstr(resp, ",5")) break;
+            modem_at_cmd("AT+CGREG?", resp, sizeof(resp), 1000);
+            if (strstr(resp, ",1") || strstr(resp, ",5")) break;
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+        modem_at_cmd("AT+CGACT=0,1", resp, sizeof(resp), 5000);
+        modem_at_cmd("AT+CGDCONT=1,\"IP\",\"hologram\"", resp, sizeof(resp), 5000);
         for (int dialAttempt = 0; dialAttempt < 3 && !connected; dialAttempt++) {
             cdc_printf("Modem: dialing PPP (attempt %d)...\r\n", dialAttempt + 1);
             mdm_write("ATD*99#\r", 8);
@@ -3191,9 +3208,10 @@ static void modemTask(void* param) {
         // RSSI is read during modem init. modemRssiCheck() available for safe gaps.
 
         // ── Detect PPP connection loss or stuck CONNECT without IP ────────
-        // Extend stale timeout during TLS — slow handshakes on weak links
-        // produce no PPP rx data while waiting for server response.
-        uint32_t staleMs = g_tlsActive ? 90000 : 30000;
+        // 90s baseline avoids false positives from the 30s LCP echo interval:
+        // if one echo-reply is delayed or reordered, a 30s window would fire on
+        // a perfectly healthy link. TLS slow-handshakes need even more headroom.
+        uint32_t staleMs = g_tlsActive ? 120000 : 90000;
         bool pppStale = g_pppConnected && lastPppRxMs > 0 &&
                         (millis() - lastPppRxMs) > staleMs;
         // If we got CONNECT but no IP within 30s, force reconnect.
@@ -3221,12 +3239,16 @@ static void modemTask(void* param) {
             g_pppConnected = false;
             // Keep g_modemRssi — display shows last-known signal during reconnect
 
-            // Only do CFUN=0/1 radio reset on first attempt and every 5th after.
-            // Repeated resets degrade the SIM7600 — soft reconnect is tried first.
-            bool doRadioReset = (s_reconnect_failures % 5 == 0);
-            // After 10+ failures (2+ radio resets), add increasing wait before reset.
-            if (doRadioReset && s_reconnect_failures >= 10) {
-                uint32_t backoffS = std::min<uint32_t>(300u, 30u * (uint32_t)(s_reconnect_failures / 5));
+            // Soft reconnect (no CFUN) for the first 4 attempts — soft now includes
+            // a +++ guard so it handles the "modem stuck in PPP data mode" case.
+            // CFUN=0/1 (full radio reset) starts at attempt 5 and every 5th after.
+            // This avoids forced de-registration on carrier-terminated sessions where
+            // the radio is already correctly registered on CEREG.
+            bool doRadioReset = (s_reconnect_failures >= 4 &&
+                                 (s_reconnect_failures - 4) % 5 == 0);
+            // After the second CFUN attempt (failures>=9), add increasing wait.
+            if (doRadioReset && s_reconnect_failures >= 9) {
+                uint32_t backoffS = std::min<uint32_t>(300u, 30u * (uint32_t)((s_reconnect_failures - 4) / 5));
                 log_write("Modem: backoff %lus before radio reset (failure #%d)",
                           (unsigned long)backoffS, s_reconnect_failures);
                 cdc_printf("Modem: backoff %lus before radio reset\r\n", (unsigned long)backoffS);

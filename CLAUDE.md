@@ -137,11 +137,26 @@ ATD*99#
 - CFUN=0/1 is only for genuinely unresponsive modem (not responding to AT at any baud).
 - Carrier (T-Mobile/Hologram) terminates sessions every ~4-6 hours — this is normal.
 
+**Reconnect sequence** — both soft and hard paths send `+++` guard first (escapes PPP
+data mode — safe no-op if already in command mode):
+- Soft (no CFUN): `+++` → ATH → CGACT=0,1 → 5s → CEREG check → CGDCONT → ATD*99#
+- Hard (CFUN): `+++` → ATH → CFUN=0 → 10s → CFUN=1 → 5s → CEREG check → ATD*99#
+
+**Root cause of repeated soft-reconnect failures**: after a reconnect gets CONNECT but
+IPCP stalls, the modem stays in PPP data mode. Without the `+++` guard, subsequent soft
+reconnects send ATH/CEREG as PPP bytes the modem ignores → 3-minute CEREG timeout each
+attempt. The `+++` guard (added fw 20260527160000) fixes this.
+
 **Reconnect backoff** (s_reconnect_failures counter in modem task pump loop):
-- Attempts 2-4, 6-9, 11-14 etc.: soft reconnect (CGACT + re-register, no CFUN)
-- Attempts 1, 5, 10, 15 etc.: full CFUN=0/1 reset
-- After 10+ failures: progressive wait before each full reset (30s × failures/5, max 300s)
+- Attempts 1-4 (failures 0-3): soft reconnect (no CFUN) — handles carrier termination
+- Attempt 5 (failures=4): first full CFUN=0/1 reset
+- Attempts 6-9 (failures 5-8): soft
+- Attempt 10 (failures=9): second CFUN reset, with progressive backoff
+- After 2+ CFUN resets: wait 30s × reset_count (max 300s) before each reset
 - Counter resets only when PPP gets IP (g_pppConnected=true), not on CONNECT alone
+
+**pppStale detection**: 90s threshold (was 30s). The 30s LCP echo interval meant one
+delayed echo-reply could falsely trigger reconnect on a healthy link.
 
 ## Detailed Documentation
 

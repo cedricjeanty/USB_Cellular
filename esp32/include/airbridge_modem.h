@@ -54,13 +54,30 @@ inline ModemReconnectResult modemReconnect(bool resetRadio = true) {
         g_hal->clock->delay_ms(1100);
         mdm_flush();
         modem_at_cmd("ATH", resp, sizeof(resp), 2000);
+        // CRITICAL: AT+CFUN=0 resets the SIM7600 UART baud rate to 115200 (default).
+        // Downgrade both modem and host to 115200 BEFORE CFUN=0, so both sides are in
+        // sync after the reset. Without this, subsequent AT commands at the upgraded
+        // baud (3Mbaud) all fail silently — CEREG polls time out for 3 minutes each.
+        modem_at_cmd("AT+IPR=115200", resp, sizeof(resp), 1000);
+        mdm_set_baudrate(115200);
         modem_at_cmd("AT+CFUN=0", resp, sizeof(resp), 5000);
         g_hal->clock->delay_ms(10000);
         modem_at_cmd("AT+CFUN=1", resp, sizeof(resp), 5000);
         g_hal->clock->delay_ms(5000);
+        // Both modem and host are now at 115200. The baud upgrade will happen
+        // on the next boot (modemAtSync + baud upgrade sequence in modemTask).
     } else {
-        // Normal reconnect after carrier-terminated session:
-        // 1. Hang up cleanly (exits PPP mode if needed)
+        // Soft reconnect — no radio reset, but always escape PPP data mode first.
+        // After a reconnect attempt that got CONNECT but failed IPCP, the modem
+        // stays in PPP data mode. Without +++ guard, ATH is sent as PPP frame
+        // bytes and the modem ignores it; all subsequent AT commands (CEREG, etc.)
+        // time out for the full 3-minute window. This is the primary cause of
+        // repeated "registration timeout" failures in the soft reconnect path.
+        g_hal->clock->delay_ms(1100);
+        mdm_write("+++", 3);
+        g_hal->clock->delay_ms(1100);
+        mdm_flush();
+        // 1. Hang up cleanly (safe in both command and data mode after +++)
         modem_at_cmd("ATH", resp, sizeof(resp), 2000);
         // 2. Explicitly deactivate the PDP context — the modem may still think
         //    context 1 is active after the carrier terminated the bearer, causing
