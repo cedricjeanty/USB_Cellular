@@ -27,16 +27,28 @@ struct ModemReconnectResult {
 };
 
 // Reconnect PPP after a connection drop.
-// resetRadio=true: full CFUN=0/1 power-cycle (use sparingly — repeated resets
-//   degrade the SIM7600 and can leave it unresponsive for 30+ minutes).
-// resetRadio=false: soft reconnect — just hang up and re-register without
-//   cycling the radio (preferred for first few retry attempts).
+//
+// resetRadio=false (preferred): PDP-context deactivate + re-register + redial.
+//   Does NOT use CFUN=0/1. After a carrier-terminated session the radio stays
+//   registered; CFUN=0/1 would cause a real deregistration and force a 30-60s
+//   re-attach cycle that makes things worse. AT+CGACT=0,1 cleanly deactivates
+//   the stale PDP context so the next ATD*99 gets a fresh bearer.
+//
+// resetRadio=true (last resort): +++ escape → ATH → CFUN=0/1 → re-register.
+//   Only use when the modem is completely unresponsive (not after a normal
+//   carrier-terminated PPP drop).
+//
+// Registration check uses AT+CEREG (LTE packet-domain), NOT AT+CREG.
+// T-Mobile denies voice registration (CREG returns state 3) but grants LTE
+// data registration (CEREG returns state 5 = roaming). Checking CREG will
+// always time out on T-Mobile/Hologram LTE-only SIMs.
 inline ModemReconnectResult modemReconnect(bool resetRadio = true) {
     ModemReconnectResult r = {};
     char resp[256];
 
     if (resetRadio) {
-        // Full reset: escape PPP data mode, hang up, power-cycle radio
+        // Genuine modem reset: escape PPP mode, hang up, power-cycle radio.
+        // Only needed when the modem stopped responding to AT commands.
         g_hal->clock->delay_ms(1100);
         mdm_write("+++", 3);
         g_hal->clock->delay_ms(1100);
@@ -47,14 +59,28 @@ inline ModemReconnectResult modemReconnect(bool resetRadio = true) {
         modem_at_cmd("AT+CFUN=1", resp, sizeof(resp), 5000);
         g_hal->clock->delay_ms(5000);
     } else {
-        // Soft reconnect: hang up (in case still in dial state) and re-register
+        // Normal reconnect after carrier-terminated session:
+        // 1. Hang up cleanly (exits PPP mode if needed)
         modem_at_cmd("ATH", resp, sizeof(resp), 2000);
-        g_hal->clock->delay_ms(1000);
+        // 2. Explicitly deactivate the PDP context — the modem may still think
+        //    context 1 is active after the carrier terminated the bearer, causing
+        //    ATD*99 to return CONNECT on a dead context (IPCP never completes).
+        modem_at_cmd("AT+CGACT=0,1", resp, sizeof(resp), 5000);
+        // Allow the network to fully release the previous session
+        g_hal->clock->delay_ms(5000);
     }
 
-    // 3. Wait for registration (up to 60s)
+    // Wait for LTE data registration (up to 60s).
+    // Use AT+CEREG (LTE/EPS), not AT+CREG (2G/3G voice).
+    // T-Mobile/Hologram denies CREG (voice) but grants CEREG (data roaming).
     for (int w = 0; w < 30; w++) {
-        modem_at_cmd("AT+CREG?", resp, sizeof(resp), 2000);
+        modem_at_cmd("AT+CEREG?", resp, sizeof(resp), 2000);
+        if (strstr(resp, ",1") || strstr(resp, ",5")) {
+            r.registered = true;
+            break;
+        }
+        // Also accept CGREG (2G/3G packet domain) as fallback
+        modem_at_cmd("AT+CGREG?", resp, sizeof(resp), 2000);
         if (strstr(resp, ",1") || strstr(resp, ",5")) {
             r.registered = true;
             break;
@@ -63,18 +89,24 @@ inline ModemReconnectResult modemReconnect(bool resetRadio = true) {
     }
     if (!r.registered) return r;
 
-    // 4. Read RSSI
+    // Read RSSI — CSQ=99 may appear briefly after mode changes; retry once.
     modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000);
     {
         char* p = strstr(resp, "+CSQ:");
         if (p) {
             int rssi = 99;
             sscanf(p, "+CSQ: %d", &rssi);
+            if (rssi == 99) {
+                g_hal->clock->delay_ms(3000);
+                modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000);
+                p = strstr(resp, "+CSQ:");
+                if (p) sscanf(p, "+CSQ: %d", &rssi);
+            }
             if (rssi != 99) r.rssi = rssi;
         }
     }
 
-    // 5. Read operator
+    // Read operator
     if (modem_at_cmd("AT+COPS?", resp, sizeof(resp), 2000) > 0) {
         char* q1 = strchr(resp, '"');
         if (q1) {
@@ -88,14 +120,16 @@ inline ModemReconnectResult modemReconnect(bool resetRadio = true) {
         }
     }
 
-    // 6. Re-set APN (CRITICAL — lost after AT+CFUN=0)
+    // Always re-state APN before redialing (required after any mode change)
     modem_at_cmd("AT+CGDCONT=1,\"IP\",\"hologram\"", resp, sizeof(resp), 5000);
 
-    // 7. Redial PPP (3 attempts)
+    // Redial PPP (3 attempts)
     for (int attempt = 0; attempt < 3 && !r.connected; attempt++) {
         if (attempt > 0) {
             modem_at_cmd("ATH", resp, sizeof(resp), 2000);
+            modem_at_cmd("AT+CGACT=0,1", resp, sizeof(resp), 3000);
             g_hal->clock->delay_ms(5000);
+            modem_at_cmd("AT+CGDCONT=1,\"IP\",\"hologram\"", resp, sizeof(resp), 5000);
         }
         mdm_write("ATD*99#\r", 8);
 
