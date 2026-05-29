@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260527170000"
+#define FW_VERSION "20260528100000"
 
 #include <cstring>
 #include <ctime>
@@ -651,13 +651,6 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
 
 static uint32_t g_msc_write_calls = 0;
 static uint32_t g_msc_write_reject = 0;
-// Per-boot MSC write cap. Limits the worst-case bulk transfer when the cookie
-// is missing or the DSU ignores it — prevents accidentally pulling an entire
-// flight history over cellular. Harvest still runs after the cap fires; the
-// next boot resumes from the cookie that harvest writes.
-static const uint64_t MSC_BOOT_CAP_BYTES = 100ULL * 1024 * 1024;
-static volatile uint64_t g_mscBytesWritten = 0;
-static volatile bool     g_mscCapHit = false;
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                             uint8_t *buffer, uint32_t bufsize) {
     (void)lun; (void)offset;
@@ -665,7 +658,6 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
     if (g_msc_write_calls == 1) log_write("SCSI: first WRITE10 lba=%lu len=%lu", (unsigned long)lba, (unsigned long)bufsize);
     if (lba + bufsize / 512 > msc_visible_sectors()) { g_msc_write_reject++; return -1; }
     if (!g_sd_ready || g_harvesting || g_msc_ejected) { g_msc_write_reject++; return -1; }
-    if (g_mscCapHit) { g_msc_write_reject++; return -1; }
     if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return -1;
     esp_err_t err = sdmmc_write_sectors(g_card, buffer, lba, bufsize / 512);
     xSemaphoreGive(g_sd_mutex);
@@ -673,15 +665,8 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
         g_lastWriteMs      = millis();
         g_lastIoMs         = g_lastWriteMs;
         g_writeDetected    = true;
-        g_hostWasConnected = true;  // any write proves a host is connected
+        g_hostWasConnected = true;
         g_hostWrittenMb   += bufsize / 1e6f;
-        g_mscBytesWritten += bufsize;
-        if (!g_mscCapHit && g_mscBytesWritten >= MSC_BOOT_CAP_BYTES) {
-            g_mscCapHit = true;
-            log_write("MSC: %llu MB cap reached — disconnecting USB; harvest will resume next boot",
-                      (unsigned long long)(g_mscBytesWritten / (1024 * 1024)));
-            tud_disconnect();
-        }
     }
     return (err == ESP_OK) ? (int32_t)bufsize : -1;
 }
@@ -1938,6 +1923,133 @@ static bool s3ApiComplete(const char* uploadId, const char* key,
     return ok;
 }
 
+// ── Aircraft manifest API ────────────────────────────────────────────────────
+// GET /prod/aircraft/manifest?serial=X  → {high_water_mark: N, ...}
+// Returns the hwm (0 on error or no manifest).
+static uint32_t s3FetchManifest(const char* serial) {
+    if (!s3LoadCreds()) return 0;
+    esp_tls_t* tls = tls_connect(g_apiHost);
+    if (!tls) return 0;
+    char req[512];
+    int rlen = snprintf(req, sizeof(req),
+        "GET /prod/aircraft/manifest?serial=%s HTTP/1.1\r\n"
+        "Host: %s\r\nx-api-key: %s\r\nConnection: close\r\n\r\n",
+        serial, g_apiHost, g_apiKey);
+    if (!tls_write_all(tls, req, rlen)) { tls_destroy(tls); return 0; }
+    std::string resp = httpReadResponse(tls);
+    tls_destroy(tls);
+    int32_t hwm = jsonInt(resp, "\"high_water_mark\"");
+    return (hwm > 0) ? (uint32_t)hwm : 0;
+}
+
+// POST /prod/aircraft/manifest with JSON body → update manifest + advance hwm.
+static bool s3UpdateManifest(const char* serial, uint32_t firstFlight,
+                             uint32_t lastFlight, const char* s3Key) {
+    if (!s3LoadCreds()) return false;
+    esp_tls_t* tls = tls_connect(g_apiHost);
+    if (!tls) return false;
+    char body[512];
+    int bodyLen = snprintf(body, sizeof(body),
+        "{\"serial\":\"%s\",\"last_flight\":%lu,\"first_flight\":%lu,\"s3_key\":\"%s\"}",
+        serial, (unsigned long)lastFlight, (unsigned long)firstFlight, s3Key ? s3Key : "");
+    char hdr[512];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "POST /prod/aircraft/manifest HTTP/1.1\r\n"
+        "Host: %s\r\nx-api-key: %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\nConnection: close\r\n\r\n",
+        g_apiHost, g_apiKey, bodyLen);
+    bool ok = tls_write_all(tls, hdr, hlen) && tls_write_all(tls, body, bodyLen);
+    if (ok) {
+        std::string resp = httpReadResponse(tls);
+        ok = resp.find("\"high_water_mark\"") != std::string::npos;
+        if (!ok) cdc_printf("Manifest update failed: %.200s", resp.c_str());
+    }
+    tls_destroy(tls);
+    return ok;
+}
+
+// Scan a .eaofh file to find the byte offset where flight (hwm+1) begins.
+// Uses firstFlight/lastFlight from the .meta sidecar to estimate position,
+// then scans a ±3-flight window. FILE* f must be open. fileSize = total bytes.
+// Returns 0 when first_flight > hwm (all content is new; caller uploads from 0).
+// Returns fileSize when all content is already covered (caller should skip).
+static uint64_t findSplitOffset(FILE* f, uint64_t fileSize,
+                                uint32_t firstFlight, uint32_t lastFlight,
+                                uint32_t hwm) {
+    if (firstFlight > hwm)   return 0;           // entirely new
+    if (lastFlight  <= hwm)  return fileSize;     // entirely old
+
+    uint32_t total = lastFlight - firstFlight + 1;
+    uint32_t avg   = (total > 0) ? (uint32_t)(fileSize / total) : 0;
+    if (avg == 0) return 0;
+
+    // Estimate byte position of hwm's 0x4C record
+    float frac    = (float)(hwm - firstFlight + 1) / (float)total;
+    uint64_t est  = (uint64_t)(frac * (float)fileSize);
+    uint64_t win  = (uint64_t)avg * 3;           // ±3 flight widths
+    uint64_t scan_start = (est > win) ? (est - win) : 0;
+    uint64_t scan_end   = est + win;
+    if (scan_end > fileSize) scan_end = fileSize;
+
+    // Buffered forward scan over the window
+    const uint32_t CHUNK = 4096;
+    uint8_t buf[CHUNK + 4];
+    uint64_t pos   = scan_start;
+    uint64_t hwm_block_end = 0;  // blockEnd of the hwm 0x4C (= start of hwm+1 block)
+    uint32_t carry = 0;
+
+    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+    fseek(f, (long)scan_start, SEEK_SET);
+    xSemaphoreGive(g_sd_mutex);
+
+    while (pos < scan_end) {
+        uint32_t want = (scan_end - pos > CHUNK) ? CHUNK : (uint32_t)(scan_end - pos);
+        xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+        uint32_t got = (uint32_t)fread(buf + carry, 1, want, f);
+        xSemaphoreGive(g_sd_mutex);
+        if (got == 0) break;
+        uint32_t avail = carry + got;
+
+        for (uint32_t i = 0; i + 3 < avail; i++) {
+            if (buf[i] != 0xEA || buf[i+1] != 0x4C) continue;
+            uint16_t rlen = ((uint16_t)buf[i+2] << 8) | buf[i+3];
+            if (rlen < 28) continue;
+            uint64_t recAbs = (pos - carry) + i;
+            if (recAbs + rlen > fileSize) continue;
+
+            // Read body[20:22] = flight BE u16
+            uint8_t fnum[2];
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+            long savedPos = ftell(f);
+            fseek(f, (long)(recAbs + 4 + 20), SEEK_SET);
+            bool gotBytes = (fread(fnum, 1, 2, f) == 2);
+            fseek(f, savedPos, SEEK_SET);
+            xSemaphoreGive(g_sd_mutex);
+            if (!gotBytes) continue;
+
+            uint32_t fl = ((uint32_t)fnum[0] << 8) | fnum[1];
+            if (fl == hwm) {
+                hwm_block_end = recAbs + rlen;
+            } else if (fl > hwm) {
+                // First flight past hwm found
+                return (hwm_block_end > 0) ? hwm_block_end : recAbs;
+            }
+        }
+
+        // Carry last 3 bytes across chunk boundary
+        if (avail >= 3) {
+            carry = 3;
+            memmove(buf, buf + avail - 3, 3);
+        } else {
+            carry = avail;
+            memmove(buf, buf, carry);
+        }
+        pos += got;
+    }
+    return hwm_block_end;  // 0 if we never found hwm record (unusual)
+}
+
 // ── OTA firmware update ─────────────────────────────────────────────────────
 
 // versionNewer() — moved to airbridge_utils.h
@@ -2269,9 +2381,18 @@ static int otaCheck() {
     return 1;
 }
 
-// Upload a file from /sdcard/upload/<relPath> to S3 using pre-signed URLs.
-// relPath is "NNNN/filename" (e.g. "0001/data.csv")
+// Upload a file from /sdcard/upload/<relPath> to S3.
+// s3KeyOverride: if non-null, use as the full S3 key instead of {device}/{relPath}.
+// startOffset: begin reading the file at this byte (0 = from start).
+static bool s3UploadFileEx(const char* relPath, const char* s3KeyOverride,
+                           uint64_t startOffset);
+
 static bool s3UploadFile(const char* relPath) {
+    return s3UploadFileEx(relPath, nullptr, 0);
+}
+
+static bool s3UploadFileEx(const char* relPath, const char* s3KeyOverride,
+                           uint64_t startOffset) {
     if (!g_netConnected && !g_pppConnected) { cdc_printf("S3: no network\r\n"); return false; }
     if (!s3LoadCreds()) return false;
     g_tlsActive = true;  // suppress +++ for entire upload session
@@ -2281,17 +2402,24 @@ static bool s3UploadFile(const char* relPath) {
 
     xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
     FILE* f = fopen(fpath, "rb");
-    uint32_t fileSize = 0;
+    uint32_t totalFileSize = 0;
     if (f) {
         fseek(f, 0, SEEK_END);
-        fileSize = ftell(f);
-        fseek(f, 0, SEEK_SET);
+        totalFileSize = (uint32_t)ftell(f);
+        // Seek to startOffset (0 for normal uploads, >0 for delta uploads)
+        fseek(f, (long)startOffset, SEEK_SET);
     }
     xSemaphoreGive(g_sd_mutex);
-    if (!f || fileSize == 0) {
+    if (!f || totalFileSize == 0) {
         cdc_printf("S3: can't open %s", fpath);
         if (f) fclose(f);
         return false;
+    }
+    // Upload size = bytes from startOffset to EOF
+    uint32_t fileSize = (startOffset < totalFileSize) ? (totalFileSize - (uint32_t)startOffset) : 0;
+    if (fileSize == 0) {
+        xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
+        return true;  // nothing to upload (delta already covered)
     }
 
     static char s3Path[2500];  // shared, STS tokens are long
@@ -2299,8 +2427,15 @@ static bool s3UploadFile(const char* relPath) {
     // ── Small file: single pre-signed PUT ────────────────────────────────
     if (fileSize <= S3_CHUNK_SIZE) {
         std::string enc = urlEncode(relPath);
-        char query[512];
-        snprintf(query, sizeof(query), "file=%s&size=%u&device=%s", enc.c_str(), fileSize, g_deviceId);
+        char query[640];
+        if (s3KeyOverride) {
+            std::string encKey = urlEncode(s3KeyOverride);
+            snprintf(query, sizeof(query), "file=%s&size=%u&device=%s&key=%s",
+                     enc.c_str(), fileSize, g_deviceId, encKey.c_str());
+        } else {
+            snprintf(query, sizeof(query), "file=%s&size=%u&device=%s",
+                     enc.c_str(), fileSize, g_deviceId);
+        }
         std::string resp = s3ApiGet(query);
 
         // Skip upload if S3 already has this file (e.g. log uploaded via incremental)
@@ -2399,8 +2534,15 @@ static bool s3UploadFile(const char* relPath) {
     // Start new multipart upload if no session
     if (!uploadId[0]) {
         std::string enc = urlEncode(relPath);
-        char query[512];
-        snprintf(query, sizeof(query), "file=%s&size=%u&device=%s", enc.c_str(), fileSize, g_deviceId);
+        char query[640];
+        if (s3KeyOverride) {
+            std::string encKey = urlEncode(s3KeyOverride);
+            snprintf(query, sizeof(query), "file=%s&size=%u&device=%s&key=%s",
+                     enc.c_str(), fileSize, g_deviceId, encKey.c_str());
+        } else {
+            snprintf(query, sizeof(query), "file=%s&size=%u&device=%s",
+                     enc.c_str(), fileSize, g_deviceId);
+        }
         std::string resp = s3ApiGet(query);
 
         // Skip if S3 already has this file
@@ -2443,13 +2585,13 @@ static bool s3UploadFile(const char* relPath) {
         cdc_printf("S3: resuming multipart at part %u/%u", startPart, totalParts);
     }
 
-    // Seek file to resume position
+    // Seek file to resume position. For delta uploads, startOffset is already applied
+    // (file was opened and seeked to startOffset above); part offsets are relative to that.
     uint32_t resumeOffset = (startPart - 1) * S3_CHUNK_SIZE;
-    if (resumeOffset > 0) {
-        xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-        fseek(f, resumeOffset, SEEK_SET);
-        xSemaphoreGive(g_sd_mutex);
-    }
+    uint64_t seekTarget = startOffset + resumeOffset;
+    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+    fseek(f, (long)seekTarget, SEEK_SET);
+    xSemaphoreGive(g_sd_mutex);
 
     uint32_t xfrStart = millis();
 
@@ -3273,10 +3415,14 @@ static void modemTask(void* param) {
                 lastPppRxMs = millis();
                 test_launched = false;
                 cdc_printf("Modem: PPP CONNECT — negotiating...\r\n");
-                log_write("Modem: PPP redial CONNECT");
-                // Restart lwIP PPP state machine — after a drop+CFUN reset the
-                // netif is in DEAD/STOPPED state and ignores incoming LCP frames
-                // until esp_netif_action_connected() puts it back to STARTING.
+                log_write("Modem: PPP redial CONNECT (attempt %d)", s_reconnect_failures + 1);
+                // Full PPP state machine reset: stop→start→connected.
+                // After many reconnect cycles esp_netif_action_connected() alone
+                // fails to restart LCP — the state machine accumulates STOPPED/CLOSED
+                // state across cycles and ignores the connected transition.
+                esp_netif_action_disconnected(g_ppp_netif, nullptr, 0, nullptr);
+                esp_netif_action_stop(g_ppp_netif, nullptr, 0, nullptr);
+                esp_netif_action_start(g_ppp_netif, nullptr, 0, nullptr);
                 esp_netif_action_connected(g_ppp_netif, nullptr, 0, nullptr);
             } else if (!rr.registered) {
                 s_reconnect_failures++;
@@ -3614,6 +3760,68 @@ static void uploadTask(void* param) {
     // Old boot logs are moved to SD root at boot (see app_main) so the
     // normal harvest → upload pipeline handles them. No TLS needed here.
 
+    // ── Manifest-based cookie sync (fleet-aware) ──────────────────────────
+    // On AirBridge swap: the local cookie may be stale. Query S3 manifest for
+    // the DSU serial (from NVS cache or current dsuCookie on SD) and advance
+    // the local cookie to the S3 high_water_mark if it's higher.
+    if (!g_s3CookieActive && (g_netConnected || g_pppConnected) && s3LoadCreds()) {
+        // Read DSU serial + local flight from the cookie on SD (single-partition only;
+        // dual-partition P1 is not mounted at this point — fall back to NVS cache).
+        char bootSerial[44] = "";
+        uint32_t bootLocalFlight = 0;
+        if (!g_dual_partition) {
+            char cookiePath[64];
+            snprintf(cookiePath, sizeof(cookiePath), "%s/dsuCookie.easdf", SD_MOUNT);
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+            FILE* cf = fopen(cookiePath, "rb");
+            if (cf) {
+                uint8_t ck[78];
+                if (fread(ck, 1, 78, cf) == 78 && ck[0] == 0xEA && ck[1] == 0x1E) {
+                    size_t copyLen = sizeof(bootSerial) - 1;
+                    if (copyLen > 42) copyLen = 42;
+                    memcpy(bootSerial, ck + 9, copyLen);
+                    bootSerial[copyLen] = '\0';
+                    for (int j = (int)copyLen - 1; j >= 0; j--) {
+                        if ((uint8_t)bootSerial[j] < 0x20 || (uint8_t)bootSerial[j] > 0x7E)
+                            bootSerial[j] = '\0';
+                        else break;
+                    }
+                    bootLocalFlight = ((uint32_t)ck[62] << 24) | ((uint32_t)ck[63] << 16)
+                                    | ((uint32_t)ck[64] << 8) | ck[65];
+                    if (bootLocalFlight == 0xFFFFFFFF) { bootLocalFlight = 0; bootSerial[0] = '\0'; }
+                }
+                fclose(cf);
+            }
+            xSemaphoreGive(g_sd_mutex);
+        }
+        // Fall back to NVS cache for serial when SD cookie unavailable
+        if (!bootSerial[0]) {
+            nvs_handle_t nh;
+            if (nvs_open("mfst", NVS_READONLY, &nh) == ESP_OK) {
+                nvs_get_string(nh, "serial", bootSerial, sizeof(bootSerial));
+                uint32_t nhwm = 0;
+                nvs_get_u32(nh, "hwm", &nhwm);
+                if (nhwm > bootLocalFlight) bootLocalFlight = nhwm;
+                nvs_close(nh);
+            }
+        }
+        if (bootSerial[0]) {
+            uint32_t s3Hwm = s3FetchManifest(bootSerial);
+            log_write("Boot manifest sync: %s local=%lu S3=%lu",
+                      bootSerial, (unsigned long)bootLocalFlight, (unsigned long)s3Hwm);
+            if (s3Hwm > bootLocalFlight) {
+                uint8_t syncCookie[78];
+                buildDsuCookie(bootSerial, s3Hwm, syncCookie);
+                xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                write_cookie_to_dsu(syncCookie, 78);
+                xSemaphoreGive(g_sd_mutex);
+                log_write("Boot cookie synced to S3 hwm=%lu", (unsigned long)s3Hwm);
+                cdc_printf("Boot cookie sync: %s hwm=%lu\r\n", bootSerial, (unsigned long)s3Hwm);
+            }
+        }
+        g_tlsActive = false;
+    }
+
     // Signal main loop: OTA + cookie done, safe to present USB to host
     g_preUsbDone = true;
     log_write("Pre-USB tasks done — USB can be presented");
@@ -3667,6 +3875,9 @@ static void uploadTask(void* param) {
                     while ((ent = readdir(subDir)) != nullptr) {
                         if (ent->d_type == DT_DIR) continue;
                         if (ent->d_name[0] == '.') continue;
+                        // Skip .meta sidecars — they're helpers, not uploads
+                        size_t nlen = strlen(ent->d_name);
+                        if (nlen > 5 && strcmp(ent->d_name + nlen - 5, ".meta") == 0) continue;
                         char fullpath[192];
                         snprintf(fullpath, sizeof(fullpath), "%s/%s", subPath, ent->d_name);
                         struct stat st;
@@ -3708,13 +3919,110 @@ static void uploadTask(void* param) {
                 vTaskDelay(pdMS_TO_TICKS(60000)); continue;
             }
 
+            // ── Fleet-aware upload: manifest check for .eaofh files ──────────
+            // Statics persist across loop iterations for the serial/hwm cache.
+            static char  s_manifestSerial[44] = "";
+            static uint32_t s_manifestHwm    = 0;
+
+            // Extract just the filename from relPath ("NNNN/filename")
+            const char* uploadFname = strrchr(relPath, '/');
+            uploadFname = uploadFname ? uploadFname + 1 : relPath;
+
+            // Strip harvest path-flattening prefix ("flightHistory__", etc.)
+            // so parseEaofhFilename sees the bare DSU filename.
+            const char* bareFname = uploadFname;
+            for (const char* p = uploadFname; p[0] && p[1]; p++) {
+                if (p[0] == '_' && p[1] == '_') bareFname = p + 2;
+            }
+
+            char eaSerial[44]  = "";
+            uint32_t eaLast    = 0;
+            uint32_t eaFirst   = 0;
+            bool isEaofh = parseEaofhFilename(bareFname, eaSerial, sizeof(eaSerial), &eaLast);
+
+            if (isEaofh) {
+                // Fetch or use cached manifest hwm for this DSU serial
+                if (strcmp(s_manifestSerial, eaSerial) != 0) {
+                    s_manifestHwm = s3FetchManifest(eaSerial);
+                    strlcpy(s_manifestSerial, eaSerial, sizeof(s_manifestSerial));
+                    // Persist cache so next boot starts with known hwm
+                    nvs_handle_t nh;
+                    if (nvs_open("mfst", NVS_READWRITE, &nh) == ESP_OK) {
+                        nvs_set_str(nh, "serial", eaSerial);
+                        nvs_set_u32(nh, "hwm",    s_manifestHwm);
+                        nvs_commit(nh); nvs_close(nh);
+                    }
+                    log_write("Manifest: %s hwm=%lu", eaSerial, (unsigned long)s_manifestHwm);
+                }
+
+                if (eaLast <= s_manifestHwm) {
+                    // Entirely covered — skip upload, clean up local files
+                    log_write("Manifest skip: %s (last=%lu hwm=%lu)", uploadFname,
+                              (unsigned long)eaLast, (unsigned long)s_manifestHwm);
+                    cdc_printf("Manifest skip: %s\r\n", uploadFname);
+                    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                    remove(path);
+                    char metaPath[200];
+                    snprintf(metaPath, sizeof(metaPath), "%s.meta", path);
+                    remove(metaPath);
+                    xSemaphoreGive(g_sd_mutex);
+                    if (g_filesQueued > 0) g_filesQueued--;
+                    g_filesUploaded++;
+                    continue;
+                }
+
+                // Read .meta sidecar for first_flight
+                char metaPath[200];
+                snprintf(metaPath, sizeof(metaPath), "%s.meta", path);
+                FILE* mf = fopen(metaPath, "r");
+                if (mf) {
+                    unsigned long ff = 0, lf = 0;
+                    fscanf(mf, "%lu:%lu", &ff, &lf);
+                    fclose(mf);
+                    eaFirst = (uint32_t)ff;
+                }
+            }
+
             cdc_printf("Uploading: %s (%.1f MB) heap=%lu min=%lu\r\n",
                      relPath, fileMb,
                      (unsigned long)esp_get_free_heap_size(),
                      (unsigned long)esp_get_minimum_free_heap_size());
             g_uploadingMb = 0.0f;
             g_uploadBaseMb = 0.0f;
-            bool uploaded = s3UploadFile(relPath);
+
+            bool uploaded = false;
+            char eaS3Key[256] = "";
+            uint64_t splitOffset = 0;
+
+            if (isEaofh) {
+                // Build aircraft-namespaced S3 key using bare DSU filename (no harvest prefix)
+                snprintf(eaS3Key, sizeof(eaS3Key), "aircraft/%s/%s", eaSerial, bareFname);
+
+                if (eaFirst > 0 && eaFirst <= s_manifestHwm) {
+                    // File spans old+new data — find split point and upload tail only
+                    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                    FILE* sf = fopen(path, "rb");
+                    uint64_t totalSz = 0;
+                    if (sf) { fseek(sf, 0, SEEK_END); totalSz = (uint64_t)ftell(sf); }
+                    xSemaphoreGive(g_sd_mutex);
+                    if (sf) {
+                        splitOffset = findSplitOffset(sf, totalSz, eaFirst, eaLast, s_manifestHwm);
+                        xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                        fclose(sf);
+                        xSemaphoreGive(g_sd_mutex);
+                        // Guard: if split found nothing useful, upload from start
+                        if (splitOffset >= totalSz) splitOffset = 0;
+                    }
+                    log_write("Manifest delta: %s offset=%llu key=%s",
+                              uploadFname, (unsigned long long)splitOffset, eaS3Key);
+                    cdc_printf("Manifest delta: %s offset=%llu\r\n",
+                               uploadFname, (unsigned long long)splitOffset);
+                }
+                uploaded = s3UploadFileEx(relPath, eaS3Key, splitOffset);
+            } else {
+                uploaded = s3UploadFile(relPath);
+            }
+
             g_tlsActive = false;  // re-enable +++ after upload
             g_uploadingMb = 0.0f;
             g_uploadBaseMb = 0.0f;
@@ -3722,6 +4030,37 @@ static void uploadTask(void* param) {
                 cdc_printf("Upload failed for %s — retrying in 30s\r\n", relPath);
                 log_write("Upload FAIL: %s", relPath);
                 vTaskDelay(pdMS_TO_TICKS(30000)); continue;
+            }
+
+            // After successful .eaofh upload: update S3 manifest + local cookie
+            if (isEaofh && eaS3Key[0]) {
+                uint32_t newFirst = (eaFirst > 0 && eaFirst <= s_manifestHwm)
+                                    ? (s_manifestHwm + 1) : (eaFirst > 0 ? eaFirst : 1);
+                bool mOk = s3UpdateManifest(eaSerial, newFirst, eaLast, eaS3Key);
+                if (mOk) {
+                    s_manifestHwm = eaLast;
+                    // Update NVS cache
+                    nvs_handle_t nh;
+                    if (nvs_open("mfst", NVS_READWRITE, &nh) == ESP_OK) {
+                        nvs_set_u32(nh, "hwm", s_manifestHwm); nvs_commit(nh); nvs_close(nh);
+                    }
+                    // Advance DSU cookie to confirmed S3 hwm
+                    if (eaSerial[0]) {
+                        uint8_t newCookie[78];
+                        buildDsuCookie(eaSerial, s_manifestHwm, newCookie);
+                        xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                        write_cookie_to_dsu(newCookie, 78);
+                        xSemaphoreGive(g_sd_mutex);
+                        log_write("Cookie updated: %s flight %lu",
+                                  eaSerial, (unsigned long)s_manifestHwm);
+                    }
+                }
+                // Clean up .meta sidecar (regardless of manifest update result)
+                xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                char metaCleanPath[200];
+                snprintf(metaCleanPath, sizeof(metaCleanPath), "%s.meta", path);
+                remove(metaCleanPath);
+                xSemaphoreGive(g_sd_mutex);
             }
 
             // Delete uploaded file and remove subfolder if empty
