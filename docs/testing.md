@@ -1,5 +1,25 @@
 # Testing
 
+## ESP32-S3 (active)
+
+The active variant has two test layers, both running the shared `airbridge_*.h` logic:
+
+- **Native Unity unit tests** — `esp32/test/test_native_*/` (16 suites: proto, dsu,
+  harvest, modem, modem_init, http, s3, ppp, nvs, cli, display, runtime, triggers,
+  utils, sd_block, sd_format). Run on the host via PlatformIO native env, no hardware.
+  ```bash
+  cd esp32 && pio test -e native
+  ```
+- **End-to-end suite** — `scripts/e2e_unified.sh` (TEST 1–23) runs the same scenarios
+  against the SDL2 emulator or real hardware:
+  ```bash
+  scripts/e2e_unified.sh --target emulator   # SimModem PTY + FakeSD, no hardware
+  scripts/e2e_unified.sh --target device     # CoolGear-power-cycled hardware
+  ```
+  Known pre-existing failures are tracked in project memory.
+
+The sections below cover the **legacy Raspberry Pi** pytest suite.
+
 ## Unit tests (no hardware required)
 
 ```bash

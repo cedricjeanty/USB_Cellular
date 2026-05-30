@@ -2,17 +2,19 @@
 
 ## Single-file firmware: `esp32/src/main.cpp`
 
-Both Arduino and ESP-IDF branches use a single source file (~2500 lines) with
-FreeRTOS tasks for concurrent operations.
+Both Arduino and ESP-IDF branches use a single source file (~5400 lines). `main.cpp`
+holds the ESP-IDF glue + FreeRTOS task wiring; the hardware-independent logic lives in
+`esp32/include/airbridge_*.h` (see the File Map in CLAUDE.md). The active branch is
+ESP-IDF + cellular; WiFi/captive-portal and the interactive CLI are disabled.
 
 ## FreeRTOS Tasks
 
-| Task | Stack | Core | Purpose |
-|------|-------|------|---------|
-| `uploadTask` | 16KB | 1 | Upload files from /harvested/ to S3 |
-| `harvestTask` | 16KB | 1 | Copy new files from SD root to /harvested/ |
-| `wifiTask` | 8KB | 1 | WiFi STA connection + captive portal AP |
-| `main_loop_task` | 4KB | 0 | Display update, harvest trigger, CLI processing |
+| Task | Stack | Core | Priority | Purpose |
+|------|-------|------|----------|---------|
+| `modemTask` | 16KB | 0 | 2 | UART→PPPoS pump, reconnection, log upload |
+| `uploadTask` | 16KB | 1 | 1 | OTA check + upload files from /harvested/ to S3 |
+| `harvestTask` | 16KB | 1 | 1 | Copy new files from SD root to /harvested/ |
+| `main_loop_task` | 4KB | 0 | 1 | Display update, USB presentation delay, modem watchdog |
 
 ## SD Card / FATFS / MSC Interaction
 
@@ -30,7 +32,7 @@ All SD access is guarded by a FreeRTOS mutex:
 
 ### Harvest Flow
 
-1. Detect USB quiet window (30s no writes, >10KB written)
+1. Detect USB quiet window (15s no writes — `QUIET_WINDOW_MS`)
 2. Set `g_harvesting=true`, eject MSC media
 3. Take SD mutex
 4. Unmount + remount FATFS (refresh after MSC writes)
@@ -53,24 +55,13 @@ All SD access is guarded by a FreeRTOS mutex:
 - `sd.begin()` during harvest refreshes the FS cache
 - MSC callbacks use Arduino `USBMSC` class wrapping TinyUSB
 
-## WiFi State Machine
+## WiFi / Captive Portal (disabled on the active branch)
 
-Three states: `WS_TRY_KNOWN` → `WS_CONNECTED` ↔ `WS_AP`
-
-- **TRY_KNOWN:** Try saved networks from NVS (10s timeout each)
-- **CONNECTED:** Poll connection every 5s, monitor RSSI
-- **AP:** Start captive portal after 60s disconnected, retry saved networks every 5min
-
-ESP-IDF uses event-driven WiFi (`esp_event` handlers set EventGroup bits).
-Arduino uses polling (`WiFi.status()`).
-
-## Captive Portal
-
-- DNS server redirects all queries to AP IP (192.168.4.1)
-- HTTP server serves WiFi config form at any path
-- Form POST with SSID/password → test connection → save to NVS
-- ESP-IDF: `esp_http_server` + raw UDP socket for DNS
-- Arduino: `WebServer` + `DNSServer` libraries
+The active ESP-IDF + cellular branch runs **without WiFi** to free heap for PPPoS +
+mbedTLS. `wifi_init()` is not called and `wifiTask` is never started; the WiFi state
+machine, captive portal, and DNS server in `main.cpp` are dormant. The credential logic
+remains extracted in `airbridge_wifi_creds.h` (with native tests) for the WiFi-capable
+Arduino fallback branch (`esp32-s3`).
 
 ## Display (SSD1306 OLED)
 

@@ -22,7 +22,7 @@ harvest files when idle, and upload via cellular.
 
 **OTA:** Auto-updates via S3. Dual OTA partitions (ota_0 + ota_1, 1.875 MB each). Rollback on crash loop.
 
-**Source:** `esp32/src/main.cpp` (PlatformIO, single-file firmware ~4500 lines)
+**Source:** `esp32/src/main.cpp` (PlatformIO, single-file firmware ~5400 lines)
 
 **Two firmware branches:**
 - `esp32-s3` — Arduino framework (90 KB/s upload, fallback)
@@ -55,8 +55,9 @@ harvest files when idle, and upload via cellular.
 ### Serial / CDC
 
 CDC is **log-only** (no RX callback, no interactive CLI). All configuration is via SD
-magic files. CLI code is kept as dead code for reference. STATUS is logged automatically
-every 60s via `airbridge_log()`.
+magic files. The interactive CLI was removed from `main.cpp`; its command-parsing logic
+survives (extracted + unit-tested) in `airbridge_cli.h` but is not wired up. STATUS is
+logged automatically every 60s via `airbridge_log()`.
 
 ### SD Magic Files
 
@@ -162,37 +163,83 @@ delayed echo-reply could falsely trigger reconnect on a healthy link.
 
 - **[S3 Upload Architecture](docs/upload.md)** — pre-signed URLs, Lambda backend, multipart, NVS resume
 - **[Build & Flash](docs/deployment.md)** — PlatformIO build, 1200-baud touch, flashing both branches
-- **[Code Architecture](docs/architecture.md)** — FreeRTOS tasks, SD/FATFS/MSC interaction, WiFi state machine
+- **[Code Architecture](docs/architecture.md)** — FreeRTOS tasks, SD/FATFS/MSC interaction
 - **[Debugging Tips](docs/debugging.md)** — common issues, ESP-IDF vs Arduino differences, sdkconfig
 - **[Legacy Pi Hardware](docs/pi-legacy.md)** — Raspberry Pi variant (being deprecated)
-- **[Testing](docs/testing.md)** — pytest suite, marks, fixtures
+- **[Testing](docs/testing.md)** — native Unity tests, emulator/hardware E2E, legacy Pi pytest
+- **[Header De-dup Plan](docs/refactor-header-dedup.md)** — route firmware upload/modem paths through the shared headers (planned)
 
 ## File Map
 
-### ESP32-S3
-* `esp32/src/main.cpp` — Single-file firmware: USB MSC, cellular, harvest, S3 upload, OTA, OLED, CLI
-* `esp32/platformio.ini` — PlatformIO build config (Arduino on esp32-s3, ESP-IDF on esp32-idf)
-* `esp32/partitions.csv` — Dual OTA partition table (ota_0 + ota_1, 1.875 MB each)
-* `esp32/sdkconfig.defaults` — ESP-IDF branch: lwIP/mbedTLS tuning (32KB TCP buffers)
-* `esp32/components/esp_tinyusb/` — ESP-IDF branch: local TinyUSB with custom MSC callbacks
-* `esp32/include/airbridge_log.h` — Unified logging: ring buffer + serial + SD flush
-* `esp32/include/airbridge_harvest.h` — Recursive directory walk, file move to /harvested/NNNN/
-* `esp32/include/airbridge_proto.h` — DSU cookie builder, CRC-16, filename parser, chunked decode
-* `esp32/include/airbridge_triggers.h` — Harvest trigger logic (15s quiet window)
-* `esp32/include/airbridge_utils.h` — JSON helpers, URL encode/decode, version compare, file skip list
-* `esp32/include/airbridge_modem.h` — modemAtSync(), modemRunInit(), modemReconnect() (CEREG/CGACT reconnect sequence)
-* `esp32/emu/main.cpp` — SDL2 emulator (~870 lines): SimModem via PTY, FileNvs, FakeSD
-* `esp32/lib/fatfs_native/` — Standalone FatFs build for native tests (no ESP-IDF/FreeRTOS deps)
-* `esp32/test/test_native_sd_format/` — Native unit tests: MBR partition type manipulation (no FatFs needed)
-* `esp32/test/test_native_sd_block/` — Native block-level tests: real FatFs against FakeSd in-memory disk
-* `lambda/presign.py` — Lambda: S3 pre-signed URLs, firmware version check, DSU cookie, OTA download URL, log append
-* `scripts/e2e_unified.sh` — Unified E2E test suite (18 emulator / 12 hardware tests). `--target emulator` or `--target device`.
-* `scripts/commission.sh` — Device commissioning (flash, format SD, verify cellular/OTA/USB)
-* `scripts/coolgear.py` — CoolGear USB hub power control for automated testing
+The ESP32-S3 codebase is organized so that **all hardware-independent logic lives in
+`esp32/include/airbridge_*.h` headers** that compile into BOTH the firmware (`main.cpp`)
+and the native emulator/unit tests through the HAL (`esp32/include/hal/`). The firmware
+glues these headers to ESP-IDF drivers; the emulator/tests glue them to fakes. New
+shared logic belongs in a header, not duplicated in `main.cpp` (see Developer Brief).
 
-### Raspberry Pi (legacy)
-* `src/airbridge/main.py` — Primary state machine (harvest loop + upload worker thread)
-* `src/airbridge/wifi_manager.py` — WiFi status, rssi_to_csq(), upload_ftp/http()
-* `src/airbridge/captive_portal.py` — NM hotspot AP + captive portal HTTP server
-* `src/airbridge/display_handler.py` — SSD1306 OLED display
-* `config.yaml` — FTP server settings, poll interval, wifi_ap section
+### ESP32-S3 (esp32-idf branch, active)
+
+```
+esp32/
+├── src/main.cpp                 # Firmware entry: USB MSC, FreeRTOS task wiring, ESP-IDF glue (~5400 lines)
+│
+├── include/                     # ── Shared, hardware-independent logic (firmware + emulator + tests) ──
+│   ├── DSU protocol & data
+│   │   ├── airbridge_proto.h    #   DSU cookie builder, CRC-16, filename parser, chunked decode
+│   │   └── airbridge_harvest.h  #   Recursive dir walk, file move to /harvested/NNNN/, skip list
+│   ├── Cellular
+│   │   ├── airbridge_modem.h    #   modemAtSync/modemRunInit/modemReconnect (CEREG/CGACT sequence)
+│   │   └── ppp_proto.h          #   Minimal PPP (HDLC/LCP/IPCP) — used by the modem simulator
+│   ├── Upload
+│   │   ├── airbridge_s3.h       #   S3 upload: single PUT + multipart, NVS resume/retry, manifest/delta
+│   │   └── airbridge_http.h     #   HTTP response parsing + S3 API calls (presign/complete) via HAL
+│   ├── Runtime & UI
+│   │   ├── airbridge_log.h      #   Ring buffer + serial + SD flush logging
+│   │   ├── airbridge_runtime.h  #   OTA version check, speed calc, STATUS formatting
+│   │   ├── airbridge_display.h  #   SSD1306 page rendering (via HAL display)
+│   │   ├── airbridge_triggers.h #   Harvest trigger logic (15s quiet window)
+│   │   └── airbridge_utils.h    #   JSON helpers, URL encode/decode, version compare, skip list
+│   ├── airbridge_cli.h          #   CLI command parsing — extracted/tested but DISABLED in firmware
+│   ├── airbridge_wifi_creds.h   #   WiFi MRU credential list — extracted/tested but WiFi DISABLED in firmware
+│   └── hal/                     #   Hardware Abstraction Layer: g_hal interfaces (nvs/uart/network/filesys/
+│                                #   display/clock) + native_impls.h (emulator) + test_impls.h (unit tests)
+│
+├── emu/main.cpp                 # SDL2 emulator (~1140 lines): wires headers to FakeSD/FileNvs + SimModem PTY
+├── include/sim_modem.h          # SIM7600 simulator: AT commands + PPP bridge via pppd
+├── include/sim_dsu.h            # Aircraft DSU simulator: reads cookie, emits only un-sent flights
+│
+├── lib/fatfs_native/            # Standalone FatFs for native tests (no ESP-IDF/FreeRTOS)
+├── test/test_native_*/          # 16 Unity test suites (proto, dsu, harvest, modem, modem_init, http,
+│                                #   s3, ppp, nvs, cli, display, runtime, triggers, utils, sd_block, sd_format)
+├── test/fixtures/               # Real .eaofh flight + metrics/ DSU fixtures for sim_dsu
+│
+├── platformio.ini               # Build config (Arduino on esp32-s3, ESP-IDF on esp32-idf)
+├── partitions.csv               # Dual OTA partition table (ota_0 + ota_1, 1.875 MB each)
+├── sdkconfig.defaults           # ESP-IDF lwIP/mbedTLS tuning (32KB TCP buffers)
+└── components/esp_tinyusb/      # Local TinyUSB fork: custom MSC read10/write10 callbacks
+```
+
+### Backend & tooling
+
+```
+lambda/presign.py                # S3 pre-signed URLs, fw version check, DSU cookie, OTA URL, log append
+scripts/
+├── e2e_unified.sh               # Unified E2E suite (TEST 1–23). --target emulator | device
+├── commission.sh                # Device commissioning (flash, format SD, verify cellular/OTA/USB)
+├── coolgear.py                  # CoolGear USB hub power control for automated power-cycle tests
+├── test_e2e_esp32.py            # Python E2E harness (hardware)
+├── test_upload_resume.py        # Multipart resume regression
+└── speed_test.py                # Upload throughput benchmark
+```
+
+### Raspberry Pi (legacy, being deprecated)
+
+```
+src/airbridge/
+├── main.py                      # Primary state machine (harvest loop + upload worker thread)
+├── wifi_manager.py              # WiFi status, rssi_to_csq(), upload_ftp/http()
+├── captive_portal.py            # NM hotspot AP + captive portal HTTP server
+└── display_handler.py           # SSD1306 OLED display
+config.yaml                      # FTP server settings, poll interval, wifi_ap section
+tests/                           # Pi-era pytest suite (see docs/testing.md)
+```
