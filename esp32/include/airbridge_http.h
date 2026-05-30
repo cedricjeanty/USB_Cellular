@@ -81,14 +81,48 @@ inline std::string buildApiGetRequest(const char* host, const char* apiKey, cons
     return std::string(req);
 }
 
+// Generic API request for arbitrary paths (not just /prod/presign).
+// path: full path + query string (e.g. "/prod/aircraft/manifest?serial=X")
+inline std::string buildApiRequestRaw(const char* host, const char* apiKey, const char* path) {
+    char req[512];
+    snprintf(req, sizeof(req),
+        "GET %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "x-api-key: %s\r\n"
+        "Connection: close\r\n\r\n",
+        path, host, apiKey);
+    return std::string(req);
+}
+
+inline std::string s3ApiGetPathViaHal(const char* host, const char* apiKey, const char* path) {
+    if (!g_hal || !g_hal->network) return "";
+    TlsHandle tls = g_hal->network->connect(host);
+    if (!tls) return "";
+    std::string req = buildApiRequestRaw(host, apiKey, path);
+    if (!g_hal->network->write(tls, req.c_str(), req.size())) {
+        g_hal->network->destroy(tls);
+        return "";
+    }
+    std::string resp = halHttpReadResponse(tls);
+    g_hal->network->destroy(tls);
+    return resp;
+}
+
 // Build an S3 API POST (complete) request string
 inline std::string buildApiCompleteRequest(const char* host, const char* apiKey,
                                             const char* uploadId, const char* key,
-                                            const char* partsJson) {
+                                            const char* partsJson,
+                                            const char* deviceId = nullptr) {
     char body[2048];
-    snprintf(body, sizeof(body),
-        "{\"upload_id\":\"%s\",\"key\":\"%s\",\"parts\":[%s]}",
-        uploadId, key, partsJson);
+    if (deviceId && deviceId[0]) {
+        snprintf(body, sizeof(body),
+            "{\"upload_id\":\"%s\",\"key\":\"%s\",\"device\":\"%s\",\"parts\":[%s]}",
+            uploadId, key, deviceId, partsJson);
+    } else {
+        snprintf(body, sizeof(body),
+            "{\"upload_id\":\"%s\",\"key\":\"%s\",\"parts\":[%s]}",
+            uploadId, key, partsJson);
+    }
     int bodyLen = strlen(body);
 
     char hdr[512];

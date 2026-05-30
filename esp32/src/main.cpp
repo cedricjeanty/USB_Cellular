@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260528100000"
+#define FW_VERSION "20260529160000"
 
 #include <cstring>
 #include <ctime>
@@ -3677,21 +3677,34 @@ static void uploadTask(void* param) {
     // Brief pause for network stack to stabilize (default route, DNS)
     if (g_pppConnected) vTaskDelay(pdMS_TO_TICKS(2000));
 
-    // ── OTA check (before USB presentation — cookie + update ready for host) ──
+    // ── OTA check: retry for the full 90s pre-USB window ────────────────────
+    // Keeps retrying on transient failures (TLS connect, server busy) until
+    // either the update succeeds, the version is current, or the 90s USB
+    // presentation deadline arrives. Prevents premature "main screen" display.
     if (!otaDone && (g_netConnected || g_pppConnected)) {
-        int otaResult = 0;
-        for (int attempt = 0; attempt < 3; attempt++) {
+        int otaResult = -1;
+        uint32_t otaWindowEnd = g_bootMs + 88000;  // stop 2s before 90s USB present
+        int attempt = 0;
+        while (millis() < otaWindowEnd) {
             if (attempt > 0) {
-                log_write("OTA: retry %d/3 in 10s", attempt + 1);
-                vTaskDelay(pdMS_TO_TICKS(10000));
-                if (!g_netConnected && !g_pppConnected) break;
+                // 5s pause between retries; abort if window closing or network lost
+                for (int w = 0; w < 50 && millis() < otaWindowEnd; w++)
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                if (!g_netConnected && !g_pppConnected) {
+                    // Network dropped — wait for it to recover before retrying
+                    vTaskDelay(pdMS_TO_TICKS(5000));
+                    if (!g_netConnected && !g_pppConnected) break;
+                }
             }
-            otaResult = otaCheck();  // 1=updated, 0=up to date, -1=error
+            log_write("OTA: check attempt %d (t=%lus)", attempt + 1,
+                      (unsigned long)((millis() - g_bootMs) / 1000));
+            otaResult = otaCheck();  // 1=downloaded, 0=up to date, -1=error
             g_tlsActive = false;
-            if (otaResult >= 0) break;  // success or up-to-date → stop retrying
+            if (otaResult >= 0) break;  // success or confirmed up-to-date → done
+            attempt++;
         }
         otaDone = true;
-        g_displayState.otaActive = false;  // clear "Checking..." immediately
+        g_displayState.otaActive = false;  // clear "Checking..." after window closes
         g_otaActive = false;
         bool staged = (otaResult == 1);
 
@@ -3757,6 +3770,75 @@ static void uploadTask(void* param) {
         g_tlsActive = false;
     }
 
+    // ── Per-aircraft S3 cookie override ─────────────────────────────────────
+    // Admin can push a date-mode or flight-mode cookie per DSU serial.
+    // Stored at aircraft/{serial}/cookie.easdf — one-shot, deleted after fetch.
+    // Takes priority over manifest HWM sync (runs before it).
+    if (!g_s3CookieActive && (g_netConnected || g_pppConnected) && s3LoadCreds()) {
+        // Get DSU serial from local cookie or NVS cache
+        char acSerial[44] = "";
+        if (!g_dual_partition) {
+            char cp[64];
+            snprintf(cp, sizeof(cp), "%s/dsuCookie.easdf", SD_MOUNT);
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+            FILE* cf = fopen(cp, "rb");
+            if (cf) {
+                uint8_t ck[78];
+                if (fread(ck, 1, 78, cf) == 78 && ck[0] == 0xEA && ck[1] == 0x1E) {
+                    size_t n = sizeof(acSerial) - 1; if (n > 42) n = 42;
+                    memcpy(acSerial, ck + 9, n); acSerial[n] = '\0';
+                    for (int j = (int)n - 1; j >= 0; j--) {
+                        if ((uint8_t)acSerial[j] < 0x20 || (uint8_t)acSerial[j] > 0x7E)
+                            acSerial[j] = '\0'; else break;
+                    }
+                }
+                fclose(cf);
+            }
+            xSemaphoreGive(g_sd_mutex);
+        }
+        if (!acSerial[0]) {
+            nvs_handle_t nh;
+            if (nvs_open("mfst", NVS_READONLY, &nh) == ESP_OK) {
+                nvs_get_string(nh, "serial", acSerial, sizeof(acSerial)); nvs_close(nh);
+            }
+        }
+        if (acSerial[0]) {
+            g_tlsActive = true;
+            esp_tls_t* tls = tls_connect(g_apiHost);
+            if (tls) {
+                char req[512];
+                int rlen = snprintf(req, sizeof(req),
+                    "GET /prod/aircraft/cookie?serial=%s HTTP/1.1\r\n"
+                    "Host: %s\r\nx-api-key: %s\r\nConnection: close\r\n\r\n",
+                    acSerial, g_apiHost, g_apiKey);
+                if (tls_write_all(tls, req, rlen)) {
+                    std::string resp = httpReadResponse(tls);
+                    std::string hexStr = jsonStr(resp, "cookie");
+                    if (hexStr.size() == 156) {
+                        uint8_t cookie[78];
+                        for (int i = 0; i < 78; i++) {
+                            char h[3] = { hexStr[i*2], hexStr[i*2+1], 0 };
+                            cookie[i] = (uint8_t)strtoul(h, nullptr, 16);
+                        }
+                        if (cookie[0] == 0xEA && cookie[1] == 0x1E) {
+                            xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                            if (write_cookie_to_dsu(cookie, 78)) {
+                                g_s3CookieActive = true;
+                                log_write("Aircraft cookie applied: %s", acSerial);
+                                cdc_printf("Aircraft cookie: applied for %s\r\n", acSerial);
+                            }
+                            xSemaphoreGive(g_sd_mutex);
+                        }
+                    } else if (resp.find("404") == std::string::npos) {
+                        log_write("Aircraft cookie: none for %s", acSerial);
+                    }
+                }
+                tls_destroy(tls);
+            }
+            g_tlsActive = false;
+        }
+    }
+
     // Old boot logs are moved to SD root at boot (see app_main) so the
     // normal harvest → upload pipeline handles them. No TLS needed here.
 
@@ -3809,6 +3891,9 @@ static void uploadTask(void* param) {
             uint32_t s3Hwm = s3FetchManifest(bootSerial);
             log_write("Boot manifest sync: %s local=%lu S3=%lu",
                       bootSerial, (unsigned long)bootLocalFlight, (unsigned long)s3Hwm);
+            // Write cookie from S3 HWM when it's higher than local (normal forward sync).
+            // For admin-driven backward rewinding, use the PUT /aircraft/manifest endpoint
+            // combined with force_cookie (TODO: implement force_cookie flag).
             if (s3Hwm > bootLocalFlight) {
                 uint8_t syncCookie[78];
                 buildDsuCookie(bootSerial, s3Hwm, syncCookie);

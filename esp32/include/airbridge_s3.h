@@ -150,15 +150,45 @@ inline bool findNextUploadFile(const char* harvestDir, char* out, size_t outSz) 
         if (!subDir) continue;
 
         bool found = false;
+        // Collect all uploadable files, then pick the one with the lowest
+        // flight number (for .eaofh) so the manifest hwm advances correctly.
+        char bestName[128] = "";
+        uint32_t bestFlight = UINT32_MAX;
         while (g_hal->filesys->readdir(subDir, &ent)) {
             if (ent.is_dir || ent.name[0] == '.') continue;
+            size_t nlen = strlen(ent.name);
+            if (nlen > 5 && strcmp(ent.name + nlen - 5, ".meta") == 0) continue;
             char fullpath[256];
             snprintf(fullpath, sizeof(fullpath), "%s/%s", subPath, ent.name);
             uint32_t sz = 0; bool isDir = false;
             if (g_hal->filesys->stat(fullpath, &sz, &isDir) && sz == 0) continue;
-            snprintf(out, outSz, "%s/%s", subs[s], ent.name);
+
+            // For .eaofh files, sort ascending by flight number
+            const char* ext = strrchr(ent.name, '.');
+            if (ext && strcmp(ext, ".eaofh") == 0) {
+                // Strip harvest prefix to find bare name for flight parse
+                const char* bare = ent.name;
+                for (const char* p = ent.name; p[0] && p[1]; p++)
+                    if (p[0] == '_' && p[1] == '_') bare = p + 2;
+                char serial[44]; uint32_t lastFlight = 0;
+                if (parseEaofhFilename(bare, serial, sizeof(serial), &lastFlight)) {
+                    if (lastFlight < bestFlight) {
+                        bestFlight = lastFlight;
+                        strlcpy(bestName, ent.name, sizeof(bestName));
+                    }
+                    continue;
+                }
+            }
+            // Non-.eaofh: take immediately (no sort needed)
+            if (!found) {
+                snprintf(out, outSz, "%s/%s", subs[s], ent.name);
+                found = true;
+            }
+        }
+        // Use lowest-flight .eaofh if found (and no regular file was selected)
+        if (!found && bestName[0]) {
+            snprintf(out, outSz, "%s/%s", subs[s], bestName);
             found = true;
-            break;
         }
         g_hal->filesys->closedir(subDir);
 
@@ -244,11 +274,13 @@ struct UploadResult {
 };
 
 // Upload a single file to S3 using pre-signed URLs.
-// filepath: full path to the file (e.g. "./emu_sdcard/upload/data.csv")
-// filename: just the name (e.g. "data.csv") — used for S3 key
+// filepath: full path to the file
+// filename: used in the presign query (file= param); also default S3 key component
+// keyOverride: if non-null, sent as key= param to use as the full S3 key
 // progress: optional callback for display updates
 inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
-                                     UploadProgressFn progress = nullptr) {
+                                     UploadProgressFn progress = nullptr,
+                                     const char* keyOverride = nullptr) {
     UploadResult res = {};
     if (!g_hal || !g_hal->network || !g_hal->filesys || !g_hal->nvs) {
         strlcpy(res.error, "HAL not initialized", sizeof(res.error));
@@ -270,9 +302,15 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
     }
 
     // Presign request
-    char query[512];
-    snprintf(query, sizeof(query), "file=%s&size=%u&device=%s",
-             urlEncode(filename).c_str(), fileSize, creds.deviceId);
+    char query[640];
+    if (keyOverride) {
+        std::string encKey = urlEncode(keyOverride);
+        snprintf(query, sizeof(query), "file=%s&size=%u&device=%s&key=%s",
+                 urlEncode(filename).c_str(), fileSize, creds.deviceId, encKey.c_str());
+    } else {
+        snprintf(query, sizeof(query), "file=%s&size=%u&device=%s",
+                 urlEncode(filename).c_str(), fileSize, creds.deviceId);
+    }
     std::string resp = s3ApiGetViaHal(creds.apiHost, creds.apiKey, query);
 
     // Skip upload if S3 already has this file with matching size
@@ -371,8 +409,10 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
 
         // Get presigned URL for this part
         char pq[1024];
-        snprintf(pq, sizeof(pq), "upload_id=%s&key=%s&part=%u",
-                 uploadId.c_str(), urlEncode(s3Key.c_str()).c_str(), partNum);
+        // Include device= so _pick_bucket routes to the correct S3 bucket
+        snprintf(pq, sizeof(pq), "upload_id=%s&key=%s&part=%u&device=%s",
+                 uploadId.c_str(), urlEncode(s3Key.c_str()).c_str(), partNum,
+                 creds.deviceId);
         std::string partResp = s3ApiGetViaHal(creds.apiHost, creds.apiKey, pq);
         std::string partUrl = jsonStr(partResp, "url");
         if (partUrl.empty()) {
@@ -417,7 +457,8 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
     // Complete multipart
     std::string partsJson = buildPartsJson(totalParts);
     std::string completeReq = buildApiCompleteRequest(
-        creds.apiHost, creds.apiKey, uploadId.c_str(), s3Key.c_str(), partsJson.c_str());
+        creds.apiHost, creds.apiKey, uploadId.c_str(), s3Key.c_str(),
+        partsJson.c_str(), creds.deviceId);
 
     TlsHandle tls = g_hal->network->connect(creds.apiHost);
     if (tls) {
@@ -430,6 +471,308 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
     uint32_t elapsed = g_hal->clock->millis() - startMs;
     res.success = true;
     res.kbps = elapsed > 0 ? fileSize / 1024.0f / (elapsed / 1000.0f) : 0;
+    return res;
+}
+
+// ── Fleet-aware manifest helpers ─────────────────────────────────────────────
+
+// GET /prod/aircraft/manifest?serial=X → high_water_mark (0 on error/absent)
+inline uint32_t halFetchManifest(const char* serial) {
+    if (!g_hal || !g_hal->network) return 0;
+    S3Creds creds = loadS3Creds();
+    if (!creds.valid) return 0;
+    char path[256];
+    snprintf(path, sizeof(path), "/prod/aircraft/manifest?serial=%s",
+             urlEncode(serial).c_str());
+    std::string resp = s3ApiGetPathViaHal(creds.apiHost, creds.apiKey, path);
+    int32_t hwm = jsonInt(resp, "high_water_mark");
+    return (hwm > 0) ? (uint32_t)hwm : 0;
+}
+
+// POST /prod/aircraft/manifest → update manifest with new file entry.
+inline bool halUpdateManifest(const char* serial, uint32_t firstFlight,
+                              uint32_t lastFlight, const char* s3Key) {
+    if (!g_hal || !g_hal->network) return false;
+    S3Creds creds = loadS3Creds();
+    if (!creds.valid) return false;
+    char body[512];
+    int bodyLen = snprintf(body, sizeof(body),
+        "{\"serial\":\"%s\",\"last_flight\":%lu,\"first_flight\":%lu,\"s3_key\":\"%s\"}",
+        serial, (unsigned long)lastFlight, (unsigned long)firstFlight, s3Key ? s3Key : "");
+    char hdr[512];
+    snprintf(hdr, sizeof(hdr),
+        "POST /prod/aircraft/manifest HTTP/1.1\r\n"
+        "Host: %s\r\nx-api-key: %s\r\n"
+        "Content-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+        creds.apiHost, creds.apiKey, bodyLen);
+    TlsHandle tls = g_hal->network->connect(creds.apiHost);
+    if (!tls) return false;
+    bool ok = g_hal->network->write(tls, hdr, strlen(hdr)) &&
+              g_hal->network->write(tls, body, bodyLen);
+    if (ok) {
+        std::string resp = halHttpReadResponse(tls);
+        ok = resp.find("high_water_mark") != std::string::npos;
+        if (!ok) printf("[Manifest] POST failed, resp: %.200s\n", resp.c_str());
+        else      printf("[Manifest] POST OK hwm advancing to %lu\n", (unsigned long)lastFlight);
+    } else {
+        printf("[Manifest] POST write failed (TLS error)\n");
+    }
+    g_hal->network->destroy(tls);
+    return ok;
+}
+
+// Read the .meta sidecar for a .eaofh file and return first_flight.
+// metaPath is the full path to the .meta file (e.g. "/sdcard/upload/0001/f.eaofh.meta").
+inline uint32_t halReadMetaFirstFlight(const char* metaPath) {
+    if (!g_hal || !g_hal->filesys) return 0;
+    void* mf = g_hal->filesys->open(metaPath, "rb");
+    if (!mf) return 0;
+    char buf[32] = {};
+    g_hal->filesys->read(mf, buf, sizeof(buf) - 1);
+    g_hal->filesys->close(mf);
+    unsigned long ff = 0, lf = 0;
+    sscanf(buf, "%lu:%lu", &ff, &lf);
+    return (uint32_t)ff;
+}
+
+// Scan a .eaofh file for the byte offset where flight > hwm begins.
+// Uses same estimate-then-scan approach as the firmware's findSplitOffset.
+// f must be open; fileSize is total bytes.
+inline uint64_t halFindSplitOffset(void* f, uint64_t fileSize,
+                                    uint32_t firstFlight, uint32_t lastFlight,
+                                    uint32_t hwm) {
+    if (!g_hal || !g_hal->filesys) return 0;
+    if (firstFlight > hwm)  return 0;
+    if (lastFlight  <= hwm) return fileSize;
+
+    uint32_t total = lastFlight - firstFlight + 1;
+    uint32_t avg   = (total > 0) ? (uint32_t)(fileSize / total) : 0;
+    if (avg == 0) return 0;
+
+    float frac   = (float)(hwm - firstFlight + 1) / (float)total;
+    uint64_t est = (uint64_t)(frac * (float)fileSize);
+    uint64_t win = (uint64_t)avg * 3;
+    uint64_t scan_start = (est > win) ? (est - win) : 0;
+    uint64_t scan_end   = est + win;
+    if (scan_end > fileSize) scan_end = fileSize;
+
+    g_hal->filesys->seek(f, (long)scan_start, 0 /*SEEK_SET*/);
+
+    const uint32_t CHUNK = 4096;
+    uint8_t buf[CHUNK + 4];
+    uint64_t pos   = scan_start;
+    uint64_t hwm_end = 0;
+    uint32_t carry = 0;
+
+    while (pos < scan_end) {
+        uint32_t want = (scan_end - pos > CHUNK) ? CHUNK : (uint32_t)(scan_end - pos);
+        uint32_t got = (uint32_t)g_hal->filesys->read(f, buf + carry, want);
+        if (got == 0) break;
+        uint32_t avail = carry + got;
+
+        for (uint32_t i = 0; i + 3 < avail; i++) {
+            if (buf[i] != 0xEA || buf[i+1] != 0x4C) continue;
+            uint16_t rlen = ((uint16_t)buf[i+2] << 8) | buf[i+3];
+            if (rlen < 28) continue;
+            uint64_t recAbs = (pos - carry) + i;
+            if (recAbs + rlen > fileSize) continue;
+
+            // Read body[20:22] — flight number
+            uint8_t fnum[2] = {};
+            long saved = (long)(recAbs + 4 + 20);
+            g_hal->filesys->seek(f, saved, 0);
+            g_hal->filesys->read(f, fnum, 2);
+            g_hal->filesys->seek(f, (long)(pos + got), 0);  // restore
+
+            uint32_t fl = ((uint32_t)fnum[0] << 8) | fnum[1];
+            if (fl == hwm) {
+                hwm_end = recAbs + rlen;
+            } else if (fl > hwm) {
+                return hwm_end > 0 ? hwm_end : recAbs;
+            }
+        }
+
+        if (avail >= 3) { carry = 3; memmove(buf, buf + avail - 3, 3); }
+        else            { carry = avail; }
+        pos += got;
+    }
+    return hwm_end;
+}
+
+// Fleet-aware upload for a single .eaofh file:
+// 1. Parse filename for (serial, last_flight).
+// 2. Fetch/cache manifest → skip if last_flight <= hwm.
+// 3. If first_flight <= hwm, extract delta (upload tail only).
+// 4. Upload to aircraft/{serial}/{barename} S3 path.
+// 5. Update manifest + write DSU cookie.
+// Returns: success (true) or failure (false). skip is also reported as success.
+inline UploadResult halS3UploadEaofh(const char* harvestDir, const char* relPath,
+                                      UploadProgressFn progress = nullptr) {
+    UploadResult res = {};
+    if (!g_hal) { strlcpy(res.error, "HAL null", sizeof(res.error)); return res; }
+
+    char fullpath[256];
+    snprintf(fullpath, sizeof(fullpath), "%s/%s", harvestDir, relPath);
+
+    // Extract bare filename (strip harvest path-flattening prefix "xxx__")
+    const char* fname = strrchr(relPath, '/');
+    fname = fname ? fname + 1 : relPath;
+    const char* bareName = fname;
+    for (const char* p = fname; p[0] && p[1]; p++)
+        if (p[0] == '_' && p[1] == '_') bareName = p + 2;
+
+    // Parse for (serial, last_flight)
+    char serial[44] = "";
+    uint32_t lastFlight = 0;
+    if (!parseEaofhFilename(bareName, serial, sizeof(serial), &lastFlight)) {
+        strlcpy(res.error, "not eaofh", sizeof(res.error));
+        return res;
+    }
+
+    // Fetch manifest (in-session cache via static vars)
+    static char  s_cachedSerial[44] = "";
+    static uint32_t s_cachedHwm = 0;
+    if (strcmp(s_cachedSerial, serial) != 0) {
+        s_cachedHwm = halFetchManifest(serial);
+        strlcpy(s_cachedSerial, serial, sizeof(s_cachedSerial));
+        if (g_hal->nvs) {
+            g_hal->nvs->set_str("mfst", "serial", serial);
+            g_hal->nvs->set_u32("mfst", "hwm", s_cachedHwm);
+        }
+        printf("[S3] Manifest %s hwm=%lu\n", serial, (unsigned long)s_cachedHwm);
+    }
+
+    if (lastFlight <= s_cachedHwm) {
+        // Entirely covered by S3 — skip
+        printf("[S3] Skip %s (last=%lu hwm=%lu)\n", bareName,
+               (unsigned long)lastFlight, (unsigned long)s_cachedHwm);
+        res.success = true;
+        strlcpy(res.error, "skipped (manifest hwm covers)", sizeof(res.error));
+        // Remove .meta sidecar if present
+        char metaPath[272];
+        snprintf(metaPath, sizeof(metaPath), "%s.meta", fullpath);
+        g_hal->filesys->remove(metaPath);
+        return res;
+    }
+
+    // Read .meta for first_flight
+    uint32_t firstFlight = 0;
+    {
+        char metaPath[272];
+        snprintf(metaPath, sizeof(metaPath), "%s.meta", fullpath);
+        firstFlight = halReadMetaFirstFlight(metaPath);
+    }
+
+    // Find split offset if file has pre-hwm content
+    uint64_t splitOffset = 0;
+    if (firstFlight > 0 && firstFlight <= s_cachedHwm) {
+        uint32_t totalSz = 0; bool isDir = false;
+        g_hal->filesys->stat(fullpath, &totalSz, &isDir);
+        if (totalSz > 0) {
+            void* f = g_hal->filesys->open(fullpath, "rb");
+            if (f) {
+                splitOffset = halFindSplitOffset(f, totalSz, firstFlight, lastFlight, s_cachedHwm);
+                g_hal->filesys->close(f);
+                if (splitOffset >= totalSz) splitOffset = 0;
+            }
+        }
+        printf("[S3] Delta %s offset=%llu\n", bareName, (unsigned long long)splitOffset);
+    }
+
+    // Build aircraft-namespaced S3 key
+    char s3Key[256];
+    snprintf(s3Key, sizeof(s3Key), "aircraft/%s/%s", serial, bareName);
+
+    // Get file size for upload
+    uint32_t totalSz = 0; bool isDir = false;
+    g_hal->filesys->stat(fullpath, &totalSz, &isDir);
+    uint32_t uploadSize = (splitOffset < totalSz) ? (totalSz - (uint32_t)splitOffset) : 0;
+    if (uploadSize == 0) {
+        res.success = true;
+        strlcpy(res.error, "empty delta", sizeof(res.error));
+        return res;
+    }
+
+    S3Creds creds = loadS3Creds();
+    if (!creds.valid) { strlcpy(res.error, "no creds", sizeof(res.error)); return res; }
+
+    // Presign with explicit key= and upload size
+    char query[640];
+    {
+        std::string encKey = urlEncode(s3Key);
+        snprintf(query, sizeof(query), "file=%s&size=%u&device=%s&key=%s",
+                 urlEncode(bareName).c_str(), uploadSize, creds.deviceId, encKey.c_str());
+    }
+    std::string presignResp = s3ApiGetViaHal(creds.apiHost, creds.apiKey, query);
+
+    if (presignResp.find("\"skip\"") != std::string::npos &&
+        presignResp.find("true") != std::string::npos) {
+        // S3 already has this exact upload (idempotent retry)
+        res.success = true;
+        strlcpy(res.error, "skipped (S3 exists)", sizeof(res.error));
+    } else {
+        std::string url = jsonStr(presignResp, "url");
+        std::string uploadId = jsonStr(presignResp, "upload_id");
+
+        if (splitOffset == 0) {
+            // Full file (no delta): delegate to halS3UploadFile with aircraft key override.
+            // This gets full multipart support and NVS resume for free.
+            res = halS3UploadFile(fullpath, bareName, progress, s3Key);
+        } else if (!url.empty() && uploadId.empty()) {
+            // Delta upload — small enough for single PUT (< 5 MB)
+            void* f = g_hal->filesys->open(fullpath, "rb");
+            if (!f) { strlcpy(res.error, "open failed", sizeof(res.error)); return res; }
+            g_hal->filesys->seek(f, (long)splitOffset, 0);
+            char s3Host[128], s3Path[2500];
+            if (!parseUrl(url, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
+                g_hal->filesys->close(f);
+                strlcpy(res.error, "URL parse failed", sizeof(res.error));
+                return res;
+            }
+            TlsHandle tls = g_hal->network->connect(s3Host);
+            if (!tls) {
+                g_hal->filesys->close(f);
+                strlcpy(res.error, "TLS failed", sizeof(res.error));
+                return res;
+            }
+            uint32_t t0 = g_hal->clock->millis();
+            char hdr[2700];
+            snprintf(hdr, sizeof(hdr),
+                "PUT %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+                s3Path, s3Host, uploadSize);
+            if (g_hal->network->write(tls, hdr, strlen(hdr)) &&
+                halStreamFile(tls, f, uploadSize, progress)) {
+                halHttpReadResponse(tls);
+                uint32_t elapsed = g_hal->clock->millis() - t0;
+                res.success = true;
+                res.kbps = elapsed > 0 ? uploadSize / 1024.0f / (elapsed / 1000.0f) : 0;
+            } else {
+                strlcpy(res.error, "stream failed", sizeof(res.error));
+            }
+            g_hal->network->destroy(tls);
+            g_hal->filesys->close(f);
+        } else {
+            // Large delta (> 5 MB) needs multipart — uncommon; fall through to
+            // full halS3UploadFile which doesn't support offset, so upload from 0
+            // (some redundant data sent but the result is correct).
+            printf("[S3] Large delta — falling back to full upload for %s\n", bareName);
+            res = halS3UploadFile(fullpath, bareName, progress, s3Key);
+        }
+    }
+
+    if (res.success) {
+        // Update manifest + cookie
+        uint32_t newFirst = (firstFlight > 0 && firstFlight <= s_cachedHwm)
+                            ? (s_cachedHwm + 1) : (firstFlight > 0 ? firstFlight : 1);
+        if (halUpdateManifest(serial, newFirst, lastFlight, s3Key)) {
+            s_cachedHwm = lastFlight;
+            if (g_hal->nvs) g_hal->nvs->set_u32("mfst", "hwm", s_cachedHwm);
+        }
+        // Remove .meta sidecar
+        char metaPath[272];
+        snprintf(metaPath, sizeof(metaPath), "%s.meta", fullpath);
+        g_hal->filesys->remove(metaPath);
+    }
     return res;
 }
 

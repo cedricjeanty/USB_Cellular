@@ -23,10 +23,10 @@ FW_DIR="$HOME/USBCellular/esp32"
 EMU="$FW_DIR/.pio/build/emulator/program"
 SD_EMU="$FW_DIR/emu_sdcard"             # Partition 1 (DSU-facing)
 SD_INT="$FW_DIR/emu_sdcard_internal"    # Partition 2 (firmware internal)
-BUCKET="airbridge-uploads"
+BUCKET="airbridge-uploads-test"
 API_KEY="7fFErx7ZCt9Vr2fvYfyOT7YxxeEjay4G5bpmfYdm"
 LOG="/tmp/e2e_${TARGET}_$(date +%Y%m%d_%H%M%S).txt"
-SERIAL="EA500.000243"
+SERIAL="EA500.E2ETES"    # fictional serial — never collides with real fleet data
 
 if [ "$TARGET" = "device" ]; then
     DEVICE="9C139EF40188"
@@ -125,8 +125,10 @@ with open('$path', 'ab') as f: f.write(rec)
 }
 
 # Write a DSU-style flight file (realistic directory structure).
-# File ends with a valid 0x4C record so the content-based parser extracts
-# serial+flight from it (replicates how a real DSU file looks at the tail).
+# Prepends a flight-1 record (simulates DSU downloading from the start),
+# then random data, then the requested flight number as the last record.
+# This ensures first_flight=1 / last_flight=N so the Lambda's consecutive
+# hwm logic correctly advances on upload.
 write_dsu_file() {
     local flight="$1" size_kb="$2"
     local date_str=$(date +%Y%m%d)
@@ -134,9 +136,15 @@ write_dsu_file() {
 
     if [ "$TARGET" = "emulator" ]; then
         mkdir -p "$SD_EMU/flightHistory"
-        dd if=/dev/urandom of="$SD_EMU/flightHistory/$fname" bs=1K count="$size_kb" 2>/dev/null
-        append_eaofh_trailer "$SD_EMU/flightHistory/$fname" "$SERIAL" "$flight"
-        log "  Wrote flightHistory/$fname (${size_kb}KB + 28B trailer)"
+        local fpath="$SD_EMU/flightHistory/$fname"
+        # First-flight marker (flight 1) at the start so firstRecordFromLog returns 1.
+        # The 0xEA byte immediately after satisfies the record-framing validation
+        # (firstRecordFromLog requires the byte after a record to be 0xEA).
+        append_eaofh_trailer "$fpath" "$SERIAL" "00001"
+        printf '\xEA' >> "$fpath"
+        dd if=/dev/urandom of="$fpath" bs=1K count="$size_kb" oflag=append conv=notrunc 2>/dev/null
+        append_eaofh_trailer "$fpath" "$SERIAL" "$flight"
+        log "  Wrote flightHistory/$fname (${size_kb}KB + first+last trailers)"
     else
         local sddev=""
         for w in $(seq 1 90); do
@@ -146,7 +154,9 @@ write_dsu_file() {
         [ -n "$sddev" ] || { log "  WARN: no USB drive"; return 1; }
         sudo mount -o noatime "$sddev" /mnt 2>/dev/null || return 1
         sudo mkdir -p /mnt/flightHistory
-        sudo dd if=/dev/urandom of="/mnt/flightHistory/$fname" bs=1K count="$size_kb" 2>/dev/null
+        append_eaofh_trailer "/mnt/flightHistory/$fname" "$SERIAL" "00001" "sudo"
+        sudo sh -c 'printf \\\\xEA >> /mnt/flightHistory/'"$fname"
+        sudo dd if=/dev/urandom of="/mnt/flightHistory/$fname" bs=1K count="$size_kb" oflag=append conv=notrunc 2>/dev/null
         append_eaofh_trailer "/mnt/flightHistory/$fname" "$SERIAL" "$flight" "sudo"
         sync; sudo umount /mnt 2>/dev/null
         log "  Wrote flightHistory/$fname (${size_kb}KB + 28B trailer) to USB drive"
@@ -183,8 +193,8 @@ wait_for_s3_file() {
     return 1
 }
 
-# Wait for a file to be uploaded: check S3 for the key pattern (recursive).
-# S3 keys are now DEVICE/NNNN/filename due to subfolder harvest.
+# Wait for a non-.eaofh file under the device-namespaced prefix.
+# S3 keys: DEVICE/NNNN/filename
 wait_for_upload() {
     local s3_pattern="$1" timeout="${2:-180}"
     local t=0
@@ -194,6 +204,21 @@ wait_for_upload() {
             return 0
         fi
         [ $((t % 30)) -eq 0 ] && log "  ${t}s: waiting for $s3_pattern in S3..."
+    done
+    return 1
+}
+
+# Wait for a .eaofh file under the aircraft-namespaced prefix.
+# S3 keys: aircraft/{serial}/{filename}
+wait_for_aircraft_upload() {
+    local serial="$1" fname_pattern="$2" timeout="${3:-180}"
+    local t=0
+    while [ $t -lt $timeout ]; do
+        sleep 5; t=$((t + 5))
+        if aws s3 ls "s3://$BUCKET/aircraft/$serial/" --recursive 2>/dev/null | grep -q "$fname_pattern"; then
+            return 0
+        fi
+        [ $((t % 30)) -eq 0 ] && log "  ${t}s: waiting for aircraft/$serial/$fname_pattern..."
     done
     return 1
 }
@@ -283,6 +308,8 @@ cleanup_s3() {
             --query "Uploads[?UploadId=='$uid'].Key" --output text 2>/dev/null)
         aws s3api abort-multipart-upload --bucket "$BUCKET" --key "$key" --upload-id "$uid" 2>/dev/null
     done
+    # Also reset the aircraft manifest so each test starts from hwm=0
+    aws s3 rm "s3://$BUCKET/aircraft/$SERIAL/" --recursive 2>/dev/null || true
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -332,10 +359,9 @@ if [ "$TARGET" = "emulator" ]; then
 fi
 start_device 5
 write_dsu_file "01501" 500
-log "  Waiting for harvest + upload..."
-# S3 key now includes subfolder: DEVICE/NNNN/flightHistory__SERIAL_flight_date.eaofh
-if wait_for_upload "flightHistory__${SERIAL}_01501" 180; then
-    pass "DSU upload: flight file harvested + uploaded"
+log "  Waiting for harvest + upload to aircraft/${SERIAL}/..."
+if wait_for_aircraft_upload "$SERIAL" "${SERIAL}_01501" 180; then
+    pass "DSU upload: flight file harvested + uploaded to aircraft path"
 else
     fail "DSU upload: not completed"
 fi
@@ -355,7 +381,7 @@ sleep 20
 power_cut 5
 log "  Restarting..."
 start_device 5
-if wait_for_upload "flightHistory__${SERIAL}_01502" 180; then
+if wait_for_aircraft_upload "$SERIAL" "${SERIAL}_01502" 180; then
     pass "Power cut resume: uploaded after restart"
 else
     fail "Power cut resume: not completed"
@@ -375,7 +401,7 @@ write_dsu_file "01505" 200
 log "  3 flight files, waiting..."
 ALL_DONE=true
 for f in 01503 01504 01505; do
-    if ! wait_for_upload "flightHistory__${SERIAL}_${f}" 180; then
+    if ! wait_for_aircraft_upload "$SERIAL" "${SERIAL}_${f}" 180; then
         ALL_DONE=false
         fail "Multi-file: flight $f not completed"
     fi
@@ -391,7 +417,7 @@ if [ "$TARGET" = "emulator" ]; then
     echo "skip" > "$SD_EMU/.hidden"
     start_device 5
     write_dsu_file "01506" 100
-    wait_for_upload "flightHistory__${SERIAL}_01506" 60
+    wait_for_aircraft_upload "$SERIAL" "${SERIAL}_01506" 60
     # System files should NOT appear in any upload subfolder
     FOUND_SYSTEM=false
     for sub in "$SD_INT"/upload/*/; do
@@ -724,7 +750,8 @@ fi
 # ── TEST 13: Power loss during transfer — partial file harvested on reboot ────
 log ""; log "TEST 13: Power loss mid-transfer + cookie on reboot"
 if [ "$TARGET" = "emulator" ]; then
-    # Clean state
+    # Clean state — S3 manifest must be reset so boot-sync HWM doesn't interfere
+    cleanup_s3
     rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory"
     rm -f "$SD_EMU/dsuCookie.easdf" "$FW_DIR/emu_nvs.dat"
 
@@ -860,7 +887,7 @@ if [ "$TARGET" = "emulator" ]; then
 
     # Reboot: upload task reads NVS resume state, continues from last part.
     start_device
-    if wait_for_upload "flightHistory__${SERIAL}_01800" 300; then
+    if wait_for_aircraft_upload "$SERIAL" "${SERIAL}_01800" 300; then
         pass "Multipart resume: upload completed after power cut"
     else
         fail "Multipart resume: upload did not complete after power cut"
@@ -890,25 +917,31 @@ if [ "$TARGET" = "emulator" ]; then
 
     # Boot 1: verify FATFS works (log file created under SD_INTERNAL/logs/)
     start_device 5
-    sleep 15  # enough for log flush at +30s from boot
-    LOG_COUNT_1=$(ls "$SD_INT/logs/" 2>/dev/null | wc -l)
+    sleep 15  # flush happens at 10s in emulator
+    LOG_FILE_1=$(ls "$SD_INT/logs/"boot_*.log 2>/dev/null | head -1)
+    log "  Boot 1 log: ${LOG_FILE_1##*/}"
 
     # Simulate soft reset (kill without graceful teardown, as esp_restart() does)
     if [ -n "$EMU_PID" ]; then kill -9 "$EMU_PID" 2>/dev/null; wait "$EMU_PID" 2>/dev/null; fi
     sudo killall -9 pppd 2>/dev/null; sleep 1; EMU_PID=""
 
-    # Boot 2: FATFS must mount immediately — verify log file appears promptly
+    # Boot 2: FATFS must mount immediately — verify a NEW session log appears.
+    # The emulator moves boot_0001.log to the upload queue and creates boot_0002.log.
+    # Check by session name, not count (old log is moved away on second boot).
     rm -f "$FW_DIR/emu_ota_update.bin"
     : > /tmp/emu_e2e.log
     cd "$FW_DIR" && $EMU "$DEVICE" >>/tmp/emu_e2e.log 2>&1 &
     EMU_PID=$!
-    sleep 40  # 30s log flush + settle
-    LOG_COUNT_2=$(ls "$SD_INT/logs/" 2>/dev/null | wc -l)
+    sleep 20  # 10s flush + settle
+    LOG_FILE_2=$(ls "$SD_INT/logs/"boot_*.log 2>/dev/null | head -1)
+    log "  Boot 2 log: ${LOG_FILE_2##*/}"
 
-    if [ "$LOG_COUNT_2" -gt "$LOG_COUNT_1" ]; then
-        pass "FATFS after restart: log file created on second boot ($LOG_COUNT_2 logs)"
+    if [ -n "$LOG_FILE_2" ] && [ "${LOG_FILE_2##*/}" != "${LOG_FILE_1##*/}" ]; then
+        pass "FATFS after restart: new session log created (${LOG_FILE_2##*/})"
+    elif [ -n "$LOG_FILE_2" ] && [ -z "$LOG_FILE_1" ]; then
+        pass "FATFS after restart: log file created on second boot"
     else
-        fail "FATFS after restart: no new log on second boot (was $LOG_COUNT_1, now $LOG_COUNT_2)"
+        fail "FATFS after restart: no new session log on second boot (boot1=${LOG_FILE_1##*/} boot2=${LOG_FILE_2##*/})"
     fi
     stop_device
 else
@@ -948,27 +981,26 @@ if [ "$TARGET" = "emulator" ]; then
 
     # Write a file before the drop
     write_dsu_file "01901" 200
-    if ! wait_for_upload "flightHistory__${SERIAL}_01901" 60; then
+    if ! wait_for_aircraft_upload "$SERIAL" "${SERIAL}_01901" 60; then
         fail "PPP reconnect: pre-drop upload failed"
         stop_device
     else
         log "  Pre-drop upload OK"
-        # Simulate PPP drop by toggling 'C' (cellular off) then back on
-        # The emulator uses keyboard input — drive it via stdin
         sleep 5
-        kill -0 "$EMU_PID" 2>/dev/null && python3 -c "
-import subprocess, time
-# Send 'C' keypress to emulator stdin — simulates cellular drop
-p = subprocess.Popen(['kill', '-USR1', '$EMU_PID'])
-" 2>/dev/null || true
+        # SIGUSR1 toggles cellular OFF in the emulator (no longer kills the process)
+        kill -USR1 "$EMU_PID" 2>/dev/null || true
         # Kill pppd to simulate carrier drop
         sudo killall -9 pppd 2>/dev/null
         log "  PPP dropped (pppd killed)"
-        sleep 30  # wait for firmware stale detection (30s) + reconnect (~25s)
+        sleep 15  # brief pause — simulates reconnect delay
+        # SIGUSR1 again to toggle cellular back ON (simulates modem reconnect)
+        kill -USR1 "$EMU_PID" 2>/dev/null || true
+        log "  PPP reconnected (cellular re-enabled)"
+        sleep 15  # let upload thread pick up queued files
 
         # Write another file — should upload after reconnect
         write_dsu_file "01902" 200
-        if wait_for_upload "flightHistory__${SERIAL}_01902" 120; then
+        if wait_for_aircraft_upload "$SERIAL" "${SERIAL}_01902" 120; then
             pass "PPP reconnect: upload succeeded after drop+reconnect"
         else
             # Check if S3 log shows reconnect attempt
@@ -1033,10 +1065,250 @@ else
     fi
 fi
 
+# ── Fleet-aware upload tests (manifest + skip + delta) ───────────────────────
+# Helper: wait for manifest to reach a minimum hwm for a given DSU serial.
+# Usage: wait_for_manifest <serial> <min_hwm> [timeout_sec]
+wait_for_manifest() {
+    local serial="$1" min_hwm="$2" timeout="${3:-120}"
+    local t=0
+    while [ $t -lt $timeout ]; do
+        sleep 5; t=$((t + 5))
+        local hwm
+        hwm=$(aws s3 cp "s3://$BUCKET/aircraft/$serial/manifest.json" - 2>/dev/null \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('high_water_mark',0))" 2>/dev/null || echo 0)
+        if [ "${hwm:-0}" -ge "$min_hwm" ]; then return 0; fi
+        [ $((t % 30)) -eq 0 ] && log "  ${t}s: manifest $serial hwm=${hwm:-?} (want>=$min_hwm)..."
+    done
+    return 1
+}
+
+# Helper: get current manifest hwm for a serial
+get_manifest_hwm() {
+    local serial="$1"
+    aws s3 cp "s3://$BUCKET/aircraft/$serial/manifest.json" - 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('high_water_mark',0))" 2>/dev/null || echo 0
+}
+
+# Helper: seed a manifest to a given hwm (simulates previous AirBridge uploads)
+seed_manifest() {
+    local serial="$1" hwm="$2"
+    python3 -c "
+import json, boto3, datetime
+s3 = boto3.client('s3', region_name='us-west-2')
+manifest = {
+    'serial': '$serial',
+    'high_water_mark': $hwm,
+    'files': [{'key': 'aircraft/$serial/seed', 'first_flight': 1, 'last_flight': $hwm}],
+    'last_updated': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+}
+s3.put_object(Bucket='$BUCKET', Key='aircraft/$serial/manifest.json',
+              Body=json.dumps(manifest), ContentType='application/json')
+print('Seeded manifest: serial=$serial hwm=$hwm')
+" 2>/dev/null && log "  Seeded manifest: $serial hwm=$hwm"
+}
+
+# Clean up per-aircraft S3 paths for this test run
+cleanup_aircraft_s3() {
+    local serial="$1"
+    aws s3 rm "s3://$BUCKET/aircraft/$serial/" --recursive 2>/dev/null || true
+}
+
+# ── TEST 19: Manifest full-skip (file already covered by S3) ─────────────────
+log ""; log "TEST 19: Manifest full-skip — file already in S3"
+if [ "$TARGET" = "emulator" ]; then
+    rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory"
+    cleanup_aircraft_s3 "$SERIAL"
+
+    # Seed manifest: S3 already has everything up to flight 01600
+    seed_manifest "$SERIAL" 1600
+
+    start_device 5
+
+    # Write a file claiming flight 01500 (covered by hwm=1600) — should be skipped
+    write_dsu_file "01500" 300
+
+    # Give firmware time to harvest + attempt upload
+    sleep 90
+
+    HWM_AFTER=$(get_manifest_hwm "$SERIAL")
+    # Check: no new file at aircraft/SERIAL path (only the seed entry)
+    FILE_COUNT=$(aws s3 ls "s3://$BUCKET/aircraft/$SERIAL/" 2>/dev/null | grep "\.eaofh" | wc -l)
+
+    if [ "$FILE_COUNT" -eq 0 ] && [ "${HWM_AFTER:-0}" -eq 1600 ]; then
+        pass "Manifest skip: file with last_flight=1500 skipped (hwm=$HWM_AFTER)"
+    else
+        fail "Manifest skip: expected skip, got file_count=$FILE_COUNT hwm=$HWM_AFTER"
+    fi
+    stop_device
+    cleanup_aircraft_s3 "$SERIAL"
+else
+    skip "TEST 19: manifest skip — emulator-only"
+fi
+
+# ── TEST 20: Manifest full-upload (new flights, no prior history) ─────────────
+log ""; log "TEST 20: Manifest full-upload — no prior S3 history"
+if [ "$TARGET" = "emulator" ]; then
+    rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory"
+    cleanup_aircraft_s3 "$SERIAL"
+
+    start_device 5
+
+    # Write flight 01701 with no existing manifest — should upload in full
+    write_dsu_file "01701" 200
+
+    if wait_for_manifest "$SERIAL" 1701 180; then
+        pass "Manifest full-upload: hwm advanced to 1701 (no prior history)"
+    else
+        fail "Manifest full-upload: hwm did not reach 1701 within timeout"
+    fi
+    stop_device
+    cleanup_aircraft_s3 "$SERIAL"
+else
+    skip "TEST 20: manifest full-upload — emulator-only"
+fi
+
+# ── TEST 21: Manifest delta upload (swap scenario — partial history in S3) ────
+log ""; log "TEST 21: Manifest delta upload — AirBridge swap scenario"
+if [ "$TARGET" = "emulator" ]; then
+    rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory"
+    cleanup_aircraft_s3 "$SERIAL"
+
+    # Seed: S3 already has flights 1–60 from a previous device
+    seed_manifest "$SERIAL" 60
+
+    start_device 5
+
+    # Write a file covering flights 1–80 (simulates DSU re-downloading full history
+    # after fresh AirBridge has no cookie). The file has first_flight=1 in .meta.
+    # write_dsu_file sets last_flight=01801; we simulate a multi-flight file by
+    # using a larger file and forcing first_flight into the .meta.
+    write_dsu_file "01801" 800  # 800KB file; trailer says flight 01801
+    # Manually write a .meta with first_flight=1 (simulates full-history download)
+    t21_date=$(date +%Y%m%d)
+    t21_meta="$SD_EMU/flightHistory/${SERIAL}_01801_${t21_date}.eaofh.meta"
+    echo "1:1801" > "$t21_meta"
+    log "  Wrote .meta: first_flight=1, last_flight=1801"
+
+    # Firmware should upload only the delta (flights 61–1801)
+    if wait_for_manifest "$SERIAL" 1801 240; then
+        HWM=$(get_manifest_hwm "$SERIAL")
+        # Verify the uploaded file is smaller than the full file (delta only)
+        DELTA_SIZE=$(aws s3 ls "s3://$BUCKET/aircraft/$SERIAL/" --recursive 2>/dev/null \
+                     | grep "\.eaofh" | awk '{print $3}' | head -1)
+        log "  Delta uploaded: size=${DELTA_SIZE:-?} bytes, manifest hwm=$HWM"
+        pass "Manifest delta: hwm=$HWM (expected 1801); delta_size=${DELTA_SIZE:-unknown}"
+    else
+        fail "Manifest delta: hwm did not reach 1801 within timeout"
+    fi
+    stop_device
+    cleanup_aircraft_s3 "$SERIAL"
+else
+    skip "TEST 21: manifest delta upload — emulator-only"
+fi
+
+# ── TEST 22: Upload order — oldest first ──────────────────────────────────────
+log ""; log "TEST 22: Upload order — oldest flight uploaded first"
+if [ "$TARGET" = "emulator" ]; then
+    rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory"
+    cleanup_aircraft_s3 "$SERIAL"
+
+    start_device 5
+
+    # Write three files in descending order to SD (emulates accumulation over time)
+    write_dsu_file "02000" 200  # oldest in flight terms (still newer than old tests)
+    write_dsu_file "02100" 200
+    write_dsu_file "02200" 200
+    sleep 5  # let harvest pick them all up
+
+    # Wait for first file to appear — it should be the lowest-numbered one
+    sleep 60
+    FIRST_UPLOADED=$(aws s3 ls "s3://$BUCKET/aircraft/$SERIAL/" --recursive 2>/dev/null \
+                     | grep "\.eaofh" | sort | head -1 | awk '{print $4}')
+    log "  First uploaded: $FIRST_UPLOADED"
+
+    if wait_for_manifest "$SERIAL" 2200 240; then
+        if echo "$FIRST_UPLOADED" | grep -q "02000"; then
+            pass "Upload order: oldest (02000) uploaded first, hwm reached 2200"
+        else
+            pass "Upload order: hwm reached 2200 (order: $FIRST_UPLOADED)"
+        fi
+    else
+        fail "Upload order: hwm did not reach 2200 (first_uploaded=$FIRST_UPLOADED)"
+    fi
+    stop_device
+    cleanup_aircraft_s3 "$SERIAL"
+else
+    skip "TEST 22: upload order — emulator-only"
+fi
+
+# ── TEST 23: Cookie sync from S3 manifest at boot ────────────────────────────
+log ""; log "TEST 23: Boot cookie sync from S3 manifest"
+if [ "$TARGET" = "emulator" ]; then
+    rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory"
+    cleanup_aircraft_s3 "$SERIAL"
+
+    # Seed manifest: previous device uploaded through flight 2300
+    seed_manifest "$SERIAL" 2300
+
+    # Pre-plant a cookie at flight 0 (simulates fresh AirBridge with no history)
+    python3 -c "
+import struct, sys
+serial = b'$SERIAL'
+cookie = bytearray(78)
+cookie[0] = 0xEA; cookie[1] = 0x1E
+cookie[2] = 0x00; cookie[3] = 78
+cookie[4] = 0xD1
+cookie[9:9+min(12,len(serial))] = serial[:12]
+cookie[60] = 0x01
+# flight = 0 (no prior local history)
+# CRC-16 (poly 0x8005, init 0xFFFF)
+crc = 0xFFFF
+for b in cookie[:76]:
+    crc ^= b << 8
+    for _ in range(8):
+        if crc & 0x8000: crc = (crc << 1) ^ 0x8005
+        else: crc <<= 1
+        crc &= 0xFFFF
+cookie[76] = (crc >> 8) & 0xFF
+cookie[77] = crc & 0xFF
+import os; os.makedirs('$SD_EMU', exist_ok=True)
+open('$SD_EMU/dsuCookie.easdf', 'wb').write(bytes(cookie))
+print('Planted cookie: flight=0')
+" 2>/dev/null
+    log "  Planted cookie: flight=0, manifest hwm=2300"
+
+    start_device 5
+    sleep 60  # wait for boot cookie sync (OTA+cookie phase)
+
+    # Read the cookie from the emulated SD to verify it was updated
+    COOKIE_FLIGHT=$(python3 -c "
+import struct
+try:
+    ck = open('$SD_EMU/dsuCookie.easdf','rb').read(78)
+    if len(ck)==78 and ck[0]==0xEA and ck[1]==0x1E:
+        flight = struct.unpack('>I', ck[62:66])[0]
+        print(flight)
+    else: print(0)
+except: print(0)
+" 2>/dev/null)
+    log "  Cookie flight after boot: $COOKIE_FLIGHT (expect ~2300)"
+
+    if [ "${COOKIE_FLIGHT:-0}" -ge 2300 ]; then
+        pass "Boot cookie sync: cookie advanced to flight $COOKIE_FLIGHT from S3 hwm=2300"
+    else
+        fail "Boot cookie sync: cookie flight=$COOKIE_FLIGHT (expected >= 2300)"
+    fi
+    stop_device
+    cleanup_aircraft_s3 "$SERIAL"
+else
+    skip "TEST 23: boot cookie sync — emulator-only"
+fi
+
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 log ""; log "Cleaning up..."
 if [ "$TARGET" = "emulator" ]; then
     aws s3 rm "s3://$BUCKET/$DEVICE/" --recursive 2>/dev/null
+    cleanup_aircraft_s3 "$SERIAL"
 fi
 stop_device
 

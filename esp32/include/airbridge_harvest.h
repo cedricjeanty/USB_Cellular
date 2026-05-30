@@ -12,6 +12,7 @@ struct HarvestResult {
     uint16_t count;
     float    usedMb;
     uint32_t maxFlight;
+    uint32_t minFlight;   // first flight seen across all .eaofh files
     char     dsuSerial[44];
     char     folder[8];      // e.g. "0001"
 };
@@ -164,24 +165,46 @@ inline HarvestResult harvestFiles(const char* srcDir, const char* destBase,
             result.count++;
 
             // Track DSU flight numbers from .eaofh files via content scan.
-            // Backward-scan the *destination* copy (already-flushed) for the
-            // last 0x0E/0x4C record; pull serial + flight from body offsets.
+            // Backward-scan for last_flight; forward-scan for first_flight.
+            // Write a .meta sidecar "{first}:{last}\n" for split-offset use at upload.
             const char* ext = strrchr(ent.name, '.');
             if (ext && strcmp(ext, ".eaofh") == 0) {
                 void* fh = g_hal->filesys->open(dst, "rb");
                 if (fh) {
                     HalLogReader rdr = { fh };
                     char serial[13] = {0};
-                    uint32_t fnum = 0;
+                    uint32_t lastFlight = 0, firstFlight = 0;
+                    char serialFirst[13] = {0};
+
                     if (lastRecordFromLog(hal_read_at, &rdr, ent.size,
-                                          &fnum, serial, sizeof(serial))) {
-                        if (fnum > result.maxFlight) result.maxFlight = fnum;
-                        // Serial is identical across all .eaofh from one DSU;
-                        // record the first non-empty one we see.
+                                          &lastFlight, serial, sizeof(serial))) {
+                        if (lastFlight > result.maxFlight) result.maxFlight = lastFlight;
                         if (serial[0] && !result.dsuSerial[0])
                             strlcpy(result.dsuSerial, serial, sizeof(result.dsuSerial));
                     }
+                    // Forward-scan for first_flight (typically fast — within first few KB)
+                    if (firstRecordFromLog(hal_read_at, &rdr, ent.size,
+                                           &firstFlight, serialFirst, sizeof(serialFirst))) {
+                        if (result.minFlight == 0 || firstFlight < result.minFlight)
+                            result.minFlight = firstFlight;
+                    }
                     g_hal->filesys->close(fh);
+
+                    // Write .meta sidecar alongside the .eaofh
+                    if (firstFlight > 0 && lastFlight > 0) {
+                        char metaDst[288];
+                        snprintf(metaDst, sizeof(metaDst), "%s.meta", dst);
+                        void* mf = g_hal->filesys->open(metaDst, "wb");
+                        if (mf) {
+                            char metaBuf[32];
+                            int mlen = snprintf(metaBuf, sizeof(metaBuf),
+                                                "%lu:%lu\n",
+                                                (unsigned long)firstFlight,
+                                                (unsigned long)lastFlight);
+                            g_hal->filesys->write(mf, metaBuf, (size_t)mlen);
+                            g_hal->filesys->close(mf);
+                        }
+                    }
                 }
             }
         } else {

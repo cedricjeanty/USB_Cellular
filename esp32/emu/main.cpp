@@ -42,6 +42,7 @@
 #include "airbridge_triggers.h"
 #include "airbridge_runtime.h"
 #include "airbridge_log.h"
+#include <csignal>
 
 // ── Display: same as TestDisplay but with SDL-compatible init ────────────────
 
@@ -74,6 +75,9 @@ static HAL            s_hal = { &s_display, &s_clock, &s_nvs, &s_fs, &s_net, &s_
 HAL* g_hal = &s_hal;
 
 static SimModem* s_modem = nullptr;
+// Set by SIGUSR1 — main loop checks and toggles cellular (mirrors 'C' keypress)
+static volatile sig_atomic_t s_cellularToggle = 0;
+static void sigusr1_handler(int) { s_cellularToggle = 1; }
 static const char* SD_ROOT = "./emu_sdcard";           // Partition 1 (DSU-facing)
 static const char* SD_INTERNAL = "./emu_sdcard_internal"; // Partition 2 (firmware internal)
 static SpeedTracker s_usbSpeed = {};
@@ -301,11 +305,26 @@ static void uploadThread(DisplayState* ds) {
         printf("[S3] Uploading %s (%.1f MB)...\n", relPath, fileMb);
         ds->uploadingMb = 0;
 
-        UploadResult r = halS3UploadFile(fullpath, relPath, uploadProgressCb);
+        // Route .eaofh files through fleet-aware upload (manifest check + aircraft path)
+        const char* fname = strrchr(relPath, '/');
+        fname = fname ? fname + 1 : relPath;
+        const char* bareName = fname;
+        for (const char* p = fname; p[0] && p[1]; p++)
+            if (p[0] == '_' && p[1] == '_') bareName = p + 2;
+        const char* ext = strrchr(bareName, '.');
+        bool isEaofh = ext && strcmp(ext, ".eaofh") == 0;
+
+        UploadResult r = isEaofh
+            ? halS3UploadEaofh(harvestDir, relPath, uploadProgressCb)
+            : halS3UploadFile(fullpath, relPath, uploadProgressCb);
         ds->uploadingMb = 0;
         if (r.success) {
-            printf("[S3] Upload complete: %.0f KB/s\n", r.kbps);
+            printf("[S3] Upload complete: %.0f KB/s (%s)\n", r.kbps, r.error);
             markFileUploaded(harvestDir, relPath);
+            // Also clean up .meta sidecar if present (halS3UploadEaofh does it too, belt+suspenders)
+            char metaPath[272];
+            snprintf(metaPath, sizeof(metaPath), "%s.meta", fullpath);
+            g_hal->filesys->remove(metaPath);
             ds->mbUploaded += fileMb;
             if (ds->mbQueued >= fileMb) ds->mbQueued -= fileMb; else ds->mbQueued = 0;
             s_log.write(g_hal->clock->millis(), "Uploaded %s %.0f KB/s", relPath, r.kbps);
@@ -347,6 +366,7 @@ static void renderFramebuffer(SDL_Renderer* renderer) {
 int main(int argc, char* argv[]) {
     signal(SIGTERM, sigHandler);
     signal(SIGINT, sigHandler);
+    signal(SIGUSR1, sigusr1_handler);  // test suite sends SIGUSR1 to toggle cellular
     s_display.init();
 
     // Create log PTY for external tools (cat, test scripts)
@@ -779,6 +799,105 @@ int main(int argc, char* argv[]) {
                     }
                 }
             }
+
+            // Per-aircraft S3 cookie override (date-mode or flight-mode, admin-pushed).
+            // Stored at aircraft/{serial}/cookie.easdf — one-shot, deleted after fetch.
+            {
+                char cookiePath[256];
+                snprintf(cookiePath, sizeof(cookiePath), "%s/dsuCookie.easdf", SD_ROOT);
+                char acSerial[44] = "";
+                void* cf = g_hal->filesys->open(cookiePath, "rb");
+                if (cf) {
+                    uint8_t ck[78] = {};
+                    if (g_hal->filesys->read(cf, ck, 78) == 78 &&
+                        ck[0] == 0xEA && ck[1] == 0x1E) {
+                        size_t n = sizeof(acSerial) - 1; if (n > 42) n = 42;
+                        memcpy(acSerial, ck + 9, n); acSerial[n] = '\0';
+                        for (int j = (int)n - 1; j >= 0; j--) {
+                            if ((uint8_t)acSerial[j] < 0x20 || (uint8_t)acSerial[j] > 0x7E)
+                                acSerial[j] = '\0'; else break;
+                        }
+                    }
+                    g_hal->filesys->close(cf);
+                }
+                if (!acSerial[0])
+                    g_hal->nvs->get_str("mfst", "serial", acSerial, sizeof(acSerial));
+
+                if (acSerial[0]) {
+                    S3Creds creds = loadS3Creds();
+                    if (creds.valid) {
+                        char path[256];
+                        snprintf(path, sizeof(path), "/prod/aircraft/cookie?serial=%s", acSerial);
+                        std::string resp = s3ApiGetPathViaHal(creds.apiHost, creds.apiKey, path);
+                        std::string hexStr = jsonStr(resp, "cookie");
+                        if (hexStr.size() == 156) {
+                            uint8_t cookie[78];
+                            for (int i = 0; i < 78; i++) {
+                                char h[3] = { hexStr[i*2], hexStr[i*2+1], 0 };
+                                cookie[i] = (uint8_t)strtol(h, nullptr, 16);
+                            }
+                            if (cookie[0] == 0xEA && cookie[1] == 0x1E) {
+                                void* wf = g_hal->filesys->open(cookiePath, "wb");
+                                if (wf) {
+                                    g_hal->filesys->write(wf, cookie, 78);
+                                    g_hal->filesys->close(wf);
+                                    printf("[S3] Aircraft cookie applied: %s\n", acSerial);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Manifest-based cookie sync: if S3 hwm > local cookie, advance cookie.
+            // Handles AirBridge swap — ensures DSU won't re-download already-uploaded flights.
+            {
+                char cookiePath[256];
+                snprintf(cookiePath, sizeof(cookiePath), "%s/dsuCookie.easdf", SD_ROOT);
+                void* cf = g_hal->filesys->open(cookiePath, "rb");
+                char cookieSerial[44] = "";
+                uint32_t localFlight = 0;
+                if (cf) {
+                    uint8_t ck[78] = {};
+                    if (g_hal->filesys->read(cf, ck, 78) == 78 &&
+                        ck[0] == 0xEA && ck[1] == 0x1E) {
+                        size_t copyLen = sizeof(cookieSerial) - 1;
+                        if (copyLen > 42) copyLen = 42;
+                        memcpy(cookieSerial, ck + 9, copyLen);
+                        cookieSerial[copyLen] = '\0';
+                        for (int j = (int)copyLen - 1; j >= 0; j--) {
+                            if ((uint8_t)cookieSerial[j] < 0x20 || (uint8_t)cookieSerial[j] > 0x7E)
+                                cookieSerial[j] = '\0';
+                            else break;
+                        }
+                        localFlight = ((uint32_t)ck[62] << 24) | ((uint32_t)ck[63] << 16)
+                                    | ((uint32_t)ck[64] << 8) | ck[65];
+                        if (localFlight == 0xFFFFFFFF) { localFlight = 0; cookieSerial[0] = '\0'; }
+                    }
+                    g_hal->filesys->close(cf);
+                }
+                // Fall back to NVS manifest cache for serial
+                if (!cookieSerial[0])
+                    g_hal->nvs->get_str("mfst", "serial", cookieSerial, sizeof(cookieSerial));
+
+                if (cookieSerial[0]) {
+                    uint32_t s3Hwm = halFetchManifest(cookieSerial);
+                    printf("[Boot] Manifest sync: %s local=%lu S3=%lu\n",
+                           cookieSerial, (unsigned long)localFlight, (unsigned long)s3Hwm);
+                    // Sync forward: write cookie when S3 HWM is higher than local.
+                    // Admin backward rewind requires force_cookie (TODO).
+                    if (s3Hwm > localFlight) {
+                        uint8_t newCookie[78];
+                        buildDsuCookie(cookieSerial, s3Hwm, newCookie);
+                        void* wf = g_hal->filesys->open(cookiePath, "wb");
+                        if (wf) {
+                            g_hal->filesys->write(wf, newCookie, 78);
+                            g_hal->filesys->close(wf);
+                            printf("[Boot] Cookie synced to S3 hwm=%lu\n", (unsigned long)s3Hwm);
+                        }
+                    }
+                }
+            }
         }
 
         // Auto-upload pending files after modem connects
@@ -921,6 +1040,18 @@ int main(int argc, char* argv[]) {
         ds.usbWriteKBps = s_usbSpeed.update(ds.hostWrittenMb, now);
         ds.uploadKBps = s_uploadSpeed.update(ds.mbUploaded + ds.uploadingMb, now);
 
+        // Periodic STATUS heartbeat — keeps the log ring buffer non-empty so the
+        // 10s flush writes new content each cycle (mirrors firmware's STATUS log).
+        {
+            static uint32_t lastStatus = 0;
+            if (now - lastStatus > 30000) {
+                lastStatus = now;
+                airbridge_log("[+%lus] STATUS ppp=%d queued=%.1fMB uploaded=%.1fMB",
+                              (unsigned long)(now / 1000),
+                              (int)ds.pppConnected, ds.mbQueued, ds.mbUploaded);
+            }
+        }
+
         // Periodic log flush to SD (every 10s) + S3 upload (every 30s)
         {
             static uint32_t lastFlush = 0;
@@ -979,6 +1110,14 @@ int main(int argc, char* argv[]) {
                     logUploading = false;
                 }).detach();
             }
+        }
+
+        // SIGUSR1 from test suite: toggle cellular (same as 'C' keypress)
+        if (s_cellularToggle) {
+            s_cellularToggle = 0;
+            ds.pppConnected = !ds.pppConnected;
+            if (ds.pppConnected) { ds.modemRssi = 22; ds.modemReady = true; }
+            printf("Cellular (SIGUSR1): %s\n", ds.pppConnected ? "ON" : "OFF");
         }
 
         updateDisplay(ds);

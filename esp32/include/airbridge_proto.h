@@ -196,6 +196,103 @@ inline uint32_t stdio_read_at(void* ctx, uint64_t off, uint8_t* buf, uint32_t le
     return (uint32_t)fread(buf, 1, len, f);
 }
 
+// ── Forward scan: find first valid record (flight + serial) ─────────────────
+// Parallel to lastRecordFromLog but scans from byte 0 forward.
+// Returns true and fills outFlight/outSerial on success.
+inline bool firstRecordFromLog(log_read_at_fn readfn, void* ctx, uint64_t fsize,
+                               uint32_t* outFlight, char* outSerial, size_t serialSz) {
+    if (!readfn || !outFlight || !outSerial || serialSz < 13 || fsize < 28) return false;
+    *outFlight = 0;
+    outSerial[0] = '\0';
+
+    const uint32_t CHUNK   = 1024;
+    const uint32_t OVERLAP = 4;
+    uint8_t buf[CHUNK + OVERLAP];
+
+    uint64_t pos = 0;
+    uint32_t carry = 0;  // bytes carried from last chunk for overlap
+    while (pos < fsize) {
+        uint32_t want = (fsize - pos > CHUNK) ? CHUNK : (uint32_t)(fsize - pos);
+        uint32_t got = readfn(ctx, pos, buf + carry, want);
+        if (got == 0) break;
+        uint32_t avail = carry + got;
+
+        for (uint32_t i = 0; i + 3 < avail; i++) {
+            if (buf[i] != 0xEA) continue;
+            uint8_t rt = buf[i + 1];
+            if (rt != 0x0E && rt != 0x4C) continue;
+            uint16_t rlen = ((uint16_t)buf[i + 2] << 8) | buf[i + 3];
+            if (rlen < 24 || rlen > 4096) continue;
+            // Absolute file offset of this record's 0xEA byte
+            uint64_t recOff = (pos - carry) + i;
+            if (recOff + rlen > fsize) continue;
+            // Validate: byte at recOff+rlen must be 0xEA or be EOF
+            if (recOff + rlen < fsize) {
+                uint8_t nextSync = 0;
+                if (readfn(ctx, recOff + rlen, &nextSync, 1) != 1) continue;
+                if (nextSync != 0xEA) continue;
+            }
+            uint8_t hdr[24];
+            if (readfn(ctx, recOff + 4, hdr, 24) != 24) continue;
+            size_t copyLen = (serialSz - 1 < 12) ? (serialSz - 1) : 12;
+            memcpy(outSerial, hdr + 5, copyLen);
+            outSerial[copyLen] = '\0';
+            for (int j = (int)copyLen - 1; j >= 0; --j) {
+                uint8_t c = (uint8_t)outSerial[j];
+                if (c == 0 || c == ' ' || c < 0x20 || c > 0x7E) outSerial[j] = '\0';
+                else break;
+            }
+            *outFlight = ((uint32_t)hdr[20] << 8) | hdr[21];
+            return true;
+        }
+
+        // Carry last OVERLAP bytes into next chunk to handle records at boundaries
+        if (avail >= OVERLAP) {
+            carry = OVERLAP;
+            memmove(buf, buf + avail - OVERLAP, OVERLAP);
+        } else {
+            carry = avail;
+            memmove(buf, buf, carry);
+        }
+        pos += got;
+    }
+    return false;
+}
+
+// ── .eaofh filename parser ───────────────────────────────────────────────────
+// Parses "{serial}_{last_flight:05u}_{YYYYMMDD}.eaofh" filename (basename only).
+// outSerial must be at least 44 bytes. Returns true on success.
+inline bool parseEaofhFilename(const char* name, char* outSerial, size_t serialSz,
+                               uint32_t* outLastFlight) {
+    if (!name || !outSerial || serialSz < 2 || !outLastFlight) return false;
+    const char* ext = strrchr(name, '.');
+    if (!ext || strcmp(ext, ".eaofh") != 0) return false;
+
+    // Find the last two underscores to split serial _ flight _ date
+    const char* und2 = nullptr;  // underscore before date
+    const char* und1 = nullptr;  // underscore before flight
+    for (const char* p = ext - 1; p >= name; p--) {
+        if (*p == '_') {
+            if (!und2) und2 = p;
+            else { und1 = p; break; }
+        }
+    }
+    if (!und1 || !und2 || und1 >= und2) return false;
+
+    size_t slen = (size_t)(und1 - name);
+    if (slen == 0 || slen >= serialSz) return false;
+    memcpy(outSerial, name, slen);
+    outSerial[slen] = '\0';
+
+    char flightBuf[12];
+    size_t flen = (size_t)(und2 - und1 - 1);
+    if (flen == 0 || flen >= sizeof(flightBuf)) return false;
+    memcpy(flightBuf, und1 + 1, flen);
+    flightBuf[flen] = '\0';
+    *outLastFlight = (uint32_t)strtoul(flightBuf, nullptr, 10);
+    return *outLastFlight > 0;
+}
+
 // ── Harvest path flattening ─────────────────────────────────────────────────
 // Converts nested directory paths to flat names with __ separator.
 // e.g. prefix="logs", name="data.bin" → "logs__data.bin"
