@@ -11,3 +11,4 @@ emu_modem.dat
 # Scratch test artifacts (downloaded flight data, stray cookies)
 s3_flights/
 dsuCookie*.easdf
+esp32/emu_log.pty
