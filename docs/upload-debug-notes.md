@@ -70,3 +70,34 @@ Why our code doesn't recover (the gap):
   `EA500.E2E` serial → test bucket, else prod.
 - **Do not power-cycle/reconnect in tight loops** — it can throttle the Hologram SIM. The
   device's current bad state is the zombie link, not (only) throttling.
+
+## VERIFIED (2026-05-31, ETag capture, probe OFF) — DATA CORRUPTION on the PPP path
+Clean capture (no MHEALTH probe) of the 22MB multipart upload:
+- Multipart presign OK (uploadId obtained, parts=5); each 5MB part streams fully
+  ("stream done", ~95 KB/s).
+- **Every part PUT returns `etag=[EMPTY] resp=` — S3 never sends an HTTP response.**
+- **The logged uploadId contains non-ASCII/corrupted bytes** (confirmed via `od` — real
+  corruption, not a terminal artifact). Even the small 249-byte presign JSON comes back
+  corrupted → wrong uploadId → part presign/PUT fail → S3 doesn't ack → empty response →
+  multipart never completes → upload wedges.
+- Modem AT-state is healthy throughout (CEREG/CGACT/IP). So this is **byte corruption on
+  the data path**, not signal loss. Small uploads (few-KB boot logs) succeed → corruption
+  is load/size-dependent or intermittent, but a single bad byte in the uploadId kills the
+  whole multipart.
+
+### Leading cause (user's "our code/state" hypothesis — supported)
+Low-level corruption/loss on UART↔modem PPP, candidates in priority order:
+1. **UART 3 Mbaud + HW flow control (CTS/RTS)** dropping/corrupting bytes under sustained
+   load — check RX buffer size/overruns; try lower baud or re-verify flow-control wiring.
+2. **lwIP/PPP**: missing/incorrect TCP checksum offload defines (CHECKSUM_GEN/CHECK_TCP),
+   MTU/MSS — without SW checksums on a lossy link, corrupt payloads pass silently.
+3. PPPoS framing / esp_netif buffer handling.
+
+### Next steps
+1. Pin the layer: log the FULL presign response + uploadId hex; add a TCP/PPP RX checksum
+   sanity check. Compare a run at 921600 baud vs 3 Mbaud (does corruption drop?). Verify
+   lwIP `CHECKSUM_*` config in sdkconfig.
+2. Emulate: inject byte corruption / dropped bytes into the SimModem PPP path → reproduce
+   the corrupted-presign / failed-part locally → verify the fix.
+3. Code fix regardless: fail+retry on empty/!200 part response (don't silently skip);
+   re-fetch presign on a bad uploadId.
