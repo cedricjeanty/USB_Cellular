@@ -37,6 +37,42 @@ have never run against real `esp_tls` / SIM7600 hardware on the upload path. The
 de-risks by reconciling first, swapping one subsystem at a time, and keeping the old code
 behind a flag until each swap is hardware-verified.
 
+## Coverage findings (2026-05-30 deep analysis)
+
+Goal: maximize how much of the *real firmware runtime* the emulator exercises. The
+emulator (`emu/main.cpp`) is a separate orchestration that calls shared **leaf** functions
+through the HAL but re-implements the task glue; the firmware runs its own inline copies of
+the upload + modem-init paths. Concrete constraints discovered while scoping the swaps:
+
+- **`g_hal` IS fully wired in firmware** (`main.cpp:3692`, `Esp32Display/Clock/Nvs/Filesys/Network`).
+  So `halS3UploadFile`/`halS3UploadEaofh`/`findNextUploadFile`/`markFileUploaded` *can* run
+  in the firmware unchanged — the swap is mechanically feasible.
+- **TLS-tuning risk the emulator cannot catch (Gap 1).** Routing uploads through `halS3*`
+  switches the live S3 PUT from the firmware's tuned `tls_connect` to `Esp32Network::connect`.
+  The emulator's network HAL is a native socket, so it validates the upload *logic* (multipart
+  sequencing, manifest/delta, split-offset, NVS resume) but NOT esp_tls buffer sizes, SNI,
+  timeouts, or throughput. → must reconcile `Esp32Network::connect` with `tls_connect`
+  (32 KB buffers, timeouts) and **hardware-verify throughput** (target ~167 KB/s) before trusting.
+- **Modem init can't be wholesale-replaced by `modemRunInit` (Gap 2).** The firmware's
+  `modemTask` does (1) **multi-baud AT sync** (115200 → +++ at 921600/460800/2M/3M, with and
+  without HW flow control) and (2) a **baud upgrade to 3 Mbaud + HW flow control that runs
+  *between* CCLK time-sync and registration** (`main.cpp:2280–2353`). Both are hardware-specific
+  and not meaningfully testable on a single-baud PTY. `modemAtSync`/`modemRunInit` assume a
+  fixed 115200 baud. → To share without losing 3Mbaud, split `modemRunInit` into
+  `modemRunInitPre` (CFUN reset → ATE0 → CTZU → CCLK→epoch) and `modemRunInitPost`
+  (CEREG=1/AUTOCSQ → registration → CSQ → COPS → CGDCONT → dial); firmware calls
+  `Pre → (firmware baud upgrade) → Post`; keep `modemRunInit()` as a `Pre+Post` wrapper so the
+  emulator and `test_native_modem_init` are unchanged. The firmware must also map the returned
+  `ModemInitResult` into its globals (`g_bootEpoch`/`g_bootMs`/`g_modemRssi`/`g_operatorName`)
+  and integrate `Post`'s dial with the existing PPP pump loop.
+- **Magic-file extraction is low value.** The config *application* (`cliSetWifi`/`cliSetS3`)
+  already lives in `airbridge_cli.h` and is unit-tested; only trivial "read 2 lines → apply →
+  remove" glue plus hardware actions (`esp_restart`, format, `g_msc_only`) remain in `app_main`.
+  Deprioritized relative to Gaps 1 and 2.
+- **Validation is serialized on the E2E suite** (~28 min, single emu_nvs/S3-bucket — can't run
+  two at once). Each firmware swap needs: native unit tests (fast) → one emulator E2E → a
+  hardware sign-off the emulator can't provide. Sequence swaps accordingly.
+
 ## Step 0 — Reconcile drift FIRST (no behavior change to firmware)
 
 1. ✅ DONE (commit `cb17621`) — `airbridge_modem.h::modemRunInit` now uses `AT+CEREG?`

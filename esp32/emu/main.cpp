@@ -271,9 +271,11 @@ static void otaProgressCb(uint32_t sent, uint32_t total) {
     if (s_otaDs && total > 0) {
         s_otaDs->otaPct = (int)(sent * 100ULL / total);
         updateDisplay(*s_otaDs);
-        if (s_otaRenderer) renderFramebuffer(s_otaRenderer);
-        SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {}
+        if (s_otaRenderer) {
+            renderFramebuffer(s_otaRenderer);
+            SDL_Event ev;
+            while (SDL_PollEvent(&ev)) {}
+        }
     }
 }
 
@@ -346,6 +348,7 @@ static const int WIN_W = SCREEN_W * SCALE;
 static const int WIN_H = SCREEN_H * SCALE;
 
 static void renderFramebuffer(SDL_Renderer* renderer) {
+    if (!renderer) return;  // headless: nothing to draw
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
     SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
@@ -385,7 +388,16 @@ int main(int argc, char* argv[]) {
     // Init unified logging with PTY+stdout sink
     airbridge_log_init(_emu_serial_sink, SDL_GetTicks);
 
-    const char* deviceId = (argc > 1) ? argv[1] : "EMU000001";
+    // Parse args: first non-flag arg is the device id. The OLED window is opt-in
+    // (--render / -r, or EMU_RENDER=1) — integration tests run headless by default.
+    const char* deviceId = "EMU000001";
+    bool g_render = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--render") == 0 || strcmp(argv[i], "-r") == 0) g_render = true;
+        else if (argv[i][0] != '-') deviceId = argv[i];
+    }
+    if (const char* e = getenv("EMU_RENDER"); e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y'))
+        g_render = true;
     s_nvs.set_str("s3", "device_id", deviceId);
 
     // Session counter (monotonic) + session log file (same as firmware)
@@ -473,7 +485,10 @@ int main(int argc, char* argv[]) {
     printf("Virtual SD card: %s/\n", SD_ROOT);
     printf("NVS storage:     ./emu_nvs.dat\n\n");
     printf("Auto: modem init → OTA check → file detect → harvest → upload\n");
-    printf("Keys: D=DSU-session  I=status  T=test-AT  C=toggle-net  X=drop-session  R=reset  Q=quit\n\n");
+    printf("Render: %s (use --render / EMU_RENDER=1 for the OLED window)\n", g_render ? "ON" : "OFF (headless)");
+    if (g_render)
+        printf("Keys: D=DSU-session  I=status  T=test-AT  C=toggle-net  X=drop-session  R=reset  Q=quit\n");
+    printf("\n");
     fflush(stdout);
     setbuf(stdout, nullptr);  // disable buffering for real-time output
     s_log.clear();
@@ -483,25 +498,32 @@ int main(int argc, char* argv[]) {
     strlcpy(ds.modemOp, "Booting...", sizeof(ds.modemOp));
     std::thread modemThread(modemInitThread, &ds);
 
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-        fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
+    // Timer subsystem works headless (no display required); video is opt-in.
+    if (SDL_Init(SDL_INIT_TIMER) != 0) {
+        fprintf(stderr, "SDL_Init(TIMER): %s\n", SDL_GetError());
         return 1;
     }
 
-    SDL_Window* window = SDL_CreateWindow(
-        "AirBridge OLED Emulator (128x64)",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        WIN_W, WIN_H, SDL_WINDOW_SHOWN);
-    if (!window) {
-        fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
-        SDL_Quit();
-        return 1;
+    SDL_Window* window = nullptr;
+    SDL_Renderer* renderer = nullptr;
+    if (g_render) {
+        if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+            fprintf(stderr, "SDL_InitSubSystem(VIDEO): %s — continuing headless\n", SDL_GetError());
+        } else {
+            window = SDL_CreateWindow(
+                "AirBridge OLED Emulator (128x64)",
+                SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                WIN_W, WIN_H, SDL_WINDOW_SHOWN);
+            if (window) {
+                renderer = SDL_CreateRenderer(window, -1,
+                    SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+                if (!renderer)
+                    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+            } else {
+                fprintf(stderr, "SDL_CreateWindow: %s — continuing headless\n", SDL_GetError());
+            }
+        }
     }
-
-    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1,
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    if (!renderer)
-        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
 
     // ── OTA check (like uploadTask does first after network) ────────
     // Wait for modem init in a non-blocking way
@@ -548,15 +570,19 @@ int main(int argc, char* argv[]) {
         dispBootSplash(FW_VERSION, devId[0] ? devId : deviceId);
         renderFramebuffer(renderer);
         uint32_t splashEnd = SDL_GetTicks() + 5000;
-        while (SDL_GetTicks() < splashEnd && running) {
-            SDL_Event ev;
-            while (SDL_PollEvent(&ev)) { if (ev.type == SDL_QUIT) running = false; }
+        while (SDL_GetTicks() < splashEnd && running && !s_quit) {
+            if (renderer) {
+                SDL_Event ev;
+                while (SDL_PollEvent(&ev)) { if (ev.type == SDL_QUIT) running = false; }
+            }
             SDL_Delay(100);
         }
     }
     while (running && !s_quit) {
         SDL_Event event;
-        while (SDL_PollEvent(&event)) {
+        // Interactive keypresses are debug-only (render mode); headless tests
+        // drive the emulator via file drops + SIGUSR1/SIGTERM.
+        while (renderer && SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) {
                 running = false;
             } else if (event.type == SDL_KEYDOWN) {
@@ -1137,8 +1163,8 @@ int main(int argc, char* argv[]) {
         waitpid(s_clientPppd, nullptr, 0);
     }
     if (s_modem) { s_modem->stop(); delete s_modem; }
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
+    if (renderer) SDL_DestroyRenderer(renderer);
+    if (window) SDL_DestroyWindow(window);
     SDL_Quit();
     return 0;
 }
