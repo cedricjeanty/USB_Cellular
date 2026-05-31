@@ -1030,6 +1030,25 @@ static void check_p1_magic() {
         esp_restart();
     }
 
+    // FORMAT_SD on P1 — set a persistent flag and reboot. The full reformat
+    // (P1 + P2) runs in app_main after the next boot's sd_init (formatting at
+    // runtime would need to tear down the active FATFS/MSC). Clears both
+    // partitions, including a stuck/corrupt internal upload queue.
+    snprintf(path, sizeof(path), "%s/FORMAT_SD", DSU_MOUNT);
+    if (access(path, F_OK) == 0) {
+        remove(path);
+        airbridge_log("P1: FORMAT_SD found — full reformat on next boot");
+        disp("Format SD", "rebooting...");
+        nvs_handle_t fh;
+        if (nvs_open("sys", NVS_READWRITE, &fh) == ESP_OK) {
+            nvs_set_u8(fh, "format", 1); nvs_commit(fh); nvs_close(fh);
+        }
+        unmount_dsu();
+        vTaskDelay(pdMS_TO_TICKS(500));
+        sd_before_restart();
+        esp_restart();
+    }
+
     unmount_dsu();
 }
 
@@ -3892,6 +3911,24 @@ extern "C" void app_main(void) {
     // Initialize event loop + netif (needed for PPP even without WiFi)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // ── FORMAT_SD request (set by the P1/P2 magic-file handler + reboot) ──
+    // Honor it by forcing a full reformat, then clear the flag.
+    {
+        nvs_handle_t fh;
+        if (nvs_open("sys", NVS_READONLY, &fh) == ESP_OK) {
+            uint8_t fmt = 0;
+            esp_err_t e = nvs_get_u8(fh, "format", &fmt);
+            nvs_close(fh);
+            if (e == ESP_OK && fmt) {
+                ESP_LOGW(TAG, "SD: FORMAT_SD requested — forcing full reformat");
+                g_needs_full_format = true;
+                if (nvs_open("sys", NVS_READWRITE, &fh) == ESP_OK) {
+                    nvs_erase_key(fh, "format"); nvs_commit(fh); nvs_close(fh);
+                }
+            }
+        }
+    }
 
     // ── Deferred SD format (needs 16KB stack, can't run in app_main) ────
     // Runs BEFORE task creation so USB hasn't been presented yet.
