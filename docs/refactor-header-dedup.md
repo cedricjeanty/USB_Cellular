@@ -84,6 +84,31 @@ the upload + modem-init paths. Concrete constraints discovered while scoping the
    updates, retry counters) that the header lacks. Add those to the header behind the
    HAL so no behavior is lost.
 
+## Gap 1 — BLOCKERS found (must fix before any upload swap; emulator can't catch these)
+
+Routing the firmware upload through `halS3UploadFile`/`halS3UploadEaofh` is mechanically
+feasible (`g_hal` is wired) but two firmware HAL impls are **not** faithful to the live path,
+and both failure modes are invisible to the native-socket / no-MSC emulator:
+
+1. **`Esp32Filesys` holds no `g_sd_mutex`** (`main.cpp:243` — plain `fopen/fread`). The live
+   `s3UploadFileEx` takes `g_sd_mutex` around every SD read to serialize against the USB MSC
+   `tud_msc_read10/write10` callbacks. `halStreamFile` → `g_hal->fs->read` would read the SD
+   card with **no mutex** while the host is doing MSC I/O → corruption / crashes on hardware.
+   Fix: give `Esp32Filesys` the same take-read-give mutex discipline (per-chunk, releasing
+   during the slow TLS write so MSC isn't starved) before routing uploads through it.
+2. **`Esp32Network::connect` ≠ `tls_connect`** (`main.cpp:276` vs `:1210`). It omits:
+   - `g_tlsActive = true` — the modem watchdog uses `g_tlsActive ? 120000 : 90000` for the
+     pppStale threshold; without it, a long upload can trip a false reconnect mid-transfer.
+   - socket `SO_RCVTIMEO`/`SO_SNDTIMEO = 30s` — without them a stalled cellular socket can
+     hang well past the handshake `timeout_ms`.
+   Fix: make `Esp32Network::connect`/`destroy` a faithful wrapper of `tls_connect`/`tls_destroy`
+   (set/clear `g_tlsActive`, set socket timeouts, keep the detailed error logging).
+
+Only after (1) and (2) does the upload swap preserve behavior. Then **hardware-verify
+throughput** (target ~167 KB/s, 10 MB multipart) — esp_tls buffer/SNI/throughput is the one
+thing the emulator fundamentally cannot validate. Recommended: do (1)+(2) as their own commit
+(no behavior change — the live path keeps working), hardware-check, THEN swap the upload path.
+
 ## Step 1 — Verify HAL coverage on the firmware (`Esp32*` impls)
 
 Confirm the firmware's HAL implementations cover everything the headers call:

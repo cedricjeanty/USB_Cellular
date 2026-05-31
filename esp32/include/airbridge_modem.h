@@ -197,9 +197,12 @@ inline bool modemAtSync() {
     return false;
 }
 
-// Run the full AT initialization sequence (post-sync).
-// Assumes modem is already responding to AT at 115200.
-inline ModemInitResult modemRunInit() {
+// Modem init, part 1 (post-sync): radio reset + echo-off + time sync.
+// Assumes the modem already responds to AT. Leaves it at the current baud so the
+// firmware can upgrade baud (3 Mbaud + HW flow control) before part 2. Returns a
+// result with .synced and .epoch set; .registered/.rssi/.connected are filled by
+// modemRunInitPost(). The single-baud emulator/tests call modemRunInit() (= Pre+Post).
+inline ModemInitResult modemRunInitPre() {
     ModemInitResult r = {};
     r.synced = true;
     char resp[512];
@@ -241,6 +244,15 @@ inline ModemInitResult modemRunInit() {
             }
         }
     }
+
+    return r;
+}
+
+// Modem init, part 2: network registration + RSSI/operator + APN + PPP dial.
+// Call after modemRunInitPre() (on the firmware, after the baud upgrade). Fills
+// r.registered / r.rssi / r.operatorName / r.connected in place.
+inline void modemRunInitPost(ModemInitResult& r) {
+    char resp[512];
 
     // Enable LTE registration URCs + auto RSSI.
     // Use AT+CEREG (LTE/EPS), NOT AT+CREG (2G/3G voice): T-Mobile/Hologram
@@ -313,6 +325,11 @@ inline ModemInitResult modemRunInit() {
             }
         }
     }
+}
 
+// Full init = Pre + Post (single-baud path used by the emulator and unit tests).
+inline ModemInitResult modemRunInit() {
+    ModemInitResult r = modemRunInitPre();
+    modemRunInitPost(r);
     return r;
 }

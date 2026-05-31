@@ -2220,61 +2220,15 @@ static void modemTask(void* param) {
 
     g_modemReady = true;
 
-    // ── Reset modem radio to clear stale PPP/PDP state from previous session ─
-    // Without this, the modem may still be in data mode from the last boot,
-    // causing PPP to fail silently on subsequent connections.
-    cdc_printf("Modem: resetting radio...\r\n");
-    modem_at_cmd("AT+CFUN=0", resp, sizeof(resp), 3000);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    modem_at_cmd("AT+CFUN=1", resp, sizeof(resp), 3000);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    modem_at_cmd("AT", resp, sizeof(resp), 2000);
-
-    // ── Disable echo ────────────────────────────────────────────────────
-    modem_at_cmd("ATE0", resp, sizeof(resp), 1000);
-    modem_at_cmd("AT+CTZU=1", resp, sizeof(resp), 500);
-
-    // ── Time sync (deferred if not available yet) ────────────────────────
-    // AT+CCLK? returns: +CCLK: "YY/MM/DD,HH:MM:SS±TZ"
-    if (modem_at_cmd("AT+CCLK?", resp, sizeof(resp), 2000) > 0) {
-        cdc_printf("Modem: CCLK raw: %s", resp);
-        char* q = strchr(resp, '"');
-        if (q) {
-            int yy = 0, mo = 0, dd = 0, hh = 0, mi = 0, ss = 0;
-            char tzSign = '+';
-            int tzVal = 0;
-            // SIM7600 format: "YY/MM/DD,HH:MM:SS"±TZ  (TZ after closing quote)
-            sscanf(q + 1, "%d/%d/%d,%d:%d:%d", &yy, &mo, &dd, &hh, &mi, &ss);
-            // Find TZ after closing quote
-            char* q2 = strchr(q + 1, '"');
-            if (q2) sscanf(q2 + 1, "%c%d", &tzSign, &tzVal);
-            cdc_printf("Modem: parsed yy=%d mo=%d dd=%d %d:%d:%d tz=%c%d\r\n",
-                       yy, mo, dd, hh, mi, ss, tzSign, tzVal);
-            if (yy >= 24 && yy <= 50 && mo >= 1 && mo <= 12) {
-                struct tm tm = {};
-                tm.tm_year = yy + 100;  // years since 1900
-                tm.tm_mon  = mo - 1;
-                tm.tm_mday = dd;
-                tm.tm_hour = hh;
-                tm.tm_min  = mi;
-                tm.tm_sec  = ss;
-                time_t epoch = mktime(&tm);
-                // Adjust for timezone (quarter-hours from UTC)
-                int tzOffsetSec = tzVal * 15 * 60;
-                if (tzSign == '-') tzOffsetSec = -tzOffsetSec;
-                epoch -= tzOffsetSec;  // convert local → UTC
-                g_bootEpoch = (uint32_t)epoch;
-                g_bootMs = millis();
-                airbridge_log_set_time(g_bootEpoch, g_bootMs);
-                cdc_printf("Modem: time synced 20%02d-%02d-%02d %02d:%02d:%02d TZ%c%d\r\n",
-                           yy, mo, dd, hh, mi, ss, tzSign, tzVal);
-                log_write("Time: 20%02d-%02d-%02d %02d:%02d:%02d TZ%c%d",
-                          yy, mo, dd, hh, mi, ss, tzSign, tzVal);
-            } else {
-                cdc_printf("Modem: CCLK invalid (yy=%d mo=%d) — no time sync\r\n", yy, mo);
-                log_write("CCLK invalid: %s", q);
-            }
-        }
+    // ── Radio reset + echo-off + time sync — shared with emulator/tests ──
+    // modemRunInitPre(): CFUN=0/1 (clear stale PPP/PDP), ATE0, CTZU, AT+CCLK
+    // time sync. Baud is left unchanged so the upgrade below can run.
+    ModemInitResult mr = modemRunInitPre();
+    if (mr.epoch) {
+        g_bootEpoch = mr.epoch;
+        g_bootMs = millis();
+        airbridge_log_set_time(g_bootEpoch, g_bootMs);
+        log_write("Modem: time synced from CCLK (epoch=%lu)", (unsigned long)g_bootEpoch);
     }
 
     // ── Increase baud rate (try highest first, fall back) ─────────────
@@ -2352,105 +2306,18 @@ static void modemTask(void* param) {
         }
     }
 
-    // ── Quick pre-PPP setup (minimal — defer everything else) ──────────
-    modem_at_cmd("AT+AUTOCSQ=1,1", resp, sizeof(resp), 1000); // auto RSSI
-
-    // ── Wait for LTE data registration (up to 30s) ────────────────────────
-    // Use AT+CEREG (LTE/EPS), not AT+CREG. T-Mobile/Hologram SIMs deny voice
-    // registration (CREG returns state 3) but grant LTE data registration
-    // (CEREG returns state 5 = roaming). CREG always times out on T-Mobile.
-    {
-        bool registered = false;
-        for (int i = 0; i < 30; i++) {  // up to 90s (was 15→45s)
-            modem_at_cmd("AT+CEREG?", resp, sizeof(resp), 1000);
-            if (strstr(resp, ",1") || strstr(resp, ",5")) {
-                registered = true;
-                cdc_printf("Modem: registered (%s)\r\n",
-                           strstr(resp, ",5") ? "roaming" : "home");
-                break;
-            }
-            modem_at_cmd("AT+CGREG?", resp, sizeof(resp), 1000);
-            if (strstr(resp, ",1") || strstr(resp, ",5")) {
-                registered = true;
-                cdc_printf("Modem: registered (CGREG, %s)\r\n",
-                           strstr(resp, ",5") ? "roaming" : "home");
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
-        if (!registered) {
-            cdc_printf("Modem: registration timeout — dialing anyway\r\n");
-            log_write("Modem: CEREG timeout — dialing unregistered");
-        }
-    }
-
-    // ── Read RSSI + operator (after registration for reliable operator name) ─
-    modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000);
-    {
-        char* p = strstr(resp, "+CSQ:");
-        if (p) {
-            int rssi = 99;
-            sscanf(p, "+CSQ: %d", &rssi);
-            g_modemRssi = rssi;
-            log_write("Modem: RSSI=%d (pre-dial)", rssi);
-            cdc_printf("Modem: RSSI=%d\r\n", rssi);
-        }
-    }
-    if (modem_at_cmd("AT+COPS?", resp, sizeof(resp), 2000) > 0) {
-        char* q1 = strchr(resp, '"');
-        if (q1) {
-            char* q2 = strchr(q1 + 1, '"');
-            if (q2) {
-                int olen = std::min((int)(q2 - q1 - 1), (int)sizeof(g_modemOp) - 1);
-                memcpy(g_modemOp, q1 + 1, olen);
-                g_modemOp[olen] = '\0';
-            }
-        }
-        cdc_printf("Modem: %s RSSI=%d\r\n", g_modemOp, g_modemRssi);
-        log_write("Modem: operator=%s RSSI=%d", g_modemOp, g_modemRssi);
-    }
-
-    // ── Set APN ──────────────────────────────────────────────────────────
-    modem_at_cmd("AT+CGDCONT=1,\"IP\",\"hologram\"", resp, sizeof(resp), 5000);
-    cdc_printf("Modem: APN set: %s", resp);
-
-    // ── Activate PDP context before dialing ──────────────────────────────
-    // AT+CGACT removed — let ATD*99# handle PDP activation
-
-    // ── Dial PPP (with retry) ────────────────────────────────────────────
-    bool connected = false;
-    for (int dialAttempt = 0; dialAttempt < 3 && !connected; dialAttempt++) {
-        if (dialAttempt > 0) {
-            cdc_printf("Modem: redial attempt %d...\r\n", dialAttempt + 1);
-            modem_at_cmd("ATH", resp, sizeof(resp), 2000);
-            vTaskDelay(pdMS_TO_TICKS(10000));
-        }
-        cdc_printf("Modem: dialing PPP (ATD*99#)...\r\n");
-        mdm_write("ATD*99#\r", 8);
-
-        // Wait for CONNECT
-        uint32_t t0 = millis();
-        char connbuf[256] = "";
-        int connlen = 0;
-        while (millis() - t0 < 30000) {
-            int len = mdm_read((uint8_t*)connbuf + connlen,
-                                      sizeof(connbuf) - 1 - connlen, 500);
-            if (len > 0) {
-                connlen += len;
-                connbuf[connlen] = '\0';
-                if (strstr(connbuf, "CONNECT")) {
-                    connected = true;
-                    cdc_printf("Modem: CONNECT received!\r\n");
-                    log_write("Modem: PPP CONNECT");
-                    break;
-                }
-                if (strstr(connbuf, "ERROR") || strstr(connbuf, "NO CARRIER")) {
-                    cdc_printf("Modem: dial failed: %s\r\n", connbuf);
-                    break;
-                }
-            }
-        }
-    }
+    // ── Registration + RSSI/operator + APN + PPP dial — shared with emulator ──
+    // modemRunInitPost(): AT+CEREG=1/AUTOCSQ, CEREG/CGREG registration wait,
+    // CSQ, COPS, CGDCONT APN, ATD*99# dial (3 attempts). Runs after the baud
+    // upgrade so the modem dials at the upgraded baud, same as before.
+    modemRunInitPost(mr);
+    g_modemRssi = mr.rssi;
+    if (mr.operatorName[0]) strlcpy(g_modemOp, mr.operatorName, sizeof(g_modemOp));
+    if (!mr.registered)
+        log_write("Modem: CEREG timeout — dialed unregistered");
+    cdc_printf("Modem: %s RSSI=%d reg=%d\r\n", g_modemOp, g_modemRssi, mr.registered);
+    log_write("Modem: operator=%s RSSI=%d", g_modemOp, g_modemRssi);
+    bool connected = mr.connected;
 
     // Retry indefinitely if initial PPP dial fails.
     // NO CFUN=0/1 here — AT+CFUN=0 resets the SIM7600 UART to 115200 while the
