@@ -242,13 +242,22 @@ inline ModemInitResult modemRunInit() {
         }
     }
 
-    // Enable registration URCs + auto RSSI
-    modem_at_cmd("AT+CREG=1", resp, sizeof(resp), 1000);
+    // Enable LTE registration URCs + auto RSSI.
+    // Use AT+CEREG (LTE/EPS), NOT AT+CREG (2G/3G voice): T-Mobile/Hologram
+    // denies CREG (voice, state 3) but grants CEREG (data roaming, state 5) —
+    // CREG always times out on these SIMs. Mirrors the firmware boot path.
+    modem_at_cmd("AT+CEREG=1", resp, sizeof(resp), 1000);
     modem_at_cmd("AT+AUTOCSQ=1,1", resp, sizeof(resp), 1000);
 
-    // Wait for registration (up to 30s)
-    for (int i = 0; i < 15; i++) {
-        modem_at_cmd("AT+CREG?", resp, sizeof(resp), 1000);
+    // Wait for LTE data registration, with CGREG packet-domain fallback.
+    for (int i = 0; i < 30; i++) {
+        modem_at_cmd("AT+CEREG?", resp, sizeof(resp), 1000);
+        if (strstr(resp, ",1") || strstr(resp, ",5")) {
+            r.registered = true;
+            break;
+        }
+        // Accept CGREG (2G/3G packet domain) as fallback
+        modem_at_cmd("AT+CGREG?", resp, sizeof(resp), 1000);
         if (strstr(resp, ",1") || strstr(resp, ",5")) {
             r.registered = true;
             break;
