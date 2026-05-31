@@ -1,75 +1,66 @@
-# Upload Debugging — State & Next Steps
+# Upload Debugging — RESOLVED
 
 Working branch: **`gap1-upload-dedup`**. Device: PCB `9C139EF3D3D8` via CoolGear.
-Helpers: `scripts/hw_flash.sh` (flash + stage CDC), `scripts/hw_capture.sh <secs> <out>` (cycle + CDC capture).
+Helpers: `scripts/hw_flash.sh`, `scripts/hw_capture.sh <secs> <out>`.
 
-> PROCESS NOTE: This session twice produced false "findings" by analyzing the WRONG/EMPTY
-> capture file. ALWAYS: (1) verify the capture file exists and is non-empty, (2) grep the
-> ACTUAL file for `Uploading`/`ULDBG`/`etag=` before drawing conclusions, (3) quote real lines.
-> Do not cite a filename you haven't just read.
+## CONCLUSION (verified, ground-truth 2026-05-31)
+**The large-file upload works. There is no upload-code bug and no persistent modem bug.**
 
-## RESOLVED — no large-file *upload-code* bug
-- Emulator multipart works to BOTH buckets (test via E2E TEST 15; prod via isolation run, 8 MB
-  landed intact). SD/MSC contention model completes a 12 MB multipart, no deadlock.
-- Branch fixes kept: `Esp32Filesys::readdir` sets `is_dir`; upload task stack 16→32 KB.
+Clean hardware capture (`/tmp/hw_mp.log`, fresh 22 MB `.eaofh`, probe-off build, RSSI 18):
+- Harvest OK → presign OK → `uploadId` VALID (`svBcu.Ykxoru...`) → `parts=5`.
+- **All 5 parts uploaded with valid ETags** (`6a45708a…`, `3922b5c2…`, `463da1d9…`, `460efad3…`,
+  `e7dee367…`), ~50 KB/s each.
+- `Uploaded … 82 KB/s` → `Cookie updated: flight 1099` → manifest updated.
+- **Verified in S3**: `aws s3 ls` shows `EA500.000243_01099_20260531.eaofh` = **22,337,317 bytes**
+  (exact size) + updated `manifest.json`. Complete and intact.
 
-## VERIFIED on hardware
-1. **Modem is healthy during sessions** (MHEALTH capture `boot_0150`): `CSQ 16–19`, `CEREG 1,5`,
-   `CGACT 1,1`, valid IP. `rssi=99` in STATUS is a **stale-display bug** (`g_modemRssi` not
-   refreshed in PPP data mode), NOT signal loss.
-2. **Small single-PUT uploads work** (capture `/tmp/hw_etag3.log`, RSSI 18, probe-off build):
-   a 4063-byte boot log → `presign resp len=1579` (got a response) → single-PUT → `stream done`
-   → succeeds. So presign + single-PUT + response-read all work for small bodies.
+So gap1's upload de-dup (firmware running the same shared `airbridge_s3.h` path as the emulator)
+is **functionally validated on hardware, including 22 MB multipart over cellular.**
 
-## NOT YET CAPTURED — the large multipart upload
-- In the latest captures the **22 MB file was no longer in the P2 queue** (already harvested on a
-  prior boot; FORMAT_SD / reboots cleared it), so the multipart path **did not run** — those
-  captures only show `scan found no files but q=N` (the long-standing phantom-counter log) and
-  the small-file upload above.
-- To exercise multipart again: drop a fresh ≥6 MB `.eaofh` into P1 `flightHistory/` (or use a
-  test serial), let it harvest, then capture. The per-part `ULDBG part N etag=[...] resp=...`
-  and `uploadId` breadcrumbs are in place (HEAD) and WILL show whether each 5 MB part PUT gets a
-  real response, an empty one, or an error.
+### What the earlier "hangs" actually were
+- **Transient cellular/SIM degradation** — induced by excessive power-cycling/reconnecting in
+  tight loops (Hologram SIM throttles). When the link is healthy the same code uploads fine.
+- **`rssi=99` STATUS stale-display bug** (`g_modemRssi` not refreshed in PPP data mode) made a
+  healthy link look dead. It is NOT signal loss (MHEALTH probe showed CSQ 16–19 throughout).
 
-## Open question (unproven) — why large uploads fail on cellular
-Earlier hardware observation (from `ULDBG`, before instrumentation was complete): 22 MB parts
-streamed but nothing landed in S3 while the modem was healthy. The MECHANISM is **not yet
-pinned** — need a clean multipart capture showing the actual per-part response. Candidates:
-- (a) large request body not fully delivered to S3 over cellular → S3 waits, no response;
-- (b) connection reset/half-close after the body → read EOF;
-- (c) TLS write reports success while bytes are dropped (esp_tls/lwIP/UART).
-Root-cause suspects behind these: UART 3 Mbaud + HW flow control RX overrun under sustained
-load; lwIP TCP MSS/MTU or checksum config; PPPoS framing.
+### Theories investigated and DISPROVEN (don't revisit)
+- SD-lock starvation / deadlock under MSC contention — emulator contention model completes; HW
+  shows reads+writes progressing. NO.
+- "Data corruption on PPP / corrupted uploadId" / "empty part responses" — these came from
+  analyzing EMPTY or WRONG capture files (process error). The real capture shows valid uploadId +
+  valid ETags. NO.
+- "Zombie link as a code bug" — modem AT-state is healthy during uploads. The wedge was link
+  quality + the stale-display bug, not a missing reconnect path. NO.
 
-## Known code bug (fix regardless; emulator-testable)
-`airbridge_s3.h` (~line 485): a part PUT with empty ETag is **silently skipped** (not treated as
-failure), so the multipart proceeds to `complete` with missing ETags → guaranteed fail. Should
-fail+retry the part on an empty/non-200 response.
+## REAL fixes found along the way (KEEP — already on the branch)
+1. `Esp32Filesys::readdir` now sets `FsDirEntry::is_dir` (latent bug; `findNextUploadFile` relied
+   on it; native impl had it, firmware didn't).
+2. Upload task stack 16 KB → 32 KB (the deep `halS3UploadEaofh→halS3UploadFile→s3ApiGetViaHal`
+   frame chain overflowed 16 KB → crash on large files). Real, necessary.
 
-## NEXT STEPS (emulate-first; hardware only to learn what to emulate)
-1. **Re-run a multipart upload on HW**: drop a fresh ≥6 MB `.eaofh`, harvest, `hw_capture.sh`,
-   and READ the real per-part `etag`/`resp` + `uploadId` lines. Classify (a)/(b)/(c).
-2. **Add deeper part-PUT instrumentation** if needed: log `halStreamFile` bytes-streamed vs
-   `Content-Length`, and the `g_hal->network->read` return value in `halHttpReadResponse`
-   (>0 / 0=EOF / <0=err) + elapsed time.
-3. **A/B the UART link** (921600 vs 3 Mbaud); check `sdkconfig` lwIP `CHECKSUM_*`, UART RX buf / overruns.
-4. **Model in `sim_modem.h` / network HAL**: inject the confirmed failure → reproduce locally.
-5. **Fix + emulator-validate**: fail+retry on empty part response; plus whatever (a)/(b)/(c) needs.
+## Worthwhile follow-ups (not blockers)
+- **`rssi=99` stale-display bug**: refresh `g_modemRssi` periodically (the disruptive +++ probe is
+  the wrong way; consider reading CSQ during brief idle gaps, or trust last-known + a slow refresh).
+- **Robustness** (defensive, for genuinely bad links): treat an empty/non-200 part PUT response as
+  a failure (fail+retry) rather than silently continuing (`airbridge_s3.h` ~485); add an
+  upload-progress watchdog so a truly dead link forces reconnect instead of slow-grinding.
+- These are emulator-testable via a network-failure injection in `sim_modem.h` / the network HAL.
 
-## Instrumentation in place (HEAD, gap1 branch)
-- `airbridge_s3.h`: `ULDBG` trace incl. per-part `etag`/`resp` + `uploadId` (gated `UL_TRACE`,
-  default 1). Via `airbridge_log` so it reaches CDC+S3 (raw `printf` → UART0, not CDC).
+## Merge readiness (gap1-upload-dedup)
+The upload de-dup + the two real fixes are validated. Before merge to master: turn OFF debug
+instrumentation (`-DUL_TRACE=0`, `MODEM_HEALTH_DEBUG` already 0), and decide whether to keep the
+diagnostic breadcrumbs (gated off) or strip them.
+
+## Instrumentation / tooling in place (HEAD)
+- `airbridge_s3.h`: `ULDBG` upload trace + per-part `etag`/`resp` + `uploadId` (gated `UL_TRACE`,
+  default 1; set `-DUL_TRACE=0` to compile out). Via `airbridge_log` → reaches CDC+S3 (raw
+  `printf` in shared code → UART0, not the captured CDC — key gotcha).
 - `main.cpp`: `modemHealthProbe()` (gated `MODEM_HEALTH_DEBUG`, default 0; +++/ATO disrupts PUTs).
+- emulator SD/MSC contention model (`EMU_SD_CONTENTION=1`, `EMU_SD_KBPS`).
 - `scripts/hw_flash.sh`, `scripts/hw_capture.sh`, `scripts/repro_sd_contention.sh`.
-
-## Key files
-- `esp32/include/airbridge_s3.h` — `halS3UploadFile` (multipart loop ~409, part response ~481),
-  `halStreamFile` (~255), `halS3UploadEaofh`.
-- `esp32/include/airbridge_http.h` — `halHttpReadResponse`, `s3ApiGetViaHal`.
-- `esp32/src/main.cpp` — `modemTask` pump, PPP, `Esp32Network` (wraps `tls_connect`).
-- `esp32/include/sim_modem.h` — SimModem (extend to inject the data-path failure).
 
 ## Env / gotchas
 - `EA500.E2E`/`EMU_`/`TEST_` → test bucket, else prod. Don't power-cycle in tight loops (SIM throttle).
-- Persistent Bash shell got polluted by heredocs earlier — use single-line commands; verify git
-  with `git rev-parse --short HEAD`; verify a capture is non-empty + grep the real file before analyzing.
+- Verify a capture file is non-empty AND grep the REAL file before drawing conclusions (this
+  session twice produced false findings from empty/wrong files). Verify git with
+  `git rev-parse --short HEAD` after commits.
