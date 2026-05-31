@@ -27,6 +27,7 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <chrono>
 #include <sys/wait.h>
 #include <signal.h>
 
@@ -115,6 +116,29 @@ static void cdc_printf(const char* fmt, ...) {
 // Signal handler for clean shutdown on SIGTERM/SIGINT
 static volatile bool s_quit = false;
 static void sigHandler(int) { s_quit = true; }
+
+// ── Simulated USB MSC SD-bus contender ──────────────────────────────────────
+// Models the host hammering the SD card via USB MSC raw-sector reads while the
+// firmware uploads: once "USB is presented", repeatedly grab the shared SD bus
+// with a 100ms timeout (exactly like tud_msc_read10_cb on the device), hold it
+// for a simulated sector read, release. Reproduces the MSC↔upload SD contention
+// the real device hits — which the emulator otherwise never models. Enabled via
+// EMU_SD_CONTENTION=1 (sets readKBps + spawns this thread).
+static std::atomic<bool> s_mscActive{false};   // true once "USB presented"
+static void mscContenderThread(SimSdCard* sd) {
+    while (!s_quit) {
+        if (!s_mscActive.load()) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
+        // Host MSC read10: take the SD bus with a 100ms timeout (else returns -1 to host)
+        if (sd->bus.try_lock_for(std::chrono::milliseconds(100))) {
+            sd->mscReads++;
+            std::this_thread::sleep_for(std::chrono::milliseconds(3));  // ~one MSC sector burst over SPI
+            sd->bus.unlock();
+        } else {
+            sd->mscTimeouts++;  // host read timed out — on HW the host then retries / may reset
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));  // host read cadence
+    }
+}
 
 // Harvest pipeline state (mirrors firmware globals)
 static bool     s_writeDetected = false;
@@ -398,6 +422,23 @@ int main(int argc, char* argv[]) {
     }
     if (const char* e = getenv("EMU_RENDER"); e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y'))
         g_render = true;
+
+    // ── SD/MSC contention model (EMU_SD_CONTENTION=1) ────────────────────────
+    // Installs the shared SD bus + a simulated USB-MSC reader that competes for
+    // it, plus per-read SPI latency (EMU_SD_KBPS, default 250 KB/s ≈ observed
+    // SPI throughput). Reproduces the device's concurrent SD access; off by
+    // default so normal runs/tests are unaffected.
+    static SimSdCard s_simSd;
+    std::thread mscThread;
+    if (const char* e = getenv("EMU_SD_CONTENTION"); e && e[0] == '1') {
+        const char* kb = getenv("EMU_SD_KBPS");
+        s_simSd.readKBps = kb ? atoi(kb) : 250;
+        g_simSdCard() = &s_simSd;
+        s_mscActive = true;  // host MSC is hammering the card (conservative: whole run)
+        mscThread = std::thread(mscContenderThread, &s_simSd);
+        printf("SD contention model: ON (SPI readKBps=%d, MSC contender active)\n", s_simSd.readKBps);
+    }
+
     s_nvs.set_str("s3", "device_id", deviceId);
 
     // Session counter (monotonic) + session log file (same as firmware)
@@ -1154,6 +1195,13 @@ int main(int argc, char* argv[]) {
     // Final flush before exit
     airbridge_log_flush(emuLogPath);
 
+    if (mscThread.joinable()) {
+        s_mscActive = false;
+        mscThread.join();
+        printf("SD contention stats: fsReads=%ld mscReads=%ld mscTimeouts=%ld\n",
+               s_simSd.fsReads.load(), s_simSd.mscReads.load(), s_simSd.mscTimeouts.load());
+        g_simSdCard() = nullptr;
+    }
     if (modemThread.joinable()) modemThread.join();
     // Clean up pppd and routing
     if (s_clientPppd > 0) {

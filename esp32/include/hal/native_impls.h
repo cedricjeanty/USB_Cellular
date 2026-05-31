@@ -12,6 +12,26 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <mutex>
+#include <atomic>
+#include <unistd.h>
+
+// ── Simulated shared SD/SPI peripheral ──────────────────────────────────────
+// On hardware the SD card sits on ONE SPI bus shared between the firmware's
+// FATFS reads and the USB MSC raw-sector reads, serialized by a single mutex
+// (g_sd_mutex). The native HAL normally has no such contention (fast host FS,
+// no-op lock). When the emulator installs a SimSdCard, NativeFilesys routes its
+// lock()/unlock() through this single timed_mutex and adds per-read SPI latency,
+// so a large upload can be made to contend with a simulated MSC reader exactly
+// like the device. Left null (default) for unit tests → no latency/contention.
+struct SimSdCard {
+    std::timed_mutex bus;             // the single SPI/SD access lock (== g_sd_mutex)
+    int  readKBps = 0;                // 0 = instant; else per-read latency modeling SPI throughput
+    std::atomic<long> mscReads{0};    // simulated MSC sector reads that got the bus
+    std::atomic<long> mscTimeouts{0}; // simulated MSC reads that timed out (host sees -1)
+    std::atomic<long> fsReads{0};     // firmware/FATFS reads served
+};
+inline SimSdCard*& g_simSdCard() { static SimSdCard* p = nullptr; return p; }
 
 // ── File-backed NVS ─────────────────────────────────────────────────────────
 
@@ -89,8 +109,19 @@ public:
 class NativeFilesys : public IFilesys {
 public:
     void* open(const char* path, const char* mode) override { return (void*)fopen(path, mode); }
-    size_t read(void* f, void* buf, size_t len) override { return fread(buf, 1, len, (FILE*)f); }
+    size_t read(void* f, void* buf, size_t len) override {
+        size_t n = fread(buf, 1, len, (FILE*)f);
+        // Model SD/SPI read throughput + count FATFS reads (only when contention installed).
+        if (SimSdCard* sd = g_simSdCard()) {
+            sd->fsReads++;
+            if (sd->readKBps > 0 && n > 0) usleep((useconds_t)(n * 1000ULL / sd->readKBps));
+        }
+        return n;
+    }
     size_t write(void* f, const void* buf, size_t len) override { return fwrite(buf, 1, len, (FILE*)f); }
+    // SD bus lock — serializes against the simulated MSC reader, like g_sd_mutex.
+    void lock() override   { if (SimSdCard* sd = g_simSdCard()) sd->bus.lock(); }
+    void unlock() override { if (SimSdCard* sd = g_simSdCard()) sd->bus.unlock(); }
     bool seek(void* f, long offset, int whence) override { return fseek((FILE*)f, offset, whence) == 0; }
     long tell(void* f) override { return ftell((FILE*)f); }
     void close(void* f) override { if (f) fclose((FILE*)f); }

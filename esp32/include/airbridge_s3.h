@@ -6,9 +6,23 @@
 #include "hal/hal.h"
 #include "airbridge_utils.h"
 #include "airbridge_http.h"
+#include "airbridge_log.h"   // ULDBG breadcrumbs reach CDC+S3 on firmware, stdout on emulator
 #include <cstdio>
 #include <cstring>
 #include <string>
+
+// Upload-path trace breadcrumbs. Routed through airbridge_log — unlike the raw
+// printf() debug in this file, which on firmware goes to UART0, NOT the captured
+// USB CDC (which is why those never showed up). Diagnostic for the large-file
+// upload hang; compile out with -DUL_TRACE=0 once root-caused.
+#ifndef UL_TRACE
+#define UL_TRACE 1
+#endif
+#if UL_TRACE
+#define ULDBG(...) airbridge_log(__VA_ARGS__)
+#else
+#define ULDBG(...) ((void)0)
+#endif
 
 #define S3_CHUNK_SIZE (5UL * 1024 * 1024)
 
@@ -245,6 +259,8 @@ inline bool halStreamFile(TlsHandle tls, void* fileHandle, uint32_t len,
     uint32_t remaining = len;
     uint32_t sent = 0;
     int throttle = g_hal->network->getMaxBytesPerSec();
+    ULDBG("ULDBG stream begin len=%u", len);
+    uint32_t traceMb = 0;  // emit one rd/wr breadcrumb pair per MB
     while (remaining > 0) {
         uint32_t toRead = (remaining < sizeof(buf)) ? remaining : sizeof(buf);
         if (throttle > 0) {
@@ -252,20 +268,25 @@ inline bool halStreamFile(TlsHandle tls, void* fileHandle, uint32_t len,
             if (maxChunk < 1024) maxChunk = 1024;
             if (toRead > maxChunk) toRead = maxChunk;
         }
+        bool trace = (sent >> 20) >= traceMb;
         // Hold the SD lock only around the read — the slow TLS write runs
         // unlocked so the USB MSC task isn't starved (matches live httpStreamChunk).
+        if (trace) ULDBG("ULDBG rd @%u/%u", sent, len);   // last line if SD read stalls
         g_hal->filesys->lock();
         size_t n = g_hal->filesys->read(fileHandle, buf, toRead);
         g_hal->filesys->unlock();
-        if (n == 0) return false;
-        if (!g_hal->network->write(tls, buf, n)) return false;
+        if (n == 0) { ULDBG("ULDBG read=0 @%u", sent); return false; }
+        if (trace) ULDBG("ULDBG wr @%u n=%u", sent, (unsigned)n);  // last line if TLS write stalls
+        if (!g_hal->network->write(tls, buf, n)) { ULDBG("ULDBG write fail @%u", sent); return false; }
         remaining -= n;
         sent += n;
+        if (trace) traceMb = (sent >> 20) + 1;
         if (progress) progress(sent, len);
         if (throttle > 0 && g_hal->clock) {
             g_hal->clock->delay_ms(n * 1000 / throttle);
         }
     }
+    ULDBG("ULDBG stream done %u", sent);
     return true;
 }
 
@@ -315,7 +336,9 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
         snprintf(query, sizeof(query), "file=%s&size=%u&device=%s",
                  urlEncode(filename).c_str(), fileSize, creds.deviceId);
     }
+    ULDBG("ULDBG halS3UploadFile %s sz=%u presign...", filename, fileSize);
     std::string resp = s3ApiGetViaHal(creds.apiHost, creds.apiKey, query);
+    ULDBG("ULDBG presign resp len=%u", (unsigned)resp.size());
 
     // Skip upload if S3 already has this file with matching size
     if (resp.find("\"skip\"") != std::string::npos &&
@@ -330,6 +353,7 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
     std::string uploadId = jsonStr(resp, "upload_id");
     int totalParts = jsonInt(resp, "parts");
     std::string s3Key = jsonStr(resp, "key");
+    ULDBG("ULDBG presign: url=%d uploadId=%d parts=%d", (int)!url.empty(), (int)!uploadId.empty(), totalParts);
 
     // Open file
     void* f = g_hal->filesys->open(filepath, "rb");
@@ -342,6 +366,7 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
 
     // ── Single-part upload (small files, url is set) ────────────────────
     if (url.length() > 0 && uploadId.empty()) {
+        ULDBG("ULDBG single-PUT path");
         char s3Host[128], s3Path[2500];
         if (!parseUrl(url, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
             g_hal->filesys->close(f);
@@ -349,6 +374,7 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
             return res;
         }
 
+        ULDBG("ULDBG single-PUT connect %s", s3Host);
         TlsHandle tls = g_hal->network->connect(s3Host);
         if (!tls) {
             g_hal->filesys->close(f);
@@ -406,10 +432,12 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
         g_hal->filesys->seek(f, (startPart - 1) * S3_CHUNK_SIZE, 0 /*SEEK_SET*/);
     }
 
+    ULDBG("ULDBG multipart: %d parts from part %u", totalParts, startPart);
     for (uint32_t partNum = startPart; partNum <= (uint32_t)totalParts; partNum++) {
         uint32_t offset = (partNum - 1) * S3_CHUNK_SIZE;
         uint32_t chunkSize = fileSize - offset;
         if (chunkSize > S3_CHUNK_SIZE) chunkSize = S3_CHUNK_SIZE;
+        ULDBG("ULDBG part %u/%d sz=%u presign...", partNum, totalParts, chunkSize);
 
         // Get presigned URL for this part
         char pq[1024];
@@ -633,11 +661,15 @@ inline UploadResult halS3UploadEaofh(const char* harvestDir, const char* relPath
         return res;
     }
 
+    ULDBG("ULDBG eaofh begin %s last=%u", bareName, lastFlight);
+
     // Fetch manifest (in-session cache via static vars)
     static char  s_cachedSerial[44] = "";
     static uint32_t s_cachedHwm = 0;
     if (strcmp(s_cachedSerial, serial) != 0) {
+        ULDBG("ULDBG manifest fetch %s...", serial);
         s_cachedHwm = halFetchManifest(serial);
+        ULDBG("ULDBG manifest hwm=%u", s_cachedHwm);
         strlcpy(s_cachedSerial, serial, sizeof(s_cachedSerial));
         if (g_hal->nvs) {
             g_hal->nvs->set_str("mfst", "serial", serial);
@@ -707,7 +739,9 @@ inline UploadResult halS3UploadEaofh(const char* harvestDir, const char* relPath
         snprintf(query, sizeof(query), "file=%s&size=%u&device=%s&key=%s",
                  urlEncode(bareName).c_str(), uploadSize, creds.deviceId, encKey.c_str());
     }
+    ULDBG("ULDBG eaofh presign uploadSize=%u split=%llu...", uploadSize, (unsigned long long)splitOffset);
     std::string presignResp = s3ApiGetViaHal(creds.apiHost, creds.apiKey, query);
+    ULDBG("ULDBG eaofh presign resp len=%u", (unsigned)presignResp.size());
 
     if (presignResp.find("\"skip\"") != std::string::npos &&
         presignResp.find("true") != std::string::npos) {
@@ -721,6 +755,7 @@ inline UploadResult halS3UploadEaofh(const char* harvestDir, const char* relPath
         if (splitOffset == 0) {
             // Full file (no delta): delegate to halS3UploadFile with aircraft key override.
             // This gets full multipart support and NVS resume for free.
+            ULDBG("ULDBG eaofh -> halS3UploadFile (full)");
             res = halS3UploadFile(fullpath, bareName, progress, s3Key);
         } else if (!url.empty() && uploadId.empty()) {
             // Delta upload — small enough for single PUT (< 5 MB)
