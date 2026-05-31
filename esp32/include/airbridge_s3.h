@@ -432,7 +432,8 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
         g_hal->filesys->seek(f, (startPart - 1) * S3_CHUNK_SIZE, 0 /*SEEK_SET*/);
     }
 
-    ULDBG("ULDBG multipart: %d parts from part %u", totalParts, startPart);
+    ULDBG("ULDBG multipart: %d parts from part %u uploadId=[%.40s] key=%s",
+          totalParts, startPart, uploadId.c_str(), s3Key.c_str());
     for (uint32_t partNum = startPart; partNum <= (uint32_t)totalParts; partNum++) {
         uint32_t offset = (partNum - 1) * S3_CHUNK_SIZE;
         uint32_t chunkSize = fileSize - offset;
@@ -479,8 +480,10 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
         }
 
         char etag[64] = "";
-        halHttpReadResponse(tls, etag, sizeof(etag));
+        std::string partResp2 = halHttpReadResponse(tls, etag, sizeof(etag));
         g_hal->network->destroy(tls);
+        ULDBG("ULDBG part %u etag=[%s] resp=%.90s", partNum,
+              etag[0] ? etag : "EMPTY", partResp2.c_str());
 
         if (etag[0]) savePartProgress(partNum, etag);
     }

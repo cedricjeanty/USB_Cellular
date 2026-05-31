@@ -2129,6 +2129,54 @@ static void modem_ip_event_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
+// ── Modem health probe (diagnostic) ─────────────────────────────────────────
+// Escapes PPP data mode, reads the REAL radio state (signal/registration/PDP
+// context/IP), and returns to data mode. Used to understand the "zombie link"
+// (PPP reports connected but no data flows). Disruptive (~10s pause of the data
+// stream) — diagnostic only; gate off via -DMODEM_HEALTH_DEBUG=0.
+#ifndef MODEM_HEALTH_DEBUG
+#define MODEM_HEALTH_DEBUG 0   // probe disabled: modem confirmed healthy; avoid +++/ATO disrupting in-flight PUTs
+#endif
+#if MODEM_HEALTH_DEBUG
+static void modemHealthProbe() {
+    if (!g_pppConnected) return;
+    char resp[256];
+    // Escape PPP → command mode (+++ guard timing)
+    vTaskDelay(pdMS_TO_TICKS(1100));
+    mdm_write("+++", 3);
+    vTaskDelay(pdMS_TO_TICKS(1100));
+    int drained = mdm_read((uint8_t*)resp, sizeof(resp) - 1, 600);
+    if (drained > 0) { resp[drained] = '\0'; }
+    bool inCmd = (drained > 0 && strstr(resp, "OK"));
+
+    auto field = [&](const char* cmd, const char* tag, char* out, size_t osz) {
+        out[0] = '\0';
+        if (modem_at_cmd(cmd, resp, sizeof(resp), 3000) > 0) {
+            char* p = strstr(resp, tag);
+            if (p) {
+                size_t k = 0;
+                for (; p[k] && p[k] != '\r' && p[k] != '\n' && k < osz - 1; k++) out[k] = p[k];
+                out[k] = '\0';
+            }
+        }
+    };
+    char csq[48], cereg[48], cgreg[48], cgact[48], cgpaddr[80];
+    field("AT+CSQ",      "+CSQ:",     csq,     sizeof(csq));
+    field("AT+CEREG?",   "+CEREG:",   cereg,   sizeof(cereg));
+    field("AT+CGREG?",   "+CGREG:",   cgreg,   sizeof(cgreg));
+    field("AT+CGACT?",   "+CGACT:",   cgact,   sizeof(cgact));
+    field("AT+CGPADDR=1","+CGPADDR:", cgpaddr, sizeof(cgpaddr));
+    log_write("MHEALTH escOK=%d | %s | %s | %s | %s | %s",
+              (int)inCmd, csq, cereg, cgreg, cgact, cgpaddr);
+
+    // Return to data mode
+    int ato = modem_at_cmd("ATO", resp, sizeof(resp), 4000);
+    bool back = (ato > 0 && strstr(resp, "CONNECT"));
+    log_write("MHEALTH ATO=%s", back ? "CONNECT (data mode resumed)" : "FAILED (session dead)");
+    if (!back) g_pppNeedsReconnect = true;  // dead session pppStale missed → force reconnect
+}
+#endif
+
 static void modemTask(void* param) {
     (void)param;
     vTaskDelay(pdMS_TO_TICKS(500));  // brief settle for UART pins
@@ -2532,6 +2580,18 @@ static void modemTask(void* param) {
         // ── Track last PPP data for stale detection ─────────────────────
         static uint32_t lastPppRxMs = 0;
         if (len > 0) lastPppRxMs = millis();
+
+#if MODEM_HEALTH_DEBUG
+        // ── Periodic modem-health probe (diagnostic) ────────────────────
+        // Every 60s while connected, read the real radio/PDP state so a CDC
+        // capture shows whether the link goes zombie (PPP up, radio dropped).
+        static uint32_t lastProbeMs = 0;
+        if (g_pppConnected && (millis() - lastProbeMs) > 60000) {
+            lastProbeMs = millis();
+            modemHealthProbe();
+            lastPppRxMs = millis();  // probe paused PPP — don't let it trip pppStale
+        }
+#endif
 
         // Periodic +++ RSSI refresh removed — it disrupts PPP/TLS.
         // RSSI is read once during modem init.
