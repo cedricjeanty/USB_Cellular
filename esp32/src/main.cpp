@@ -23,6 +23,7 @@
 #include "airbridge_wifi_creds.h"
 #include "airbridge_harvest.h"
 #include "airbridge_http.h"
+#include "airbridge_s3.h"
 #include "airbridge_triggers.h"
 #include "airbridge_cli.h"
 #include "airbridge_modem.h"
@@ -73,6 +74,14 @@
 static const char *TAG = "airbridge";
 
 HAL* g_hal = nullptr;
+
+// ── SD/SPI mutex ────────────────────────────────────────────────────────────
+// Serializes SD access between harvest/upload tasks and the USB MSC callbacks.
+// Declared early so the Esp32Filesys HAL impl (used by shared upload code) can
+// take it around streaming reads.
+static SemaphoreHandle_t g_sd_mutex = nullptr;
+static volatile bool     g_sd_ready = false;
+static volatile bool     g_tlsActive = false; // suppress +++ escape during TLS; lengthens modem-watchdog stale threshold
 
 // ── MSC-only mode (no CDC) ──────────────────────────────────────────────────
 // Default: MSC-only for avionics compatibility. Set via CLI: SETMODE CDC / SETMODE MSC
@@ -253,8 +262,11 @@ public:
         struct dirent* ent = ::readdir((DIR*)d);
         if (!ent) return false;
         strlcpy(entry->name, ent->d_name, sizeof(entry->name));
-        // Need stat for size and type
-        return true;  // caller uses stat() for details
+        // Populate is_dir from d_type (reliable on the ESP-IDF FATFS VFS). Shared
+        // code (e.g. findNextUploadFile) relies on this; size still needs stat().
+        entry->is_dir = (ent->d_type == DT_DIR);
+        entry->size = 0;
+        return true;
     }
     void closedir(void* d) override { ::closedir((DIR*)d); }
     bool stat(const char* path, uint32_t* size_out, bool* is_dir_out) override {
@@ -271,21 +283,21 @@ public:
         struct ::stat st;
         return ::stat(path, &st) == 0;
     }
+    // SD is shared with the USB MSC callbacks — serialize streaming reads.
+    void lock() override   { if (g_sd_mutex) xSemaphoreTake(g_sd_mutex, portMAX_DELAY); }
+    void unlock() override { if (g_sd_mutex) xSemaphoreGive(g_sd_mutex); }
 };
+
+// Defined later — the live TLS connect/destroy (sets g_tlsActive, socket
+// timeouts, detailed error logging). Esp32Network wraps them so the shared
+// upload code (airbridge_s3.h) uses the exact same TLS path as the firmware.
+static esp_tls_t* tls_connect(const char* host);
+static void       tls_destroy(esp_tls_t* tls);
 
 class Esp32Network : public INetwork {
 public:
     TlsHandle connect(const char* host) override {
-        esp_tls_t* tls = esp_tls_init();
-        if (!tls) return nullptr;
-        esp_tls_cfg_t cfg = {};
-        cfg.skip_common_name = true;
-        cfg.timeout_ms = 30000;
-        if (esp_tls_conn_new_sync(host, strlen(host), 443, &cfg, tls) != 1) {
-            esp_tls_conn_destroy(tls);
-            return nullptr;
-        }
-        return (TlsHandle)tls;
+        return (TlsHandle)tls_connect(host);
     }
     bool write(TlsHandle conn, const void* data, size_t len) override {
         esp_tls_t* tls = (esp_tls_t*)conn;
@@ -303,7 +315,7 @@ public:
         return esp_tls_conn_read((esp_tls_t*)conn, buf, len);
     }
     void destroy(TlsHandle conn) override {
-        esp_tls_conn_destroy((esp_tls_t*)conn);
+        tls_destroy((esp_tls_t*)conn);
     }
 };
 
@@ -327,9 +339,7 @@ static const char *SD_MOUNT = "/sdcard";
 static bool g_fatfs_mounted = false;
 static BYTE g_fatfs_pdrv = 0xFF;  // FATFS drive number, persists across mount/unmount
 
-// ── SD/SPI mutex ────────────────────────────────────────────────────────────
-static SemaphoreHandle_t g_sd_mutex = nullptr;
-static volatile bool     g_sd_ready = false;
+// g_sd_mutex / g_sd_ready declared earlier (needed by the Esp32Filesys HAL impl).
 
 // ── Harvest timing ──────────────────────────────────────────────────────────
 // QUIET_WINDOW_MS defined in airbridge_triggers.h
@@ -357,7 +367,7 @@ static volatile bool g_otaActive    = false; // suppress display during OTA down
 static bool          g_s3CookieActive = false; // S3 cookie overrides harvest cookie this session
 static volatile bool g_preUsbDone   = false; // upload task signals OTA+cookie done → present USB
 static float    g_uploadingMb    = 0.0f; // live progress of current file upload
-static volatile bool g_tlsActive = false; // suppress +++ escape during TLS
+// g_tlsActive declared earlier (needed by the Esp32Network HAL impl).
 static float    g_uploadBaseMb   = 0.0f; // base offset for multipart (completed parts)
 static float    g_usbWriteKBps   = 0.0f; // live USB write speed for display
 static float    g_uploadKBps     = 0.0f; // live upload speed for display
@@ -2717,6 +2727,13 @@ static void modemTask(void* param) {
     }
 }
 
+// Progress callback for the shared upload code (airbridge_s3.h) — drives the
+// OLED upload-progress field. sent/total are per-PUT (single or per-part).
+static void uploadProgressCb(uint32_t sent, uint32_t total) {
+    (void)total;
+    g_uploadingMb = g_uploadBaseMb + sent / 1e6f;
+}
+
 // ── Upload task ─────────────────────────────────────────────────────────────
 static void uploadTask(void* param) {
     (void)param;
@@ -3040,76 +3057,26 @@ static void uploadTask(void* param) {
         for (;;) {
             if (g_harvesting) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
 
-            // Find next file in oldest subfolder
-            // Find next file in oldest non-empty subfolder
+            char harvBase[64];
+            snprintf(harvBase, sizeof(harvBase), "%s/upload", SD_MOUNT);
+
+            // Find the next file to upload (oldest folder, lowest flight first).
+            // Shared scanner — guard with the SD mutex since it walks dirs the
+            // USB MSC task may also touch.
             char relPath[128] = "";  // "NNNN/filename"
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-            {
-                char harvBase[64];
-                snprintf(harvBase, sizeof(harvBase), "%s/upload", SD_MOUNT);
-                // Collect numeric subfolders
-                char subs[32][16];
-                int nSubs = 0;
-                DIR* topDir = opendir(harvBase);
-                if (topDir) {
-                    struct dirent* ent;
-                    while ((ent = readdir(topDir)) != nullptr && nSubs < 32) {
-                        if (ent->d_type != DT_DIR) continue;
-                        if (ent->d_name[0] == '.' || ent->d_name[0] == '\0') continue;
-                        bool numeric = true;
-                        for (const char* p = ent->d_name; *p && numeric; p++)
-                            if (*p < '0' || *p > '9') numeric = false;
-                        if (!numeric) continue;
-                        strlcpy(subs[nSubs++], ent->d_name, 16);
-                    }
-                    closedir(topDir);
-                }
-                // Sort ascending
-                for (int i = 0; i < nSubs - 1; i++)
-                    for (int j = i + 1; j < nSubs; j++)
-                        if (strcmp(subs[i], subs[j]) > 0) {
-                            char tmp[16]; strlcpy(tmp, subs[i], 16);
-                            strlcpy(subs[i], subs[j], 16); strlcpy(subs[j], tmp, 16);
-                        }
-                // Find first file, skip + rmdir empty folders
-                for (int s = 0; s < nSubs && !relPath[0]; s++) {
-                    char subPath[96];
-                    snprintf(subPath, sizeof(subPath), "%s/%s", harvBase, subs[s]);
-                    DIR* subDir = opendir(subPath);
-                    if (!subDir) continue;
-                    struct dirent* ent;
-                    while ((ent = readdir(subDir)) != nullptr) {
-                        if (ent->d_type == DT_DIR) continue;
-                        if (ent->d_name[0] == '.') continue;
-                        // Skip .meta sidecars — they're helpers, not uploads
-                        size_t nlen = strlen(ent->d_name);
-                        if (nlen > 5 && strcmp(ent->d_name + nlen - 5, ".meta") == 0) continue;
-                        char fullpath[192];
-                        snprintf(fullpath, sizeof(fullpath), "%s/%s", subPath, ent->d_name);
-                        struct stat st;
-                        if (stat(fullpath, &st) == 0 && st.st_size == 0) continue;
-                        snprintf(relPath, sizeof(relPath), "%s/%s", subs[s], ent->d_name);
-                        break;
-                    }
-                    closedir(subDir);
-                    if (!relPath[0]) rmdir(subPath);  // empty folder, clean up
-                }
-            }
+            bool found = findNextUploadFile(harvBase, relPath, sizeof(relPath));
             xSemaphoreGive(g_sd_mutex);
-
-            if (!relPath[0]) break;  // nothing to upload — no log spam
+            if (!found) break;  // nothing to upload
 
             char path[192];
-            snprintf(path, sizeof(path), "%s/upload/%s", SD_MOUNT, relPath);
+            snprintf(path, sizeof(path), "%s/%s", harvBase, relPath);
             cdc_printf("Upload: found %s\r\n", path);
 
-            // Get file size before upload
+            // File size for the display + queue accounting
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
             float fileMb = 0.0f;
-            {
-                struct stat st;
-                if (stat(path, &st) == 0) fileMb = (float)st.st_size / 1e6f;
-            }
+            { struct stat st; if (stat(path, &st) == 0) fileMb = (float)st.st_size / 1e6f; }
             xSemaphoreGive(g_sd_mutex);
 
             // Wait for network (WiFi or cellular)
@@ -3125,171 +3092,68 @@ static void uploadTask(void* param) {
                 vTaskDelay(pdMS_TO_TICKS(60000)); continue;
             }
 
-            // ── Fleet-aware upload: manifest check for .eaofh files ──────────
-            // Statics persist across loop iterations for the serial/hwm cache.
-            static char  s_manifestSerial[44] = "";
-            static uint32_t s_manifestHwm    = 0;
-
-            // Extract just the filename from relPath ("NNNN/filename")
+            // Is this a DSU flight log? (strip harvest "__" prefix for the bare name)
             const char* uploadFname = strrchr(relPath, '/');
             uploadFname = uploadFname ? uploadFname + 1 : relPath;
-
-            // Strip harvest path-flattening prefix ("flightHistory__", etc.)
-            // so parseEaofhFilename sees the bare DSU filename.
             const char* bareFname = uploadFname;
-            for (const char* p = uploadFname; p[0] && p[1]; p++) {
+            for (const char* p = uploadFname; p[0] && p[1]; p++)
                 if (p[0] == '_' && p[1] == '_') bareFname = p + 2;
-            }
-
-            char eaSerial[44]  = "";
-            uint32_t eaLast    = 0;
-            uint32_t eaFirst   = 0;
+            char eaSerial[44] = ""; uint32_t eaLast = 0;
             bool isEaofh = parseEaofhFilename(bareFname, eaSerial, sizeof(eaSerial), &eaLast);
 
-            if (isEaofh) {
-                // Fetch or use cached manifest hwm for this DSU serial
-                if (strcmp(s_manifestSerial, eaSerial) != 0) {
-                    s_manifestHwm = s3FetchManifest(eaSerial);
-                    strlcpy(s_manifestSerial, eaSerial, sizeof(s_manifestSerial));
-                    // Persist cache so next boot starts with known hwm
-                    nvs_handle_t nh;
-                    if (nvs_open("mfst", NVS_READWRITE, &nh) == ESP_OK) {
-                        nvs_set_str(nh, "serial", eaSerial);
-                        nvs_set_u32(nh, "hwm",    s_manifestHwm);
-                        nvs_commit(nh); nvs_close(nh);
-                    }
-                    log_write("Manifest: %s hwm=%lu", eaSerial, (unsigned long)s_manifestHwm);
-                }
+            cdc_printf("Uploading: %s (%.1f MB) heap=%lu min=%lu\r\n", relPath, fileMb,
+                       (unsigned long)esp_get_free_heap_size(),
+                       (unsigned long)esp_get_minimum_free_heap_size());
+            g_uploadingMb = 0.0f; g_uploadBaseMb = 0.0f;
 
-                if (eaLast <= s_manifestHwm) {
-                    // Entirely covered — skip upload, clean up local files
-                    log_write("Manifest skip: %s (last=%lu hwm=%lu)", uploadFname,
-                              (unsigned long)eaLast, (unsigned long)s_manifestHwm);
-                    cdc_printf("Manifest skip: %s\r\n", uploadFname);
-                    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-                    remove(path);
-                    char metaPath[200];
-                    snprintf(metaPath, sizeof(metaPath), "%s.meta", path);
-                    remove(metaPath);
-                    xSemaphoreGive(g_sd_mutex);
-                    if (g_filesQueued > 0) g_filesQueued--;
-                    g_filesUploaded++;
-                    continue;
-                }
-
-                // Read .meta sidecar for first_flight
-                char metaPath[200];
-                snprintf(metaPath, sizeof(metaPath), "%s.meta", path);
-                FILE* mf = fopen(metaPath, "r");
-                if (mf) {
-                    unsigned long ff = 0, lf = 0;
-                    fscanf(mf, "%lu:%lu", &ff, &lf);
-                    fclose(mf);
-                    eaFirst = (uint32_t)ff;
-                }
-            }
-
-            cdc_printf("Uploading: %s (%.1f MB) heap=%lu min=%lu\r\n",
-                     relPath, fileMb,
-                     (unsigned long)esp_get_free_heap_size(),
-                     (unsigned long)esp_get_minimum_free_heap_size());
-            g_uploadingMb = 0.0f;
-            g_uploadBaseMb = 0.0f;
-
-            bool uploaded = false;
-            char eaS3Key[256] = "";
-            uint64_t splitOffset = 0;
-
-            if (isEaofh) {
-                // Build aircraft-namespaced S3 key using bare DSU filename (no harvest prefix)
-                snprintf(eaS3Key, sizeof(eaS3Key), "aircraft/%s/%s", eaSerial, bareFname);
-
-                if (eaFirst > 0 && eaFirst <= s_manifestHwm) {
-                    // File spans old+new data — find split point and upload tail only
-                    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-                    FILE* sf = fopen(path, "rb");
-                    uint64_t totalSz = 0;
-                    if (sf) { fseek(sf, 0, SEEK_END); totalSz = (uint64_t)ftell(sf); }
-                    xSemaphoreGive(g_sd_mutex);
-                    if (sf) {
-                        splitOffset = findSplitOffset(sf, totalSz, eaFirst, eaLast, s_manifestHwm);
-                        xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-                        fclose(sf);
-                        xSemaphoreGive(g_sd_mutex);
-                        // Guard: if split found nothing useful, upload from start
-                        if (splitOffset >= totalSz) splitOffset = 0;
-                    }
-                    log_write("Manifest delta: %s offset=%llu key=%s",
-                              uploadFname, (unsigned long long)splitOffset, eaS3Key);
-                    cdc_printf("Manifest delta: %s offset=%llu\r\n",
-                               uploadFname, (unsigned long long)splitOffset);
-                }
-                uploaded = s3UploadFileEx(relPath, eaS3Key, splitOffset);
-            } else {
-                uploaded = s3UploadFile(relPath);
-            }
+            // Upload via the shared code path — identical to what the emulator runs.
+            // .eaofh files go through fleet-aware manifest/delta logic; others are
+            // a plain single/multipart PUT. SD reads inside hold g_sd_mutex via the
+            // Esp32Filesys lock() hook; TLS uses the same tls_connect() as before.
+            UploadResult ur = isEaofh
+                ? halS3UploadEaofh(harvBase, relPath, uploadProgressCb)
+                : halS3UploadFile(path, relPath, uploadProgressCb);
 
             g_tlsActive = false;  // re-enable +++ after upload
-            g_uploadingMb = 0.0f;
-            g_uploadBaseMb = 0.0f;
-            if (!uploaded) {
-                cdc_printf("Upload failed for %s — retrying in 30s\r\n", relPath);
-                log_write("Upload FAIL: %s", relPath);
+            g_uploadingMb = 0.0f; g_uploadBaseMb = 0.0f;
+
+            if (!ur.success) {
+                cdc_printf("Upload failed for %s: %s — retrying in 30s\r\n", relPath, ur.error);
+                log_write("Upload FAIL: %s (%s)", relPath, ur.error);
                 vTaskDelay(pdMS_TO_TICKS(30000)); continue;
             }
+            log_write("Uploaded %s %.0f KB/s (%s)", relPath, ur.kbps, ur.error);
 
-            // After successful .eaofh upload: update S3 manifest + local cookie
-            if (isEaofh && eaS3Key[0]) {
-                uint32_t newFirst = (eaFirst > 0 && eaFirst <= s_manifestHwm)
-                                    ? (s_manifestHwm + 1) : (eaFirst > 0 ? eaFirst : 1);
-                bool mOk = s3UpdateManifest(eaSerial, newFirst, eaLast, eaS3Key);
-                if (mOk) {
-                    s_manifestHwm = eaLast;
-                    // Update NVS cache
-                    nvs_handle_t nh;
-                    if (nvs_open("mfst", NVS_READWRITE, &nh) == ESP_OK) {
-                        nvs_set_u32(nh, "hwm", s_manifestHwm); nvs_commit(nh); nvs_close(nh);
-                    }
-                    // Advance DSU cookie to confirmed S3 hwm
-                    if (eaSerial[0]) {
-                        uint8_t newCookie[78];
-                        buildDsuCookie(eaSerial, s_manifestHwm, newCookie);
-                        xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-                        write_cookie_to_dsu(newCookie, 78);
-                        xSemaphoreGive(g_sd_mutex);
-                        log_write("Cookie updated: %s flight %lu",
-                                  eaSerial, (unsigned long)s_manifestHwm);
-                    }
+            // .eaofh: advance the DSU cookie to the confirmed S3 high-water-mark.
+            // halS3UploadEaofh updates the manifest + NVS mfst/hwm but does NOT
+            // write the cookie — the firmware does, so the aircraft DSU resumes
+            // from the right flight. Idempotent on a manifest-skip.
+            if (isEaofh && eaSerial[0]) {
+                uint32_t hwm = 0;
+                nvs_handle_t nh;
+                if (nvs_open("mfst", NVS_READONLY, &nh) == ESP_OK) {
+                    nvs_get_u32(nh, "hwm", &hwm); nvs_close(nh);
                 }
-                // Clean up .meta sidecar (regardless of manifest update result)
-                xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-                char metaCleanPath[200];
-                snprintf(metaCleanPath, sizeof(metaCleanPath), "%s.meta", path);
-                remove(metaCleanPath);
-                xSemaphoreGive(g_sd_mutex);
+                if (hwm > 0) {
+                    uint8_t newCookie[78];
+                    buildDsuCookie(eaSerial, hwm, newCookie);
+                    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                    write_cookie_to_dsu(newCookie, 78);
+                    xSemaphoreGive(g_sd_mutex);
+                    log_write("Cookie updated: %s flight %lu", eaSerial, (unsigned long)hwm);
+                }
             }
 
-            // Delete uploaded file and remove subfolder if empty
+            // Delete the uploaded file + remove the subfolder if now empty.
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-            remove(path);
-            // Extract subfolder path and try rmdir (only succeeds if empty)
-            {
-                const char* slash = strchr(relPath, '/');
-                if (slash) {
-                    char subDir[96];
-                    snprintf(subDir, sizeof(subDir), "%s/upload/%.*s",
-                             SD_MOUNT, (int)(slash - relPath), relPath);
-                    rmdir(subDir);
-                }
-            }
+            markFileUploaded(harvBase, relPath);
             xSemaphoreGive(g_sd_mutex);
+
             ESP_LOGI(TAG, "Uploaded & deleted: %s", relPath);
             if (g_filesQueued > 0) g_filesQueued--;
             g_filesUploaded++;
             g_mbUploaded += fileMb;
             if (g_mbQueued >= fileMb) g_mbQueued -= fileMb; else g_mbQueued = 0.0f;
-
-            // RSSI check removed — +++ disrupts PPP even between files
         }
         if (g_filesQueued > 0) {
             log_write("Upload: scan found no files but q=%u — possible FATFS stale cache", g_filesQueued);
@@ -4025,7 +3889,10 @@ extern "C" void app_main(void) {
     }
 
     // ── Create tasks ────────────────────────────────────────────────────
-    xTaskCreatePinnedToCore(uploadTask,    "upload",    16384, nullptr, 1, &g_upload_task,  1);
+    // 32KB stack: the shared upload path (halS3UploadEaofh → halS3UploadFile →
+    // s3ApiGetViaHal) nests several multi-KB frames (s3Path[2500], hdr[2700], …),
+    // which overflows the old 16KB stack and crashes mid-upload on hardware.
+    xTaskCreatePinnedToCore(uploadTask,    "upload",    32768, nullptr, 1, &g_upload_task,  1);
     xTaskCreatePinnedToCore(harvestTask,   "harvest",   16384, nullptr, 1, &g_harvest_task, 1);
     xTaskCreatePinnedToCore(modemTask,     "modem",     16384, nullptr, 2, &g_modem_task,   0);  // core 0, 16KB stack for reconnection
     xTaskCreatePinnedToCore(main_loop_task, "main_loop", 4096, nullptr, 1, nullptr,         0);

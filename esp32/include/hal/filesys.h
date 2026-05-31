@@ -34,4 +34,11 @@ public:
     virtual bool   rmdir(const char* path) = 0;
     virtual bool   remove(const char* path) = 0;
     virtual bool   exists(const char* path) = 0;
+
+    // Coarse SD-access lock. On the firmware the SD card is shared with the USB
+    // MSC callbacks, so streaming reads must be serialized via a mutex; callers
+    // (e.g. halStreamFile) wrap each read in lock()/unlock(). No-op by default
+    // (native/test backends have no contended device).
+    virtual void   lock() {}
+    virtual void   unlock() {}
 };

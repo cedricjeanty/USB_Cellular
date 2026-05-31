@@ -241,7 +241,7 @@ inline S3Creds loadS3Creds() {
 inline bool halStreamFile(TlsHandle tls, void* fileHandle, uint32_t len,
                           UploadProgressFn progress = nullptr) {
     if (!g_hal || !g_hal->network || !g_hal->filesys) return false;
-    uint8_t buf[8192];
+    static uint8_t buf[8192];  // static: keep off the (small) firmware task stack
     uint32_t remaining = len;
     uint32_t sent = 0;
     int throttle = g_hal->network->getMaxBytesPerSec();
@@ -252,7 +252,11 @@ inline bool halStreamFile(TlsHandle tls, void* fileHandle, uint32_t len,
             if (maxChunk < 1024) maxChunk = 1024;
             if (toRead > maxChunk) toRead = maxChunk;
         }
+        // Hold the SD lock only around the read — the slow TLS write runs
+        // unlocked so the USB MSC task isn't starved (matches live httpStreamChunk).
+        g_hal->filesys->lock();
         size_t n = g_hal->filesys->read(fileHandle, buf, toRead);
+        g_hal->filesys->unlock();
         if (n == 0) return false;
         if (!g_hal->network->write(tls, buf, n)) return false;
         remaining -= n;
