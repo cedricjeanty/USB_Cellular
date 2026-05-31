@@ -5,8 +5,9 @@
 set -u
 cd "$(dirname "$0")/../esp32"
 
-SERIAL="EA500.E2ETES"      # test serial → test bucket
-DEVICE="EMU_CONTEND_$(date +%H%M%S)"
+SERIAL="${SERIAL:-EA500.E2ETES}"      # test serial → test bucket (override to test prod routing)
+DEVICE="${DEVICE:-EMU_CONTEND_$(date +%H%M%S)}"
+CONTENTION="${CONTENTION:-1}"          # 0 = no SD contention (isolate network/backend)
 SIZE_MB="${1:-12}"         # >5MB → multipart
 DATE=$(date +%Y%m%d)
 F="emu_sdcard/flightHistory/${SERIAL}_01500_${DATE}.eaofh"
@@ -30,8 +31,8 @@ dd if=/dev/urandom of="$F" bs=1M count="$SIZE_MB" oflag=append conv=notrunc 2>/d
 trailer "$F" "$SERIAL" "01500"          # last-flight trailer
 ls -l "$F"
 
-echo "=== run emulator with SD contention (readKBps=250), capture ~300s ==="
-EMU_SD_CONTENTION=1 EMU_SD_KBPS=250 timeout 300 ./.pio/build/emulator/program "$DEVICE" > /tmp/contend.log 2>&1
-echo "exit=$? (124=timed out → likely HUNG)"
+echo "=== run emulator (device=$DEVICE serial=$SERIAL contention=$CONTENTION), capture ~300s ==="
+EMU_SD_CONTENTION="$CONTENTION" EMU_SD_KBPS=250 timeout 300 ./.pio/build/emulator/program "$DEVICE" > /tmp/contend.log 2>&1
+echo "exit=$? (124=timed out)"
 echo "=== ULDBG trace tail ==="
 grep -E "ULDBG|stream done|Upload OK|Uploaded|contention stats|Manifest" /tmp/contend.log | tail -40
