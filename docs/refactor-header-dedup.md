@@ -39,11 +39,11 @@ behind a flag until each swap is hardware-verified.
 
 ## Step 0 — Reconcile drift FIRST (no behavior change to firmware)
 
-1. Change `airbridge_modem.h::modemRunInit` from `AT+CREG?` to `AT+CEREG?` (+ `AT+CGREG?`),
-   matching `main.cpp` and the CLAUDE.md "never CREG on T-Mobile/Hologram" rule.
-2. Run `pio test -e native` (esp. `test_native_modem_init`) — fix the sim/test if it
-   asserted on `CREG`. After this, the header is the *correct* implementation.
-3. Diff `halS3UploadFile`/`halS3UploadEaofh` against `s3UploadFileEx` line-by-line and
+1. ✅ DONE (commit `cb17621`) — `airbridge_modem.h::modemRunInit` now uses `AT+CEREG?`
+   (+ `AT+CGREG?` fallback) instead of `AT+CREG?`, matching `main.cpp` and the CLAUDE.md
+   "never CREG on T-Mobile/Hologram" rule. `test_native_modem_init` + `test_native_modem`
+   pass; the SimModem still answers `AT+CREG?` so the AT-handler tests are unaffected.
+2. Diff `halS3UploadFile`/`halS3UploadEaofh` against `s3UploadFileEx` line-by-line and
    note any firmware-only behavior (progress callbacks, `g_sd_mutex` discipline, OLED
    updates, retry counters) that the header lacks. Add those to the header behind the
    HAL so no behavior is lost.
