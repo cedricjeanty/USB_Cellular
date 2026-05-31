@@ -1,103 +1,72 @@
-# Upload Debugging — State & Next Steps (compacted 2026-05-31)
+# Upload Debugging — State & Next Steps
 
 Working branch: **`gap1-upload-dedup`**. Device: PCB `9C139EF3D3D8` via CoolGear (`scripts/coolgear.py`).
 
-## RESOLVED — there is no large-file *upload-code* bug
-Spent a long arc thinking the 22 MB upload had an SD-lock / multipart bug. It does not:
-- **Emulator multipart works** to BOTH buckets. `EMU_E2E` → test bucket (E2E TEST 15, 10 MB,
-  passes). Isolation run `SERIAL=EA999.HWDIAG DEVICE=HWDIAG000001 CONTENTION=0` → **prod**
-  bucket, 8 MB file **landed intact** (`scripts/repro_sd_contention.sh`). Prod test data was
-  cleaned up.
+> RETRACTION: an earlier version of this doc claimed a "VERIFIED data corruption on the PPP
+> path (empty part responses + corrupted uploadId)." That was WRONG — it was derived from an
+> **empty capture file** (the ETag capture produced 0 lines and the flash never ran). There is
+> currently **no hardware data** on the per-part PUT response. Treat the per-part behavior as
+> UNKNOWN until a clean capture exists.
+
+## RESOLVED — no large-file *upload-code* bug
+- **Emulator multipart works** to BOTH buckets. `EMU_E2E` → test bucket (E2E TEST 15, 10 MB).
+  Isolation run `SERIAL=EA999.HWDIAG DEVICE=HWDIAG000001 CONTENTION=0` → **prod** bucket, 8 MB
+  file **landed intact** (`scripts/repro_sd_contention.sh`). Prod test data was cleaned up.
 - **SD/MSC contention model** (`EMU_SD_CONTENTION=1`) completes a 12 MB multipart upload,
   `mscTimeouts=0`, no deadlock → shared lock discipline is sound.
-- **On hardware**, `ULDBG` breadcrumbs showed the 22 MB upload *progressing* (parts stream
-  per-MB, reads+writes), NOT hanging on an SD read. Real fixes found+kept on the branch:
-  `Esp32Filesys::readdir` now sets `is_dir` (latent bug), upload task stack 16→32 KB.
-- Conclusion: **gap1's upload de-dup is functionally validated.** Mergeable once the modem
-  issue below is addressed.
+- Real fixes found+kept on the branch: `Esp32Filesys::readdir` now sets `is_dir` (latent bug),
+  upload task stack 16→32 KB.
+- Conclusion: gap1's upload de-dup is functionally validated; the failure is on the link/data path.
 
-## ROOT CAUSE of the "upload hang" — modem zombie-link, caused by our code
-On hardware the parts *stream* (bytes into TLS) but never land in S3, then the device goes
-silent for hours, all under **`AT+CSQ`=99 (no detectable signal) while PPP still reports
-connected**. That is a zombie link: lwIP/PPP thinks it's up, the radio has actually dropped,
-data goes nowhere. NOT a degraded tower — a code/state problem.
+## VERIFIED on hardware (MHEALTH probe capture, `boot_0150`)
+- **Modem is healthy during uploads**: `CSQ 16–19`, `CEREG 1,5` (registered), `CGREG 0,5`,
+  `CGACT 1,1` (PDP active), valid IP — the whole session.
+- **`rssi=99` in STATUS is a stale-display bug** (`g_modemRssi` not refreshed mid-session via
+  AUTOCSQ in PPP data mode), NOT signal loss. The "dead radio / zombie link" read was wrong.
+- **The upload parts stream** ("stream done", per-MB reads+writes, ~50–95 KB/s) but **no
+  multipart/parts ever land in S3** (checked both buckets), while the emulator lands the same
+  parts over host internet.
 
-Why our code doesn't recover (the gap):
-- Link-health = `pppStale` on `lastPppRxMs` (`main.cpp:2533–2545`): fires only when the modem
-  goes **fully silent** for `staleMs` (90 s, or **120 s while `g_tlsActive`**). It does NOT
-  detect "modem still answers LCP echoes but no real internet data flows." LCP echo replies
-  keep `lastPppRxMs` fresh → `pppStale` never fires → upload wedges indefinitely.
-- `IP_EVENT_PPP_LOST_IP` is the only other trigger, and ESP-IDF lwIP-PPP is documented to lose
-  the connection *without* firing it (esp-protocols #562/#637).
-- Supporting: SIMCom does **not recommend PPP** for SIM7600 data ("high-bandwidth module; use
-  QMI"). PPPoS-over-UART is inherently fragile for sustained transfers.
+## NOT YET VERIFIED (the open question)
+*Why do streamed parts never land in S3 while the modem AT-state is healthy?*
+- The per-part PUT response / ETag has **not** been captured. Two attempts produced **empty CDC
+  logs (0 lines)**; `scripts/hw_flash.sh` did not exist when invoked (exit 127) so the probe-off
+  + ETag build was **never actually flashed** — the device still runs the MHEALTH-probe build.
+- Candidate mechanisms to distinguish with a *working* capture: (a) parts don't fully reach S3
+  (connection stall/drop → S3 waits, no response); (b) S3 rejects them (bad uploadId/signature
+  → error response); (c) data corruption on the UART/PPP path. NONE confirmed yet.
+
+## Known code bug regardless (fix + emulator-test independently)
+`airbridge_s3.h` (~line 485): an empty/failed part response (no ETag) is **silently skipped**
+instead of fail+retry, so a multipart with any bad part can never complete → upload wedges.
 
 ## NEXT STEPS (emulate-first; hardware only to learn what to emulate)
-1. **HW capture to understand the zombie state** (the device is in it now — good).
-   Instrument the firmware to log, every ~15 s during a session: `AT+CSQ`, `AT+CEREG?`,
-   `AT+CGACT?`, `AT+CGPADDR`, and bytes-since-last *non-LCP* PPP RX. Capture via CDC while a
-   large upload wedges. Tells us: is the radio deregistered? PDP context dead? data mode stuck?
-   (Querying needs a `+++` escape mid-session — do it carefully / only on suspected stall.)
-2. **Model the zombie state in `sim_modem.h`**: PPP stays up but data stops flowing / radio
-   deregisters (CEREG→0, CSQ→99) mid-session, optionally still answering LCP. So we can
-   reproduce + test recovery locally.
-3. **Fix (test in emulator):**
-   - App-level **upload-progress watchdog**: if an in-flight upload makes no real S3 progress
-     (no part completes / TLS write rate ~0) for N s, force a full reconnect — this keys on
-     *actual data delivery*, the only reliable signal.
-   - Smarter stale detection: count only **non-LCP** PPP RX toward `lastPppRxMs`; add a
-     periodic real-reachability check (DNS/keepalive), not just PPP-layer liveness.
-   - Robust multipart error handling: verify each part's PUT response/ETag; fail-fast + retry
-     on a rejected/empty-ETag part instead of streaming into the void.
-   - Durable option to evaluate: SIM7600 built-in TCP/IP (AT `NETOPEN`/`CIPOPEN`) or its
-     native TLS, replacing PPPoS for uploads (big change; weigh later).
-4. **Validate** recovery in the emulator against the modeled zombie state, then hardware-confirm.
+1. **Make the HW flash + CDC capture reliable.** Recreate `scripts/hw_flash.sh` (it was lost),
+   run it cleanly (the persistent Bash shell got polluted by multi-line heredocs this session →
+   garbled output, cancelled batches, empty captures — use small single-line commands). Confirm
+   the probe-off + ETag build is actually flashed and CDC produces output before trusting a run.
+2. **Capture the per-part response** (`ULDBG part N etag=[...] resp=...` + the uploadId, hex if
+   needed) to classify (a)/(b)/(c). Only then state a mechanism.
+3. **Model it in `sim_modem.h`** (drop/corrupt PPP bytes, or stall a part PUT) and reproduce locally.
+4. **Fix + emulator-validate**: fail+retry on bad part response; whatever (a)/(b)/(c) shows.
+
+## Instrumentation in place (HEAD, gap1 branch)
+- `airbridge_s3.h`: `ULDBG` upload trace + per-part `etag`/`resp` + `uploadId` breadcrumbs
+  (gated `UL_TRACE`, default 1). Routed via `airbridge_log` so it reaches CDC+S3 — raw `printf`
+  in shared code goes to UART0, never the captured CDC (important gotcha).
+- `main.cpp`: `modemHealthProbe()` (gated `MODEM_HEALTH_DEBUG`, default 0 — it does +++/ATO which
+  disrupts in-flight PUTs; only enable to read AT-state).
+- `scripts/repro_sd_contention.sh` (`SERIAL`/`DEVICE`/`CONTENTION` env). `scripts/hw_flash.sh` is
+  MISSING (cancelled write) — recreate it.
 
 ## Key files
 - `esp32/include/airbridge_modem.h` — `modemAtSync`/`modemRunInitPre/Post`/`modemReconnect`.
-- `esp32/src/main.cpp` — `modemTask` pump loop, `pppStale` (~2533), reconnect backoff (~2576),
-  PPP event handlers (~2118).
-- `esp32/include/sim_modem.h` — SimModem (extend to inject zombie-link failure modes).
-- `esp32/include/airbridge_s3.h` — `ULDBG` upload trace (gated by `UL_TRACE`, default 1; set
-  `-DUL_TRACE=0` to compile out). Routed via `airbridge_log` so it reaches CDC+S3 (raw
-  `printf` in shared code goes to UART0, never the captured CDC — important gotcha).
-- `scripts/repro_sd_contention.sh` — emulator upload repro (`SERIAL`/`DEVICE`/`CONTENTION` env).
+- `esp32/src/main.cpp` — `modemTask` pump loop, `pppStale` (~2533), reconnect backoff, PPP events.
+- `esp32/include/sim_modem.h` — SimModem (extend to inject PPP-path failure modes).
 
 ## Env / gotchas
-- Flash: `ENABLE_CDC` on P1 (USB-visible) → power-cycle → CDC → 1200-baud touch `/dev/ttyACM0`
-  → `pio run -e esp32s3 -t upload --upload-port /dev/ttyACM0` → power-cycle. `FORMAT_SD` on P1
-  reformats P1+P2 (clears stuck queue). Bucket routing: `EMU_`/`TEST_` device or `TEST.`/
-  `EA500.E2E` serial → test bucket, else prod.
-- **Do not power-cycle/reconnect in tight loops** — it can throttle the Hologram SIM. The
-  device's current bad state is the zombie link, not (only) throttling.
-
-## VERIFIED (2026-05-31, ETag capture, probe OFF) — DATA CORRUPTION on the PPP path
-Clean capture (no MHEALTH probe) of the 22MB multipart upload:
-- Multipart presign OK (uploadId obtained, parts=5); each 5MB part streams fully
-  ("stream done", ~95 KB/s).
-- **Every part PUT returns `etag=[EMPTY] resp=` — S3 never sends an HTTP response.**
-- **The logged uploadId contains non-ASCII/corrupted bytes** (confirmed via `od` — real
-  corruption, not a terminal artifact). Even the small 249-byte presign JSON comes back
-  corrupted → wrong uploadId → part presign/PUT fail → S3 doesn't ack → empty response →
-  multipart never completes → upload wedges.
-- Modem AT-state is healthy throughout (CEREG/CGACT/IP). So this is **byte corruption on
-  the data path**, not signal loss. Small uploads (few-KB boot logs) succeed → corruption
-  is load/size-dependent or intermittent, but a single bad byte in the uploadId kills the
-  whole multipart.
-
-### Leading cause (user's "our code/state" hypothesis — supported)
-Low-level corruption/loss on UART↔modem PPP, candidates in priority order:
-1. **UART 3 Mbaud + HW flow control (CTS/RTS)** dropping/corrupting bytes under sustained
-   load — check RX buffer size/overruns; try lower baud or re-verify flow-control wiring.
-2. **lwIP/PPP**: missing/incorrect TCP checksum offload defines (CHECKSUM_GEN/CHECK_TCP),
-   MTU/MSS — without SW checksums on a lossy link, corrupt payloads pass silently.
-3. PPPoS framing / esp_netif buffer handling.
-
-### Next steps
-1. Pin the layer: log the FULL presign response + uploadId hex; add a TCP/PPP RX checksum
-   sanity check. Compare a run at 921600 baud vs 3 Mbaud (does corruption drop?). Verify
-   lwIP `CHECKSUM_*` config in sdkconfig.
-2. Emulate: inject byte corruption / dropped bytes into the SimModem PPP path → reproduce
-   the corrupted-presign / failed-part locally → verify the fix.
-3. Code fix regardless: fail+retry on empty/!200 part response (don't silently skip);
-   re-fetch presign on a bad uploadId.
+- Flash: `ENABLE_CDC` on P1 → power-cycle → CDC → 1200-baud touch `/dev/ttyACM0` →
+  `pio run -e esp32s3 -t upload --upload-port /dev/ttyACM0` → power-cycle. `FORMAT_SD` on P1
+  reformats P1+P2. Bucket routing: `EMU_`/`TEST_` device or `TEST.`/`EA500.E2E` serial → test, else prod.
+- Don't power-cycle/reconnect in tight loops (can throttle the Hologram SIM).
+- Persistent Bash shell pollution: prefer single-line commands; verify with `git rev-parse --short HEAD`.
