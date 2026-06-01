@@ -10,13 +10,24 @@ The active variant has two test layers, both running the shared `airbridge_*.h` 
   ```bash
   cd esp32 && pio test -e native
   ```
-- **End-to-end suite** — `scripts/e2e_unified.sh` (TEST 1–23) runs the same scenarios
-  against the SDL2 emulator or real hardware:
+- **End-to-end suite** — `scripts/e2e_unified.sh` runs scenario tests against the SDL2
+  emulator or real hardware:
   ```bash
   scripts/e2e_unified.sh --target emulator   # SimModem PTY + FakeSD, no hardware
   scripts/e2e_unified.sh --target device     # CoolGear-power-cycled hardware
   ```
-  Known pre-existing failures are tracked in project memory.
+  Several tests are **consolidated**: rather than booting the emulator per case, they run a
+  natural sequence on one session and assert at each step — which also tests emergent,
+  cross-operation behavior (manifest HWM monotonic, cookie chains, state survives reboot):
+  - **TEST 2 — happy-path lifecycle**: upload → multi-file → system-file-skip → cookie →
+    reboot/persist → PPP drop+reconnect → upload-order, in one boot.
+  - **TEST 19 — manifest lifecycle**: full-upload → skip-covered-file → boot cookie sync.
+  - **TEST 3 — power-cut resume ×2**: single-PUT cut+resume, then multipart cut + NVS resume.
+
+  Waits are **state-triggered** off emulator log markers (`wait_for_log`, `wait_for_harvest`,
+  `wait_for_upload_complete`, `wait_for_manifest`) rather than fixed sleeps, so each step and
+  each power-cut lands at the correct moment. Isolation-critical tests (other power-cut /
+  regression cases) stay standalone.
 
 The sections below cover the **legacy Raspberry Pi** pytest suite.
 

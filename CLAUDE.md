@@ -224,7 +224,8 @@ esp32/
 ```
 lambda/presign.py                # S3 pre-signed URLs, fw version check, DSU cookie, OTA URL, log append
 scripts/
-├── e2e_unified.sh               # Unified E2E suite (TEST 1–23). --target emulator | device
+├── e2e_unified.sh               # Unified E2E suite (~15 tests; consolidated lifecycle + manifest +
+│                                #   power-cut tests; state-triggered waits). --target emulator | device
 ├── commission.sh                # Device commissioning (flash, format SD, verify cellular/OTA/USB)
 ├── coolgear.py                  # CoolGear USB hub power control for automated power-cycle tests
 ├── test_e2e_esp32.py            # Python E2E harness (hardware)
