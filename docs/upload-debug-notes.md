@@ -37,14 +37,22 @@ is **functionally validated on hardware, including 22 MB multipart over cellular
    on it; native impl had it, firmware didn't).
 2. Upload task stack 16 KB → 32 KB (the deep `halS3UploadEaofh→halS3UploadFile→s3ApiGetViaHal`
    frame chain overflowed 16 KB → crash on large files). Real, necessary.
+3. **Multipart part-PUT retry** (commit `1df4ad3` + `8433a36`): a part PUT that streams fully but
+   gets no ETag (lost ack on a flaky link) now retries up to 3× (re-presign + re-seek + re-stream)
+   instead of silently skipping → broken `complete`. Aborts cleanly with NVS resume intact if all
+   retries fail. Tested: native `test_native_s3` (retry-recovers + all-retries-fail, proven to fail
+   with PART_RETRIES=1), and **E2E TEST 24** (OpenSSLNetwork `dropPutResponseOnPart` /
+   `EMU_DROP_PUT_RESP` drops the 1st part response → upload still lands; suite 31/31).
 
 ## Worthwhile follow-ups (not blockers)
-- **`rssi=99` stale-display bug**: refresh `g_modemRssi` periodically (the disruptive +++ probe is
-  the wrong way; consider reading CSQ during brief idle gaps, or trust last-known + a slow refresh).
-- **Robustness** (defensive, for genuinely bad links): treat an empty/non-200 part PUT response as
-  a failure (fail+retry) rather than silently continuing (`airbridge_s3.h` ~485); add an
-  upload-progress watchdog so a truly dead link forces reconnect instead of slow-grinding.
-- These are emulator-testable via a network-failure injection in `sim_modem.h` / the network HAL.
+- **`rssi=99` stale-display**: DECIDED to leave as-is (see `feedback_display_direction` memory) —
+  no safe way to read RSSI mid-PPP on this single-UART board; users don't need it. Will revisit as
+  part of a planned graphical OLED redesign (more graphical, always-show-activity, maybe drop RSSI).
+- **Upload-progress watchdog**: considered redundant with existing `pppStale` (90s/120s) which
+  already forces reconnect when the modem goes silent; the part-PUT retry covers the app layer.
+  Not pursuing unless a real need shows up.
+- Network fault-injection harness now exists (`OpenSSLNetwork.dropPutResponseOnPart`) for any
+  future flaky-link tests.
 
 ## Merge readiness (gap1-upload-dedup)
 The upload de-dup + the two real fixes are validated. Before merge to master: turn OFF debug
