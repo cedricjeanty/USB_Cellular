@@ -438,54 +438,66 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
         uint32_t offset = (partNum - 1) * S3_CHUNK_SIZE;
         uint32_t chunkSize = fileSize - offset;
         if (chunkSize > S3_CHUNK_SIZE) chunkSize = S3_CHUNK_SIZE;
-        ULDBG("ULDBG part %u/%d sz=%u presign...", partNum, totalParts, chunkSize);
 
-        // Get presigned URL for this part
-        char pq[1024];
-        // Include device= so _pick_bucket routes to the correct S3 bucket
-        snprintf(pq, sizeof(pq), "upload_id=%s&key=%s&part=%u&device=%s",
-                 uploadId.c_str(), urlEncode(s3Key.c_str()).c_str(), partNum,
-                 creds.deviceId);
-        std::string partResp = s3ApiGetViaHal(creds.apiHost, creds.apiKey, pq);
-        std::string partUrl = jsonStr(partResp, "url");
-        if (partUrl.empty()) {
-            g_hal->filesys->close(f);
-            snprintf(res.error, sizeof(res.error), "Presign part %u failed", partNum);
-            return res;
-        }
-
-        char s3Host[128], s3Path[2500];
-        if (!parseUrl(partUrl, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
-            g_hal->filesys->close(f);
-            strlcpy(res.error, "Part URL parse failed", sizeof(res.error));
-            return res;
-        }
-
-        TlsHandle tls = g_hal->network->connect(s3Host);
-        if (!tls) {
-            g_hal->filesys->close(f);
-            snprintf(res.error, sizeof(res.error), "TLS connect part %u failed", partNum);
-            return res;
-        }
-
-        char hdr[2700];
-        snprintf(hdr, sizeof(hdr),
-            "PUT %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
-            s3Path, s3Host, chunkSize);
-        if (!g_hal->network->write(tls, hdr, strlen(hdr)) ||
-            !halStreamFile(tls, f, chunkSize, progress)) {
-            g_hal->network->destroy(tls); g_hal->filesys->close(f);
-            snprintf(res.error, sizeof(res.error), "Stream part %u failed", partNum);
-            return res;
-        }
-
+        // Upload this part with retries. A part is only "done" once S3 returns a
+        // non-empty ETag — on a flaky cellular link the PUT can stream fully yet
+        // get no/!2xx response. Retrying (re-presign + re-seek + re-stream) avoids
+        // the old failure mode where an empty-ETag part was silently skipped and
+        // the final "complete" then failed with a missing part. Each attempt
+        // re-seeks to this part's offset (halStreamFile advances the file pos).
         char etag[64] = "";
-        std::string partResp2 = halHttpReadResponse(tls, etag, sizeof(etag));
-        g_hal->network->destroy(tls);
-        ULDBG("ULDBG part %u etag=[%s] resp=%.90s", partNum,
-              etag[0] ? etag : "EMPTY", partResp2.c_str());
+        const int PART_RETRIES = 3;
+        for (int attempt = 0; attempt < PART_RETRIES && !etag[0]; attempt++) {
+            ULDBG("ULDBG part %u/%d sz=%u attempt %d presign...",
+                  partNum, totalParts, chunkSize, attempt + 1);
 
-        if (etag[0]) savePartProgress(partNum, etag);
+            // Presigned URL for this part. device= so _pick_bucket routes correctly.
+            char pq[1024];
+            snprintf(pq, sizeof(pq), "upload_id=%s&key=%s&part=%u&device=%s",
+                     uploadId.c_str(), urlEncode(s3Key.c_str()).c_str(), partNum,
+                     creds.deviceId);
+            std::string partResp = s3ApiGetViaHal(creds.apiHost, creds.apiKey, pq);
+            std::string partUrl = jsonStr(partResp, "url");
+            if (partUrl.empty()) { ULDBG("ULDBG part %u presign empty, retry", partNum); continue; }
+
+            char s3Host[128], s3Path[2500];
+            if (!parseUrl(partUrl, s3Host, sizeof(s3Host), s3Path, sizeof(s3Path))) {
+                ULDBG("ULDBG part %u URL parse failed, retry", partNum); continue;
+            }
+
+            TlsHandle tls = g_hal->network->connect(s3Host);
+            if (!tls) { ULDBG("ULDBG part %u TLS connect failed, retry", partNum); continue; }
+
+            // Seek to this part's offset (required on every attempt — a prior
+            // attempt or part left the file pos elsewhere).
+            g_hal->filesys->seek(f, (long)offset, 0 /*SEEK_SET*/);
+
+            char hdr[2700];
+            snprintf(hdr, sizeof(hdr),
+                "PUT %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+                s3Path, s3Host, chunkSize);
+            if (!g_hal->network->write(tls, hdr, strlen(hdr)) ||
+                !halStreamFile(tls, f, chunkSize, progress)) {
+                g_hal->network->destroy(tls);
+                ULDBG("ULDBG part %u stream failed, retry", partNum);
+                continue;
+            }
+
+            std::string partResp2 = halHttpReadResponse(tls, etag, sizeof(etag));
+            g_hal->network->destroy(tls);
+            ULDBG("ULDBG part %u attempt %d etag=[%s] resp=%.60s", partNum, attempt + 1,
+                  etag[0] ? etag : "EMPTY", partResp2.c_str());
+        }
+
+        if (!etag[0]) {
+            // All retries failed to get an ETag — abort. Parts saved so far stay in
+            // the NVS resume session, so the upload task's next attempt resumes.
+            g_hal->filesys->close(f);
+            snprintf(res.error, sizeof(res.error), "Part %u failed after %d retries (no ETag)",
+                     partNum, PART_RETRIES);
+            return res;
+        }
+        savePartProgress(partNum, etag);
     }
     g_hal->filesys->close(f);
 

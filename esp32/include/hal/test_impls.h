@@ -278,26 +278,45 @@ public:
 
 // ── Network ─────────────────────────────────────────────────────────────────
 
-// Mock network with canned HTTP responses
+// Mock network with canned HTTP responses.
+// Single-response mode: set next_response (returned for every connection).
+// Sequenced mode: push responses with push_response(); each new connection pops
+// the next one (falling back to next_response once the queue is empty). This lets
+// a test script a multipart sequence (presign, part-presign, part-PUT, complete)
+// and inject a transient failure (e.g. an empty part-PUT response) to exercise retry.
 class MockNetwork : public INetwork {
 public:
     struct MockConn { std::string resp; size_t pos; std::string captured; };
     std::string next_response;
+    std::vector<std::string> response_queue;  // FIFO; consumed front-first
+    size_t queue_pos = 0;
+    int connect_count = 0;
     std::string last_host;
     std::string last_request;
+    std::vector<std::string> requests;        // every request body, in order
     bool fail_connect = false;
 
-    void reset() { next_response.clear(); last_host.clear(); last_request.clear(); fail_connect = false; }
+    void reset() {
+        next_response.clear(); response_queue.clear(); queue_pos = 0;
+        connect_count = 0; last_host.clear(); last_request.clear();
+        requests.clear(); fail_connect = false;
+    }
+    void push_response(const std::string& r) { response_queue.push_back(r); }
 
     TlsHandle connect(const char* host) override {
         if (fail_connect) return nullptr;
         last_host = host;
-        return new MockConn{next_response, 0, ""};
+        connect_count++;
+        std::string resp = (queue_pos < response_queue.size())
+                           ? response_queue[queue_pos++] : next_response;
+        return new MockConn{resp, 0, ""};
     }
     bool write(TlsHandle conn, const void* data, size_t len) override {
         auto* c = (MockConn*)conn;
+        bool first = c->captured.empty();
         c->captured.append((const char*)data, len);
         last_request = c->captured;
+        if (first) requests.push_back(c->captured); else requests.back() = c->captured;
         return true;
     }
     int read(TlsHandle conn, void* buf, size_t len) override {

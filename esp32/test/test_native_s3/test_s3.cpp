@@ -355,6 +355,76 @@ void test_upload_skip_if_exists(void) {
     TEST_ASSERT_TRUE(r.success);  // skip counts as success
 }
 
+// ── Multipart part-PUT retry tests ──────────────────────────────────────────
+// A >5MB file uploads as multipart (S3_CHUNK_SIZE = 5MB). The connection sequence
+// is: [0] initial presign, then per part [presign, PUT], then [complete].
+// MockNetwork serves response_queue front-first per connect().
+
+static const std::string PRESIGN_INIT =
+    "HTTP/1.1 200 OK\r\n\r\n"
+    "{\"upload_id\":\"UP123\",\"key\":\"D1/0001/big.bin\",\"parts\":2}";
+static std::string partPresign(int part) {
+    return std::string("HTTP/1.1 200 OK\r\n\r\n")
+         + "{\"url\":\"https://s3.aws.com/bucket/D1/0001/big.bin?partNumber=" + std::to_string(part)
+         + "&uploadId=UP123&sig=abc\"}";
+}
+static std::string partPutOk(const char* etag) {
+    return std::string("HTTP/1.1 200 OK\r\nETag: \"") + etag + "\"\r\n\r\n";
+}
+static const std::string PART_PUT_EMPTY = "";  // S3 sent nothing → no ETag (flaky link)
+static const std::string COMPLETE_OK =
+    "HTTP/1.1 200 OK\r\n\r\n<CompleteMultipartUploadResult></CompleteMultipartUploadResult>";
+
+static void setup_multipart_creds_and_file(void) {
+    s_nvs.set_str("s3", "api_host", "api.ex.com");
+    s_nvs.set_str("s3", "api_key", "key");
+    s_nvs.set_str("s3", "device_id", "D1");
+    s_fs.add_dir("/sd/upload");
+    s_fs.add_dir("/sd/upload/0001");
+    std::string big(6 * 1024 * 1024, 'x');  // 6MB → 2 parts (5MB + 1MB)
+    s_fs.add_file("/sd/upload/0001/big.bin", big.data(), big.size());
+}
+
+// Part 1's PUT transiently returns an empty response (no ETag); the retry
+// re-presigns + re-PUTs and succeeds. Upload should ultimately succeed.
+void test_multipart_part_put_retry_recovers(void) {
+    setup_multipart_creds_and_file();
+    s_net.push_response(PRESIGN_INIT);        // initial presign
+    s_net.push_response(partPresign(1));      // part 1 presign (attempt 1)
+    s_net.push_response(PART_PUT_EMPTY);      // part 1 PUT attempt 1 → no ETag
+    s_net.push_response(partPresign(1));      // part 1 presign (attempt 2 / retry)
+    s_net.push_response(partPutOk("etag1"));  // part 1 PUT attempt 2 → OK
+    s_net.push_response(partPresign(2));      // part 2 presign
+    s_net.push_response(partPutOk("etag2"));  // part 2 PUT → OK
+    s_net.push_response(COMPLETE_OK);         // complete
+
+    UploadResult r = halS3UploadFile("/sd/upload/0001/big.bin", "0001/big.bin");
+    TEST_ASSERT_TRUE(r.success);
+    // 8 connections = the scripted sequence incl. the one retry.
+    TEST_ASSERT_EQUAL_INT(8, s_net.connect_count);
+}
+
+// All retries of a part fail → upload aborts cleanly (no false success), and the
+// NVS resume session is preserved for the upload task's next attempt.
+void test_multipart_part_put_all_retries_fail(void) {
+    setup_multipart_creds_and_file();
+    s_net.push_response(PRESIGN_INIT);    // initial presign
+    s_net.push_response(partPresign(1));  // part 1 presign attempt 1
+    s_net.push_response(PART_PUT_EMPTY);  // PUT 1 → no ETag
+    s_net.push_response(partPresign(1));  // attempt 2
+    s_net.push_response(PART_PUT_EMPTY);  // PUT 2 → no ETag
+    s_net.push_response(partPresign(1));  // attempt 3
+    s_net.push_response(PART_PUT_EMPTY);  // PUT 3 → no ETag
+    // (no further responses needed — should give up after 3 attempts)
+
+    UploadResult r = halS3UploadFile("/sd/upload/0001/big.bin", "0001/big.bin");
+    TEST_ASSERT_FALSE(r.success);
+    // Session still present (not cleared) so the next upload attempt resumes.
+    char uid[64] = "";
+    TEST_ASSERT_TRUE(s_nvs.get_str("s3up", "uid", uid, sizeof(uid)));
+    TEST_ASSERT_EQUAL_STRING("UP123", uid);
+}
+
 // ── Test runner ─────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -394,6 +464,10 @@ int main(int argc, char** argv) {
     RUN_TEST(test_upload_success);
     RUN_TEST(test_upload_connect_fails);
     RUN_TEST(test_upload_skip_if_exists);
+
+    // Multipart part-PUT retry
+    RUN_TEST(test_multipart_part_put_retry_recovers);
+    RUN_TEST(test_multipart_part_put_all_retries_fail);
 
     // findNextUploadFile
     RUN_TEST(test_find_next_empty);
