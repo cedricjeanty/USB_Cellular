@@ -167,6 +167,14 @@ public:
     char bindAddr[32] = "";    // bind to specific source IP (e.g. PPP interface)
     int maxBytesPerSec = 0;    // bandwidth limit (0 = unlimited)
 
+    // Fault injection (tests): if >0, the Nth S3 part PUT (1-indexed, by PUT
+    // connection order) still uploads its body to S3 but its RESPONSE read
+    // returns 0 (EOF) — simulating a response lost on a flaky link. The firmware
+    // sees no ETag and retries the part; the retry is a new PUT connection with a
+    // higher index, so it reads the ETag normally. Models "PUT succeeded but the
+    // ack didn't come back," the exact case the part-PUT retry guards against.
+    int dropPutResponseOnPart = 0;
+
     OpenSSLNetwork() {
         SSL_library_init();
         SSL_load_error_strings();
@@ -178,7 +186,8 @@ public:
         if (ctx_) SSL_CTX_free(ctx_);
     }
 
-    struct Conn { SSL* ssl; int fd; };
+    struct Conn { SSL* ssl; int fd; bool sawPut = false; bool dropResp = false; };
+    int putCount_ = 0;  // count of PUT connections seen (for fault injection)
 
     TlsHandle connect(const char* host) override {
         struct addrinfo hints = {}, *res = nullptr;
@@ -213,6 +222,14 @@ public:
 
     bool write(TlsHandle conn, const void* data, size_t len) override {
         auto* c = (Conn*)conn;
+        // Detect a part PUT (request line starts with "PUT ") on its first write,
+        // and decide whether to drop this connection's response (fault injection).
+        if (!c->sawPut && len >= 4 && memcmp(data, "PUT ", 4) == 0) {
+            c->sawPut = true;
+            putCount_++;
+            if (dropPutResponseOnPart > 0 && putCount_ == dropPutResponseOnPart)
+                c->dropResp = true;
+        }
         const char* p = (const char*)data;
         size_t rem = len;
         while (rem > 0) {
@@ -225,6 +242,7 @@ public:
 
     int read(TlsHandle conn, void* buf, size_t len) override {
         auto* c = (Conn*)conn;
+        if (c->dropResp) return 0;  // simulate lost response: EOF before any data
         int r = SSL_read(c->ssl, buf, len);
         if (r <= 0) return (SSL_get_error(c->ssl, r) == SSL_ERROR_ZERO_RETURN) ? 0 : -1;
         return r;

@@ -1304,6 +1304,34 @@ else
     skip "TEST 23: boot cookie sync — emulator-only"
 fi
 
+# ── TEST 24: Multipart part-PUT retry on a flaky link ────────────────────────
+# The first part PUT uploads its body but its RESPONSE is dropped (lost ack), so
+# the firmware gets no ETag and must retry that part. The upload should still
+# complete and land the file. Exercises the part-PUT retry through the full
+# upload-task path (emulator only — needs the OpenSSLNetwork fault-injection).
+log ""; log "TEST 24: Multipart part-PUT retry (flaky link, dropped part response)"
+if [ "$TARGET" = "emulator" ]; then
+    cleanup_s3
+    cleanup_aircraft_s3 "$SERIAL"
+    rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory"
+    rm -f "$SD_EMU"/*.bin "$SD_EMU"/*.easdf "$FW_DIR/emu_nvs.dat"
+
+    export EMU_DROP_PUT_RESP=1   # drop the response of the 1st part PUT
+    start_device
+    write_dsu_file "01900" 8192  # 8 MB → 2 parts → exercises part 1 retry
+    log "  8 MB file written; part-1 PUT response will be dropped once, then retried"
+    if wait_for_aircraft_upload "$SERIAL" "${SERIAL}_01900" 300; then
+        pass "Part-PUT retry: multipart upload completed despite dropped part response"
+    else
+        fail "Part-PUT retry: upload did not complete after dropped part response"
+    fi
+    unset EMU_DROP_PUT_RESP
+    stop_device
+    cleanup_aircraft_s3 "$SERIAL"
+else
+    skip "TEST 24: part-PUT retry — emulator-only (needs network fault injection)"
+fi
+
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 log ""; log "Cleaning up..."
 if [ "$TARGET" = "emulator" ]; then

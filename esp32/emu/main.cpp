@@ -439,6 +439,14 @@ int main(int argc, char* argv[]) {
         printf("SD contention model: ON (SPI readKBps=%d, MSC contender active)\n", s_simSd.readKBps);
     }
 
+    // ── Flaky-link fault injection (EMU_DROP_PUT_RESP=N) ─────────────────────
+    // The Nth S3 part PUT uploads its body but its response is dropped (lost ack),
+    // so the firmware retries the part. Exercises the multipart part-PUT retry.
+    if (const char* e = getenv("EMU_DROP_PUT_RESP"); e && atoi(e) > 0) {
+        s_net.dropPutResponseOnPart = atoi(e);
+        printf("Flaky-link: drop response of part PUT #%d (retry test)\n", s_net.dropPutResponseOnPart);
+    }
+
     s_nvs.set_str("s3", "device_id", deviceId);
 
     // Session counter (monotonic) + session log file (same as firmware)
