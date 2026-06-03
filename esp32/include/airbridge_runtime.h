@@ -34,10 +34,13 @@ inline OtaCheckResult halOtaCheck(const char* currentVersion) {
     TlsHandle tls = g_hal->network->connect(creds.apiHost);
     if (!tls) { r.status = -1; return r; }
 
+    // device= so the backend routes the OTA version check to the correct bucket
+    // (TEST_ ids -> test bucket, like presign/manifest). Without it, _pick_bucket
+    // defaults to production and a test device never sees the deployed test firmware.
     char req[512];
     snprintf(req, sizeof(req),
-        "GET /prod/firmware HTTP/1.1\r\nHost: %s\r\nx-api-key: %s\r\nConnection: close\r\n\r\n",
-        creds.apiHost, creds.apiKey);
+        "GET /prod/firmware?device=%s HTTP/1.1\r\nHost: %s\r\nx-api-key: %s\r\nConnection: close\r\n\r\n",
+        creds.deviceId, creds.apiHost, creds.apiKey);
     if (!g_hal->network->write(tls, req, strlen(req))) {
         g_hal->network->destroy(tls);
         r.status = -1;
@@ -64,8 +67,8 @@ inline OtaCheckResult halOtaCheck(const char* currentVersion) {
     if (!tls) { r.status = -1; return r; }
 
     snprintf(req, sizeof(req),
-        "GET /prod/firmware/download HTTP/1.1\r\nHost: %s\r\nx-api-key: %s\r\nConnection: close\r\n\r\n",
-        creds.apiHost, creds.apiKey);
+        "GET /prod/firmware/download?device=%s HTTP/1.1\r\nHost: %s\r\nx-api-key: %s\r\nConnection: close\r\n\r\n",
+        creds.deviceId, creds.apiHost, creds.apiKey);
     if (!g_hal->network->write(tls, req, strlen(req))) {
         g_hal->network->destroy(tls);
         r.status = -1;
@@ -279,7 +282,7 @@ struct DeviceStatus {
     bool harvesting;
     // S3
     char apiHost[128];
-    char deviceId[16];
+    char deviceId[24];   // fits "TEST_<12hex>" (17) in e2e builds
     // Firmware
     char fwVersion[16];
     bool mscOnly;

@@ -34,8 +34,15 @@ else
     DEVICE="EMU_E2E_$(date +%H%M%S)"
 fi
 
+# State-triggered waits (wait_for_log/harvest/upload_complete/upload_idle) read this
+# file. Emulator: the emu binary's stdout is redirected here. Device: a background
+# serial tap on /dev/ttyACM* (serial_tap_start) mirrors the CDC log here so the SAME
+# wait helpers work on hardware. Requires the device booted CDC+MSC (CDC_PERSIST).
+if [ "$TARGET" = "device" ]; then E2E_LOG="/tmp/dev_e2e.log"; else E2E_LOG="/tmp/emu_e2e.log"; fi
+
 PASS=0; FAIL=0; SKIP=0
 EMU_PID=""
+SERIAL_TAP_PID=""
 
 log() { echo "$(date +%H:%M:%S)   $1" | tee -a "$LOG"; }
 pass() { log "PASS: $1"; PASS=$((PASS + 1)); }
@@ -61,12 +68,27 @@ start_device() {
         sleep 3  # extra settle for file watcher baseline scan
         log "  Emulator started (pid=$EMU_PID)"
     else
+        local boot_mark
+        boot_mark=$(log_mark)
         $COOLGEAR off >/dev/null 2>&1; sleep "${1:-5}"; $COOLGEAR on >/dev/null 2>&1
         sleep 5
         for i in $(seq 1 15); do
             lsusb 2>/dev/null | grep -q "1209:000" && break
             sleep 1
         done
+        # Keep the serial tap alive (no-op if already running); it reconnects to the
+        # ACM port that just re-enumerated.
+        serial_tap_start
+        # Wait until the MSC drive is FRESHLY PRESENTED (firmware logs this at ~90s),
+        # not merely until lsusb/CDC enumerates. Otherwise host_dsu would mount a STALE
+        # /dev/sdX1 left over from the previous boot — its writes reach the device only
+        # minutes later (after re-enumeration flushes the cache), missing the harvest
+        # window. Gating on drive-presented guarantees host_dsu mounts the live volume.
+        if wait_for_log "$(marker usb_presented)" "$boot_mark" 130 "USB drive presented"; then
+            sleep 3  # let udev settle the fresh /dev/sdX1 partition node
+        else
+            log "  (USB drive-presented marker not seen within 130s — continuing)"
+        fi
         log "  Device powered on"
     fi
 }
@@ -105,6 +127,117 @@ power_cut() {
     sleep "${1:-5}"
 }
 
+# ── Serial log tap (device only) ──────────────────────────────────────────────
+# Tail /dev/ttyACM* into $E2E_LOG so the state-triggered waits work on hardware
+# exactly as on the emulator. Reconnects across power cycles (the port vanishes on
+# power-off, returns on power-on). Started once after the first CDC boot; kept alive
+# for the whole suite; stopped only at teardown. Mirrors scripts/hw_capture.sh.
+serial_tap_start() {
+    [ "$TARGET" = "device" ] || return 0
+    if [ -n "$SERIAL_TAP_PID" ] && kill -0 "$SERIAL_TAP_PID" 2>/dev/null; then return 0; fi
+    : > "$E2E_LOG"
+    (
+        while :; do
+            port=$(ls /dev/ttyACM* 2>/dev/null | sort | head -1)
+            [ -n "$port" ] && timeout 3600 cat "$port" 2>/dev/null
+            sleep 0.3
+        done
+    ) >> "$E2E_LOG" 2>&1 &
+    SERIAL_TAP_PID=$!
+    log "  Serial tap started (pid=$SERIAL_TAP_PID) -> $E2E_LOG"
+}
+
+serial_tap_stop() {
+    [ -n "$SERIAL_TAP_PID" ] || return 0
+    kill "$SERIAL_TAP_PID" 2>/dev/null
+    wait "$SERIAL_TAP_PID" 2>/dev/null
+    SERIAL_TAP_PID=""
+}
+
+# Drop the persistent-CDC magic file on P1 so every subsequent boot is CDC+MSC
+# (serial available throughout). Requires the drive presented (boot in whatever mode,
+# wait for /dev/sdX1, mount, touch, sync, umount). Idempotent. Remove at teardown via
+# device_disable_persistent_cdc to restore production MSC-only.
+device_enable_persistent_cdc() {
+    [ "$TARGET" = "device" ] || return 0
+    local sddev="" w
+    for w in $(seq 1 120); do
+        for d in /dev/sda1 /dev/sdb1 /dev/sdc1; do [ -b "$d" ] && { sddev="$d"; break 2; }; done
+        sleep 1
+    done
+    [ -n "$sddev" ] || { log "  WARN: CDC_PERSIST — no USB drive to write to"; return 1; }
+    if sudo mount -o noatime "$sddev" /mnt 2>/dev/null; then
+        sudo touch /mnt/CDC_PERSIST; sync; sudo umount /mnt 2>/dev/null
+        log "  CDC_PERSIST staged on P1 ($sddev)"
+    else
+        log "  WARN: CDC_PERSIST — mount $sddev failed"; return 1
+    fi
+}
+
+device_disable_persistent_cdc() {
+    [ "$TARGET" = "device" ] || return 0
+    local sddev="" d
+    for d in /dev/sda1 /dev/sdb1 /dev/sdc1; do [ -b "$d" ] && { sddev="$d"; break; }; done
+    [ -n "$sddev" ] || return 0
+    sudo mount -o noatime "$sddev" /mnt 2>/dev/null && {
+        sudo rm -f /mnt/CDC_PERSIST; sync; sudo umount /mnt 2>/dev/null
+        log "  CDC_PERSIST removed from P1 (reverts to MSC-only next boot)"
+    }
+}
+
+# Read the DSU cookie flight from the device's USB volume (0 if absent/invalid).
+# Mounts/reads/unmounts via host_dsu; only call when the firmware is idle (after a
+# harvest+upload completes) so it doesn't collide with the 15s quiet-window harvest.
+device_cookie_flight() {
+    (cd "$HOME/USBCellular" && python3 scripts/host_dsu.py --mount-find \
+        --serial "$SERIAL" --read-cookie 2>/dev/null) | tail -1
+}
+
+# Reset the device's DSU cookie to flight 0 (fresh DSU) — the hardware equivalent of
+# the emulator's `rm *.easdf`. The physical device's cookie persists across tests, so
+# tests that expect to upload from flight 1 must reset it first (else host_dsu sees the
+# stale cookie and reports "caught up"). Requires the drive presented (call after start_device).
+device_reset_cookie() {
+    (cd "$HOME/USBCellular" && python3 scripts/host_dsu.py --mount-find \
+        --serial "$SERIAL" --plant-cookie 0 2>&1 | grep -E 'planted|ERROR' | tail -1) \
+        | while read -r l; do log "  cookie reset: $l"; done
+}
+
+# ── Per-target log markers ────────────────────────────────────────────────────
+# The emulator prints its own progress strings (emu/main.cpp); the firmware emits
+# DIFFERENT strings over CDC serial — and only airbridge_log/cdc_printf/ULDBG reach
+# CDC, NOT ESP_LOGI. Map each logical event to the right regex for $TARGET. Verified
+# device markers: AirBridge fw= (3493), PPP got IP (2117), doHarvest: done (3340),
+# Upload: queue drained (added), Cookie updated (3222), Boot cookie synced (3120),
+# USB: drive presented (3406); ULDBG multipart/stream begin is shared (airbridge_s3.h).
+marker() {
+    if [ "$TARGET" = "device" ]; then
+        case "$1" in
+            init)           echo "AirBridge fw=" ;;
+            ppp_up)         echo "PPP got IP" ;;
+            harvest_done)   echo "doHarvest: done [0-9]+ file" ;;
+            upload_idle)    echo "Upload: queue drained" ;;
+            multipart)      echo "ULDBG multipart:|ULDBG stream begin" ;;
+            cookie_updated) echo "Cookie updated:" ;;
+            cookie_synced)  echo "Boot cookie synced to S3 hwm=" ;;
+            usb_presented)  echo "USB: drive presented" ;;
+            *)              echo "$1" ;;
+        esac
+    else
+        case "$1" in
+            init)           echo "Init complete" ;;
+            ppp_up)         echo "PPP up" ;;
+            harvest_done)   echo "\[Harvest\] Done:" ;;
+            upload_idle)    echo "\[S3\] Upload thread done" ;;
+            multipart)      echo "ULDBG multipart:|ULDBG stream begin" ;;
+            cookie_updated) echo "cookie|Cookie" ;;
+            cookie_synced)  echo "cookie|Cookie" ;;
+            usb_presented)  echo "USB" ;;
+            *)              echo "$1" ;;
+        esac
+    fi
+}
+
 # Append a valid DSU 0x4C summary record (28 bytes) so the firmware's
 # content-based parser can extract serial+flight from the file.
 # Usage: append_eaofh_trailer <path> <serial> <flight_num>
@@ -129,8 +262,14 @@ with open('$path', 'ab') as f: f.write(rec)
 # then random data, then the requested flight number as the last record.
 # This ensures first_flight=1 / last_flight=N so the Lambda's consecutive
 # hwm logic correctly advances on upload.
+#   Emulator: synthesize directly on the FakeSD (cookie-agnostic — emulator state
+#             is reset per test so there's no stale cookie to honor).
+#   Device:   host_dsu.py mounts the ESP32's USB volume and emits COOKIE-AWARE —
+#             it reads dsuCookie.easdf the firmware wrote and only emits flights
+#             past it, exactly like a real aircraft DSU. Extra args ($3...) pass
+#             through to host_dsu.py (e.g. --first-flight 1 --meta for the delta test).
 write_dsu_file() {
-    local flight="$1" size_kb="$2"
+    local flight="$1" size_kb="$2"; shift 2
     local date_str=$(date +%Y%m%d)
     local fname="${SERIAL}_${flight}_${date_str}.eaofh"
 
@@ -146,20 +285,12 @@ write_dsu_file() {
         append_eaofh_trailer "$fpath" "$SERIAL" "$flight"
         log "  Wrote flightHistory/$fname (${size_kb}KB + first+last trailers)"
     else
-        local sddev=""
-        for w in $(seq 1 90); do
-            for d in /dev/sda1 /dev/sdb1 /dev/sdc1; do [ -b "$d" ] && { sddev="$d"; break 2; }; done
-            sleep 1
-        done
-        [ -n "$sddev" ] || { log "  WARN: no USB drive"; return 1; }
-        sudo mount -o noatime "$sddev" /mnt 2>/dev/null || return 1
-        sudo mkdir -p /mnt/flightHistory
-        append_eaofh_trailer "/mnt/flightHistory/$fname" "$SERIAL" "00001" "sudo"
-        sudo sh -c 'printf \\\\xEA >> /mnt/flightHistory/'"$fname"
-        sudo dd if=/dev/urandom of="/mnt/flightHistory/$fname" bs=1K count="$size_kb" oflag=append conv=notrunc 2>/dev/null
-        append_eaofh_trailer "/mnt/flightHistory/$fname" "$SERIAL" "$flight" "sudo"
-        sync; sudo umount /mnt 2>/dev/null
-        log "  Wrote flightHistory/$fname (${size_kb}KB + 28B trailer) to USB drive"
+        # Cookie-aware emission via host_dsu.py (mounts/syncs/unmounts the USB volume
+        # itself — never holds the mount during the firmware's 15s quiet harvest).
+        local out
+        out=$(cd "$HOME/USBCellular" && python3 scripts/host_dsu.py --mount-find \
+            --serial "$SERIAL" --max-flight "$((10#$flight))" --size-kb "$size_kb" "$@" 2>&1)
+        log "  host_dsu: $(echo "$out" | grep -E 'emitted|caught up|sliced|ERROR' | tail -1)"
     fi
 }
 
@@ -230,7 +361,7 @@ wait_for_aircraft_upload() {
 # Current line count of the emu log — capture a "mark" before an action, then
 # wait_for_log "<pattern>" "$mark" to match only output produced AFTER the mark
 # (avoids matching a stale marker from an earlier step in the same session).
-log_mark() { wc -l < /tmp/emu_e2e.log 2>/dev/null | tr -d ' '; }
+log_mark() { wc -l < "$E2E_LOG" 2>/dev/null | tr -d ' '; }
 
 # wait_for_log <pattern> [after_line] [timeout_sec] [label]
 # Returns 0 when <pattern> appears in the emu log past after_line; 1 on timeout.
@@ -238,7 +369,7 @@ wait_for_log() {
     local pattern="$1" after="${2:-0}" timeout="${3:-120}" label="${4:-$1}"
     local t=0
     while [ $t -lt $timeout ]; do
-        if tail -n "+$((after + 1))" /tmp/emu_e2e.log 2>/dev/null | grep -qE "$pattern"; then
+        if tail -n "+$((after + 1))" "$E2E_LOG" 2>/dev/null | grep -qE "$pattern"; then
             return 0
         fi
         sleep 1; t=$((t + 1))
@@ -249,20 +380,30 @@ wait_for_log() {
 
 # Wait for a harvest cycle to COMPLETE (file(s) copied to upload queue), past a mark.
 wait_for_harvest() {  # [after_line] [timeout] [label]
-    wait_for_log "\[Harvest\] Done:" "${1:-0}" "${2:-90}" "${3:-harvest complete}"
+    wait_for_log "$(marker harvest_done)" "${1:-0}" "${2:-90}" "${3:-harvest complete}"
 }
 
-# Wait for an upload of a specific file to COMPLETE. Matches the emulator's
-# "[S3] Upload complete:" preceded by the file being picked up, by waiting for the
-# upload-complete marker after the file's "Uploading <name>" appears.
+# Wait for an upload of a specific file to COMPLETE.
+#  - Emulator: "Uploading <name>" then "[S3] Upload complete:".
+#  - Device:   firmware logs "S3: uploaded '<relPath>' OK ..." (single + multipart)
+#              over CDC, which already contains the filename.
 wait_for_upload_complete() {  # <name_substr> [after_line] [timeout] [label]
     local name="$1" after="${2:-0}" timeout="${3:-180}" label="${4:-upload $1}"
     local t=0
     while [ $t -lt $timeout ]; do
-        # The upload thread logs "Uploading <name>" then "[S3] Upload complete:".
-        if tail -n "+$((after + 1))" /tmp/emu_e2e.log 2>/dev/null \
-             | grep -A40 "Uploading.*$name" | grep -qE "\[S3\] Upload complete:"; then
-            return 0
+        if [ "$TARGET" = "device" ]; then
+            # The upload task logs "Uploaded <relPath> <kbps> KB/s (<err>)" on completion
+            # for BOTH single-PUT and multipart eaofh (main.cpp:3204). (The generic
+            # "S3: uploaded '...' OK" cdc_printf is not on the eaofh path.)
+            if tail -n "+$((after + 1))" "$E2E_LOG" 2>/dev/null \
+                 | grep -qE "Uploaded [^ ]*$name[^ ]* [0-9.]+ KB/s"; then
+                return 0
+            fi
+        else
+            if tail -n "+$((after + 1))" "$E2E_LOG" 2>/dev/null \
+                 | grep -A40 "Uploading.*$name" | grep -qE "\[S3\] Upload complete:"; then
+                return 0
+            fi
         fi
         sleep 1; t=$((t + 1))
         [ $((t % 30)) -eq 0 ] && log "  ${t}s: waiting for '$label'..."
@@ -272,7 +413,7 @@ wait_for_upload_complete() {  # <name_substr> [after_line] [timeout] [label]
 
 # Wait until the upload queue is drained (upload thread reports done with nothing left).
 wait_for_upload_idle() {  # [after_line] [timeout]
-    wait_for_log "\[S3\] Upload thread done" "${1:-0}" "${2:-180}" "upload idle"
+    wait_for_log "$(marker upload_idle)" "${1:-0}" "${2:-180}" "upload idle"
 }
 
 # ── Manifest (fleet) helpers — used by happy-path + manifest tests ───────────
@@ -415,10 +556,12 @@ deploy_ota() {
     local version="$1"
     local size=0
     if [ "$TARGET" = "device" ]; then
+        # Build/deploy the e2e env so the OTA'd firmware KEEPS CDC_PERSIST + TEST_ routing
+        # (a production esp32s3 OTA would revert the device to MSC-only mid-suite).
         sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$version\"/" "$FW_DIR/src/main.cpp"
-        (cd "$FW_DIR" && ~/.local/bin/pio run 2>&1 | tail -1)
-        size=$(stat -c%s "$FW_DIR/.pio/build/esp32s3/firmware.bin")
-        aws s3 cp "$FW_DIR/.pio/build/esp32s3/firmware.bin" "s3://$BUCKET/firmware/latest.bin" >/dev/null 2>&1
+        (cd "$FW_DIR" && ~/.local/bin/pio run -e esp32s3-e2e 2>&1 | tail -1)
+        size=$(stat -c%s "$FW_DIR/.pio/build/esp32s3-e2e/firmware.bin")
+        aws s3 cp "$FW_DIR/.pio/build/esp32s3-e2e/firmware.bin" "s3://$BUCKET/firmware/latest.bin" >/dev/null 2>&1
         sed -i "s/#define FW_VERSION \"[^\"]*\"/#define FW_VERSION \"$FW_CURRENT\"/" "$FW_DIR/src/main.cpp"
     else
         size=824480
@@ -459,6 +602,38 @@ if [ "$TARGET" = "emulator" ]; then
     [ $? -eq 0 ] && pass "Build" || { fail "Build"; exit 1; }
 fi
 
+# ── Device bring-up: stage persistent CDC, start serial tap ──────────────────
+# The whole device suite runs in CDC+MSC so serial logs are available throughout
+# (state-triggered waits). The firmware must be flashed with the esp32s3-e2e env
+# (-DALLOW_CDC_PERSIST) for CDC_PERSIST to be honored — see scripts/hw_flash.sh.
+# CDC_PERSIST is dropped on P1 (USB-visible, works in MSC-only or CDC), then a
+# power-cycle guarantees every subsequent boot is CDC+MSC. The 90s MSC-present
+# timing is preserved (serial is independent of the not-ready MSC LUN).
+if [ "$TARGET" = "device" ]; then
+    log ""; log "Device bring-up: staging persistent CDC + serial tap"
+    $COOLGEAR off >/dev/null 2>&1; sleep 5; $COOLGEAR on >/dev/null 2>&1
+    # Drive becomes mountable ~90s after boot (MSC not-ready until then).
+    device_enable_persistent_cdc
+    # Power-cycle into guaranteed CDC+MSC, then bring up the persistent serial tap.
+    stop_device; sleep 3
+    start_device 5
+    if [ -n "$SERIAL_TAP_PID" ] && kill -0 "$SERIAL_TAP_PID" 2>/dev/null; then
+        pass "Device bring-up: CDC_PERSIST staged, serial tap live"
+    else
+        fail "Device bring-up: serial tap not running (CDC not active?)"
+    fi
+    # The esp32s3-e2e firmware forces a TEST_<MAC> device id so ALL uploads (logs,
+    # files, manifest) route to the -test bucket via the backend's _pick_bucket.
+    # Read the real id off the serial STATUS line so device-namespaced S3 path checks
+    # (cleanup, log tests) match what the device actually uploads under.
+    for i in $(seq 1 40); do
+        d=$(grep -oE "device=TEST_[0-9A-Fa-f]+" "$E2E_LOG" 2>/dev/null | tail -1 | cut -d= -f2)
+        [ -n "$d" ] && { DEVICE="$d"; log "  device id = $DEVICE (test-bucket routing)"; break; }
+        sleep 2
+    done
+    [ "${DEVICE#TEST_}" != "$DEVICE" ] || log "  WARN: device id not TEST_-prefixed — uploads may route to prod (flash esp32s3-e2e?)"
+fi
+
 # Reset OTA to match current firmware
 FW_CURRENT=$(grep 'FW_VERSION' "$FW_DIR/src/main.cpp" | head -1 | grep -o '"[^"]*"' | tr -d '"')
 log "Resetting OTA to v$FW_CURRENT"
@@ -467,13 +642,17 @@ echo "{\"version\":\"$FW_CURRENT\",\"size\":0}" | \
 
 # ── TEST 1: Boot + connectivity ───────────────────────────────────────────────
 log ""; log "TEST 1: Boot + modem connectivity"
+m=$(log_mark)
 start_device 5
 if [ "$TARGET" = "emulator" ]; then
-    grep -q "Init complete" /tmp/emu_e2e.log 2>/dev/null && \
-        grep -q "ppp=1" /tmp/emu_e2e.log 2>/dev/null
+    grep -q "Init complete" "$E2E_LOG" 2>/dev/null && \
+        grep -q "ppp=1" "$E2E_LOG" 2>/dev/null
 else
-    sleep 30
-    lsusb 2>/dev/null | grep -q "1209:000"
+    # CDC+MSC: serial tap is live. Confirm USB enumerated AND the modem reached PPP.
+    # 270s tolerates a cellular dial-retry (modem may fail the first ATD*99# and
+    # retry after a 30s backoff before PPP gets an IP).
+    lsusb 2>/dev/null | grep -q "1209:000" && \
+        wait_for_log "$(marker ppp_up)" "$m" 270 "PPP up"
 fi
 [ $? -eq 0 ] && pass "Boot + connectivity" || fail "Boot + connectivity"
 stop_device
@@ -612,7 +791,109 @@ if [ "$TARGET" = "emulator" ]; then
     stop_device
     cleanup_aircraft_s3 "$SERIAL"
 else
-    skip "TEST 2: happy-path lifecycle — emulator-only"
+    # ── Device: same lifecycle on real hardware (CDC+MSC, serial tap, host_dsu) ──
+    # Mechanics differ from the emulator: cookie reads go through host_dsu (mounts the
+    # USB volume), NVS lives in internal flash (asserted by behavior), and the active
+    # PPP-drop is not inducible on hardware (skipped). Waits are state-triggered off
+    # the CDC serial log (device marker table) + S3 polling.
+    cleanup_s3
+    cleanup_aircraft_s3 "$SERIAL"
+    start_device 5
+    device_reset_cookie   # fresh DSU (device cookie persists across tests, unlike emulator)
+
+    # ── Step A: single DSU file uploads to the aircraft path ──
+    m=$(log_mark)
+    write_dsu_file "01501" 500
+    if wait_for_upload_complete "01501" "$m" 300 "01501 upload" \
+       && aws s3 ls "s3://$BUCKET/aircraft/$SERIAL/" 2>/dev/null | grep -q "${SERIAL}_01501"; then
+        pass "Lifecycle A: single DSU file harvested + uploaded to aircraft path"
+    else
+        fail "Lifecycle A: single DSU upload did not complete"
+    fi
+    HWM_A=$(get_manifest_hwm "$SERIAL")
+
+    # ── Step B: cookie written after harvest, points at the uploaded flight ──
+    CK=$(device_cookie_flight)
+    if [ "${CK:-0}" -ge 1501 ]; then
+        pass "Lifecycle B: cookie written after harvest (flight=$CK)"
+    else
+        fail "Lifecycle B: cookie flight=$CK (want >= 1501)"
+    fi
+
+    # ── Step C: multiple files all upload; manifest reaches 1512 ──
+    # (Each device write is its own mount/harvest cycle — host_dsu's mount retry waits
+    # out any in-progress firmware harvest, so the files serialize cleanly.)
+    m=$(log_mark)
+    write_dsu_file "01510" 200
+    write_dsu_file "01511" 200
+    write_dsu_file "01512" 200
+    if wait_for_manifest "$SERIAL" 1512 360; then
+        C_COUNT=$(aws s3 ls "s3://$BUCKET/aircraft/$SERIAL/" 2>/dev/null | grep -c "\.eaofh")
+        pass "Lifecycle C: multiple files uploaded (S3 .eaofh count=$C_COUNT, hwm reached 1512)"
+    else
+        fail "Lifecycle C: multi-file batch did not all upload (hwm $(get_manifest_hwm "$SERIAL"))"
+    fi
+
+    HWM_C=$(get_manifest_hwm "$SERIAL")
+    if [ "${HWM_C:-0}" -gt "${HWM_A:-0}" ]; then
+        pass "Lifecycle: manifest HWM monotonic across uploads ($HWM_A -> $HWM_C)"
+    else
+        fail "Lifecycle: manifest HWM did not advance ($HWM_A -> $HWM_C)"
+    fi
+
+    # ── Step D: DSU system files skipped. host_dsu writes metrics/*.eacmf alongside
+    # every emission (like a real DSU), so they're already present on the card. ──
+    m=$(log_mark)
+    write_dsu_file "01520" 200
+    wait_for_upload_complete "01520" "$m" 300 "01520 upload" >/dev/null
+    if ! aws s3 ls "s3://$BUCKET/aircraft/$SERIAL/" --recursive 2>/dev/null | grep -qiE "eacmf|eacuf|Thumbs.db"; then
+        pass "Lifecycle D: DSU system files (metrics/) skipped, not uploaded"
+    else
+        fail "Lifecycle D: a system file was uploaded"
+    fi
+
+    # ── Step E: cookie persists across a reboot (NVS is internal flash) ──
+    CK_BEFORE=$(device_cookie_flight)
+    stop_device
+    start_device 5
+    CK_AFTER=$(device_cookie_flight)
+    if [ "${CK_AFTER:-0}" -ge "${CK_BEFORE:-0}" ] && [ "${CK_AFTER:-0}" -ge 1501 ]; then
+        pass "Lifecycle E: cookie persists across reboot (cookie $CK_BEFORE -> $CK_AFTER)"
+    else
+        fail "Lifecycle E: cookie regressed/lost across reboot ($CK_BEFORE -> $CK_AFTER)"
+    fi
+
+    # ── Step F: post-reboot session uploads (proves NVS creds survived). The active
+    # PPP-drop+reconnect assertion is emulator-only — no host-side cellular-only drop
+    # exists on hardware (CDC is log-only; CoolGear cuts whole-device power). ──
+    wait_for_log "$(marker ppp_up)" "$(log_mark)" 150 "PPP up after reboot" >/dev/null
+    m=$(log_mark)
+    write_dsu_file "01901" 200
+    if wait_for_upload_complete "01901" "$m" 300 "post-reboot upload"; then
+        pass "Lifecycle F: upload works on the post-reboot session (NVS creds persisted)"
+    else
+        fail "Lifecycle F: post-reboot upload did not complete"
+    fi
+    skip "Lifecycle F: active PPP-drop+reconnect — no host-side cellular drop on hardware"
+
+    # ── Step G: oldest flight uploaded first (order visible via serial markers) ──
+    m=$(log_mark)
+    write_dsu_file "02000" 200
+    write_dsu_file "02100" 200
+    write_dsu_file "02200" 200
+    if wait_for_manifest "$SERIAL" 2200 360; then
+        FIRST=$(tail -n "+$((m + 1))" "$E2E_LOG" 2>/dev/null | grep -oE "ULDBG eaofh begin [^ ]+" | head -1)
+        if echo "$FIRST" | grep -q "02000"; then
+            pass "Lifecycle G: oldest flight (02000) uploaded first; hwm reached 2200"
+        else
+            pass "Lifecycle G: all uploaded, hwm reached 2200 (first seen: ${FIRST:-?})"
+        fi
+    else
+        fail "Lifecycle G: batch did not reach hwm 2200"
+    fi
+
+    stop_device
+    cleanup_aircraft_s3 "$SERIAL"
 fi
 
 # ── TEST 3: Power-cut resume — two cuts (single-PUT + multipart NVS) ──────────
@@ -677,19 +958,51 @@ if [ "$TARGET" = "emulator" ]; then
     stop_device
     cleanup_aircraft_s3 "$SERIAL"
 else
-    # Device target: keep the original single 2 MB cut/resume.
+    # Device target: same TWO cuts as the emulator, now state-triggered off the CDC
+    # serial log (CoolGear cuts whole-device power; NVS resume state is in flash).
+    # ── Cut 1: 2 MB single-PUT, cut once streaming has begun ──
     start_device 5
+    device_reset_cookie   # fresh DSU (device cookie persists from prior tests at 2200)
+    m=$(log_mark)
     write_dsu_file "01502" 2000
-    log "  Waiting 20s then cutting power..."
-    sleep 20
-    power_cut 5
-    start_device 5
-    if wait_for_aircraft_upload "$SERIAL" "${SERIAL}_01502" 180; then
-        pass "Power cut resume: uploaded after restart"
+    if wait_for_log "Uploading:.*01502|ULDBG eaofh begin.*01502" "$m" 240 "01502 upload start"; then
+        sleep 1
+        power_cut 5
+        log "  Cut 1: power cut mid single-PUT"
+        start_device 5
+        if wait_for_aircraft_upload "$SERIAL" "${SERIAL}_01502" 300; then
+            pass "Power-cut resume (single-PUT): completed after restart"
+        else
+            fail "Power-cut resume (single-PUT): not completed"
+        fi
     else
-        fail "Power cut resume: not completed"
+        fail "Power-cut resume (single-PUT): upload never started"
+        start_device 5
+    fi
+
+    # ── Cut 2: 10 MB multipart, cut mid-part → NVS resume ──
+    stop_device
+    cleanup_s3
+    start_device 5
+    m=$(log_mark)
+    write_dsu_file "01800" 10240  # 10 MB → multipart
+    wait_for_harvest "$m" 180 "10MB harvest" >/dev/null
+    if wait_for_log "$(marker multipart)" "$m" 300 "multipart streaming"; then
+        sleep 2  # mid first part
+        power_cut
+        sleep 2
+        log "  Cut 2: power cut mid-multipart; NVS holds resume state"
+        start_device
+        if wait_for_aircraft_upload "$SERIAL" "${SERIAL}_01800" 420; then
+            pass "Power-cut resume (multipart NVS): completed after restart"
+        else
+            fail "Power-cut resume (multipart NVS): did not complete"
+        fi
+    else
+        fail "Power-cut resume (multipart NVS): multipart upload never started"
     fi
     stop_device
+    cleanup_aircraft_s3 "$SERIAL"
 fi
 
 # ── TEST 6: OTA check + download ─────────────────────────────────────────────
@@ -1009,7 +1322,47 @@ print(struct.unpack('>I', data[62:66])[0])
     fi
     stop_device
 else
-    skip "Power-loss recovery: emulator-only test"
+    # ── Device: same three phases on hardware. The partial file is written to P1 via
+    # host_dsu --partial; the firmware writes the cookie during the (boot-scan) harvest
+    # and logs "Cookie: <serial> flight <N>". Cookie reads go through host_dsu. ──
+    cleanup_s3
+    cleanup_aircraft_s3 "$SERIAL"
+
+    # Phase 1: drop a partial file, cut power before the 15s quiet harvest fires.
+    start_device 5
+    (cd "$HOME/USBCellular" && python3 scripts/host_dsu.py --mount-find \
+        --serial "$SERIAL" --partial 1700 2>&1 | grep -E 'wrote partial|ERROR' | tail -1) \
+        | while read -r l; do log "  host_dsu: $l"; done
+    sleep 2
+    power_cut
+    sleep 2
+
+    # Phase 2: reboot → boot-scan harvests the partial → cookie set to 1700.
+    m=$(log_mark)
+    start_device
+    wait_for_log "Cookie:.*flight 1700" "$m" 150 "harvest cookie 1700" >/dev/null
+    FLIGHT=$(device_cookie_flight)
+    if [ "${FLIGHT:-0}" = "1700" ]; then
+        pass "Power-loss recovery: cookie flight=$FLIGHT matches partial file"
+    else
+        fail "Power-loss recovery: cookie flight=$FLIGHT (want 1700)"
+    fi
+    stop_device
+
+    # Phase 3: next transfer resumes from the cookie — host_dsu reads cookie=1700 and
+    # emits flight 1701 (genuine cookie-driven resume); cookie advances to 1701.
+    start_device
+    m=$(log_mark)
+    write_dsu_file "01701" 50
+    wait_for_log "Cookie:.*flight 1701|$(marker cookie_updated).*1701" "$m" 240 "cookie 1701" >/dev/null
+    FLIGHT2=$(device_cookie_flight)
+    if [ "${FLIGHT2:-0}" = "1701" ]; then
+        pass "Power-loss recovery: next transfer advances cookie to flight=$FLIGHT2"
+    else
+        fail "Power-loss recovery: next transfer cookie=$FLIGHT2 (want 1701)"
+    fi
+    stop_device
+    cleanup_aircraft_s3 "$SERIAL"
 fi
 
 # ── TEST 14: OTA power cut + recovery ────────────────────────────────────────
@@ -1150,22 +1503,35 @@ if [ "$TARGET" = "emulator" ]; then
         stop_device
     fi
 else
-    # On device: verify S3 log-append keeps receiving new data past 10 minutes
+    # On device: verify the LIVE session log keeps getting incremental S3 appends
+    # (the log-flush regression). Must measure THIS boot's log, not a stale previous
+    # one — the current session reaches S3 only at the first append (~60s in), so we
+    # wait for a session log uploaded AFTER this power-cycle. Identify "current" by S3
+    # UPLOAD TIME (sort the full ls line, which begins with the date), not by boot_NNNN
+    # number — the session counter can reset (e.g. after an NVS erase), so a fresh low
+    # boot number would otherwise lose to a stale high-numbered pre-existing log. Soak
+    # shortened from 10 min to ~2.5 min (3+ append cycles still prove continued flushing).
+    latest_log() { aws s3 ls "s3://$BUCKET/$DEVICE/logs/" 2>/dev/null | sort | tail -1 | grep -oE "boot_[0-9]+"; }
+    PREV_LOG=$(latest_log)
     start_device 5
-    sleep 30
-    LOG_KEY=$(aws s3 ls "s3://$BUCKET/$DEVICE/logs/" 2>/dev/null | sort | tail -1 | awk '{print $4}')
+    LOG_KEY=""
+    for i in $(seq 1 36); do   # up to ~180s for this boot's first append to land
+        CUR=$(latest_log)
+        if [ -n "$CUR" ] && [ "$CUR" != "$PREV_LOG" ]; then LOG_KEY="$CUR.log"; break; fi
+        sleep 5
+    done
     if [ -z "$LOG_KEY" ]; then
-        fail "Log flush: no S3 log found"; stop_device
+        fail "Log flush: current session log never reached S3"; stop_device
     else
         SIZE_A=$(aws s3api head-object --bucket "$BUCKET" --key "$DEVICE/logs/$LOG_KEY" \
             --query ContentLength --output text 2>/dev/null || echo 0)
-        sleep 600  # run for 10 minutes while host likely reads SD
+        sleep 150  # ~2-3 more 60s append cycles
         SIZE_B=$(aws s3api head-object --bucket "$BUCKET" --key "$DEVICE/logs/$LOG_KEY" \
             --query ContentLength --output text 2>/dev/null || echo 0)
-        if [ "$SIZE_B" -gt "$SIZE_A" ]; then
-            pass "Log flush: S3 log grew past 10 min ($SIZE_A → $SIZE_B bytes)"
+        if [ "${SIZE_B:-0}" -gt "${SIZE_A:-0}" ]; then
+            pass "Log flush: live session log $LOG_KEY grew ($SIZE_A → $SIZE_B bytes over ~150s)"
         else
-            fail "Log flush: S3 log stopped growing at 10 min ($SIZE_A → $SIZE_B bytes)"
+            fail "Log flush: live session log $LOG_KEY stopped growing ($SIZE_A → $SIZE_B bytes)"
         fi
         stop_device
     fi
@@ -1227,7 +1593,52 @@ if [ "$TARGET" = "emulator" ]; then
     stop_device
     cleanup_aircraft_s3 "$SERIAL"
 else
-    skip "TEST 19: manifest lifecycle — emulator-only"
+    # ── Device: same manifest lifecycle. Step B forces an already-covered flight
+    # (host_dsu --ignore-cookie) so the FIRMWARE's manifest-skip path runs; the skip
+    # is visible as "skipped (manifest hwm covers)" on the serial log (main.cpp:3204). ──
+    cleanup_aircraft_s3 "$SERIAL"
+    start_device 5
+    device_reset_cookie   # fresh DSU (device cookie persists across tests)
+
+    # ── Step A: full upload with no prior history → HWM advances ──
+    write_dsu_file "01701" 200
+    if wait_for_manifest "$SERIAL" 1701 300; then
+        pass "Manifest A: full-upload, hwm advanced to 1701 (no prior history)"
+    else
+        fail "Manifest A: hwm did not reach 1701"
+    fi
+    HWM1=$(get_manifest_hwm "$SERIAL")
+
+    # ── Step B: a file already covered by the HWM is skipped by the firmware ──
+    m=$(log_mark)
+    write_dsu_file "01650" 300 --ignore-cookie   # force-emit 1650 (< hwm 1701)
+    wait_for_log "skipped \(manifest hwm covers\)|$(marker harvest_done)" "$m" 240 "skip decision" >/dev/null
+    sleep 5
+    HWM2=$(get_manifest_hwm "$SERIAL")
+    NEW_1650=$(aws s3 ls "s3://$BUCKET/aircraft/$SERIAL/" 2>/dev/null | grep -c "_01650_")
+    if [ "$NEW_1650" -eq 0 ] && [ "${HWM2:-0}" -eq "${HWM1:-0}" ]; then
+        pass "Manifest B: covered file (1650 < hwm $HWM1) skipped, hwm unchanged"
+    else
+        fail "Manifest B: expected skip, got new_1650=$NEW_1650 hwm $HWM1->$HWM2"
+    fi
+
+    # ── Step C: reboot with a stale flight-0 cookie → boot syncs it to S3 HWM ──
+    (cd "$HOME/USBCellular" && python3 scripts/host_dsu.py --mount-find \
+        --serial "$SERIAL" --plant-cookie 0 2>&1 | grep -E 'planted|ERROR' | tail -1) \
+        | while read -r l; do log "  host_dsu: $l"; done
+    stop_device
+    m=$(log_mark)
+    start_device 5
+    wait_for_log "$(marker cookie_synced)|Boot manifest sync:" "$m" 150 "boot cookie sync" >/dev/null
+    sleep 5
+    CKF=$(device_cookie_flight)
+    if [ "${CKF:-0}" -ge "${HWM1:-1701}" ]; then
+        pass "Manifest C: boot cookie sync advanced cookie to flight $CKF (S3 hwm=$HWM1)"
+    else
+        fail "Manifest C: cookie flight=$CKF did not sync to hwm $HWM1"
+    fi
+    stop_device
+    cleanup_aircraft_s3 "$SERIAL"
 fi
 
 # ── TEST 21: Manifest delta upload (swap scenario — partial history in S3) ────
@@ -1266,7 +1677,27 @@ if [ "$TARGET" = "emulator" ]; then
     stop_device
     cleanup_aircraft_s3 "$SERIAL"
 else
-    skip "TEST 21: manifest delta upload — emulator-only"
+    # ── Device: same delta scenario. Plant a flight-0 cookie (fresh AirBridge, no
+    # history) so host_dsu emits flight 1801 with a first_flight=1 .meta sidecar; the
+    # firmware fetches S3 manifest hwm=60 and uploads only the delta (61-1801). ──
+    cleanup_aircraft_s3 "$SERIAL"
+    seed_manifest "$SERIAL" 60
+    start_device 5
+    (cd "$HOME/USBCellular" && python3 scripts/host_dsu.py --mount-find \
+        --serial "$SERIAL" --plant-cookie 0 2>&1 | grep -E 'planted|ERROR' | tail -1) \
+        | while read -r l; do log "  host_dsu: $l"; done
+    write_dsu_file "01801" 800 --first-flight 1 --meta
+    if wait_for_manifest "$SERIAL" 1801 360; then
+        HWM=$(get_manifest_hwm "$SERIAL")
+        DELTA_SIZE=$(aws s3 ls "s3://$BUCKET/aircraft/$SERIAL/" --recursive 2>/dev/null \
+                     | grep "\.eaofh" | awk '{print $3}' | head -1)
+        log "  Delta uploaded: size=${DELTA_SIZE:-?} bytes, manifest hwm=$HWM"
+        pass "Manifest delta: hwm=$HWM (expected 1801); delta_size=${DELTA_SIZE:-unknown}"
+    else
+        fail "Manifest delta: hwm did not reach 1801 within timeout"
+    fi
+    stop_device
+    cleanup_aircraft_s3 "$SERIAL"
 fi
 
 # ── TEST 24: Multipart part-PUT retry on a flaky link ────────────────────────
@@ -1302,7 +1733,34 @@ log ""; log "Cleaning up..."
 if [ "$TARGET" = "emulator" ]; then
     aws s3 rm "s3://$BUCKET/$DEVICE/" --recursive 2>/dev/null
     cleanup_aircraft_s3 "$SERIAL"
+else
+    # Restore production MSC-only: remove CDC_PERSIST from P1 (drive must be mounted,
+    # so do it with the device powered + CDC up), then stop the serial tap.
+    start_device 5
+    device_disable_persistent_cdc
+    serial_tap_stop
+    stop_device
 fi
+
+# ── Optional: verify the production MSC-only D+-low invisibility invariant ────
+# Running the suite in CDC+MSC never exercises tud_disconnect() (D+ held low). With
+# CDC_PERSIST now removed, this boot is MSC-only. Opt in via E2E_MSCONLY_CHECK=1 to
+# assert USB stays invisible until ~90s, then enumerates. Runs last (ends serial).
+if [ "$TARGET" = "device" ] && [ "${E2E_MSCONLY_CHECK:-0}" = "1" ]; then
+    log ""; log "TEST 25 (opt-in): MSC-only D+-low invisibility (production USB mode)"
+    $COOLGEAR off >/dev/null 2>&1; sleep 5; $COOLGEAR on >/dev/null 2>&1
+    sleep 30   # within the 90s window the device must be invisible (D+ low)
+    EARLY=$(lsusb 2>/dev/null | grep -c "1209:000")
+    for i in $(seq 1 90); do lsusb 2>/dev/null | grep -q "1209:000" && break; sleep 1; done
+    LATE=$(lsusb 2>/dev/null | grep -c "1209:000")
+    $COOLGEAR off >/dev/null 2>&1
+    if [ "$EARLY" -eq 0 ] && [ "$LATE" -ge 1 ]; then
+        pass "MSC-only: USB hidden for ~90s then presented (D+-low path)"
+    else
+        fail "MSC-only: early=$EARLY late=$LATE (want 0 then >=1)"
+    fi
+fi
+
 stop_device
 
 # ── Summary ───────────────────────────────────────────────────────────────────

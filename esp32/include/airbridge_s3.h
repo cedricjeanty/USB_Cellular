@@ -236,7 +236,7 @@ inline void markFileUploaded(const char* harvestDir, const char* relPath) {
 struct S3Creds {
     char apiHost[128];
     char apiKey[64];
-    char deviceId[16];
+    char deviceId[24];   // 12-hex MAC id, or "TEST_<12hex>" (17) in e2e builds
     bool valid;
 };
 

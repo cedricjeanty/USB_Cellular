@@ -548,6 +548,12 @@ static int               g_modemRssi    = 99;
 // CLI removed — CDC serial is now a log-only output stream.
 // Configuration via SD magic files: WIFI_CONFIG, S3_CONFIG, ENABLE_CDC, firmware.bin
 
+// Persistent CDC+MSC magic file (E2E/dev only). Unlike one-shot ENABLE_CDC, this
+// file is NOT deleted after processing and is re-checked every boot — its presence
+// keeps CDC+MSC on; remove it to revert to production MSC-only. Honored only when
+// built with -DALLOW_CDC_PERSIST so a production OTA build silently ignores it.
+#define CDC_PERSIST_MAGIC "CDC_PERSIST"
+
 // ── Unified logging (early, before any callbacks that use log_write/cdc_printf)
 static void _cdc_serial_sink(const char* buf, int len) {
     if (g_msc_only) return;
@@ -1029,6 +1035,17 @@ static void check_p1_magic() {
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
+#ifdef ALLOW_CDC_PERSIST
+    // CDC_PERSIST on P1 — persistent CDC+MSC, NOT removed (re-read every boot).
+    snprintf(path, sizeof(path), "%s/%s", DSU_MOUNT, CDC_PERSIST_MAGIC);
+    if (access(path, F_OK) == 0) {
+        g_msc_only = false;
+        airbridge_log("P1: CDC_PERSIST — CDC+MSC (persistent until removed)");
+        disp("USB Mode", "CDC (persist)");
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+#endif
+
     // REBOOT on P1 — clean restart
     snprintf(path, sizeof(path), "%s/REBOOT", DSU_MOUNT);
     if (access(path, F_OK) == 0) {
@@ -1151,7 +1168,7 @@ static void doUpdateDisplay() {
 
 static char g_apiHost[128] = "";
 static char g_apiKey[64]   = "";
-static char g_deviceId[16] = "";
+static char g_deviceId[24] = "";  // 12-hex MAC id, or "TEST_<12hex>" (17) in e2e builds
 
 static bool s3LoadCreds() {
     if (g_apiHost[0] && g_apiKey[0] && g_deviceId[0]) return true;
@@ -3068,11 +3085,18 @@ static void uploadTask(void* param) {
         // dual-partition P1 is not mounted at this point — fall back to NVS cache).
         char bootSerial[44] = "";
         uint32_t bootLocalFlight = 0;
-        if (!g_dual_partition) {
-            char cookiePath[64];
-            snprintf(cookiePath, sizeof(cookiePath), "%s/dsuCookie.easdf", SD_MOUNT);
+        {
+            // Read the DSU cookie from the partition the DSU actually uses: P1 (/dsu)
+            // in dual-partition mode (temp-mounted here), else P2 (/sdcard). This block
+            // used to be single-partition-only, so dual-partition devices never read the
+            // local cookie and the boot sync relied solely on the NVS cache (TEST 19-C).
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-            FILE* cf = fopen(cookiePath, "rb");
+            bool dsuTmp = false;
+            const char* ckDir = SD_MOUNT;
+            if (g_dual_partition) { dsuTmp = mount_dsu(); ckDir = DSU_MOUNT; }
+            char cookiePath[64];
+            snprintf(cookiePath, sizeof(cookiePath), "%s/dsuCookie.easdf", ckDir);
+            FILE* cf = (!g_dual_partition || dsuTmp) ? fopen(cookiePath, "rb") : nullptr;
             if (cf) {
                 uint8_t ck[78];
                 if (fread(ck, 1, 78, cf) == 78 && ck[0] == 0xEA && ck[1] == 0x1E) {
@@ -3091,6 +3115,7 @@ static void uploadTask(void* param) {
                 }
                 fclose(cf);
             }
+            if (dsuTmp) unmount_dsu();
             xSemaphoreGive(g_sd_mutex);
         }
         // Fall back to NVS cache for serial when SD cookie unavailable
@@ -3133,6 +3158,7 @@ static void uploadTask(void* param) {
     for (;;) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));  // wake on notify or every 15s
 
+        int uploadedThisPass = 0;  // for the "queue drained" marker (E2E wait anchor)
         for (;;) {
             if (g_harvesting) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
 
@@ -3146,7 +3172,14 @@ static void uploadTask(void* param) {
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
             bool found = findNextUploadFile(harvBase, relPath, sizeof(relPath));
             xSemaphoreGive(g_sd_mutex);
-            if (!found) break;  // nothing to upload
+            if (!found) {
+                // Queue drained. Log once per pass that did work so E2E waits have
+                // an exact "upload idle" anchor on the CDC serial stream.
+                if (uploadedThisPass > 0) {
+                    log_write("Upload: queue drained (%d file(s) this pass)", uploadedThisPass);
+                }
+                break;  // nothing to upload
+            }
 
             char path[192];
             snprintf(path, sizeof(path), "%s/%s", harvBase, relPath);
@@ -3231,11 +3264,19 @@ static void uploadTask(void* param) {
             ESP_LOGI(TAG, "Uploaded & deleted: %s", relPath);
             if (g_filesQueued > 0) g_filesQueued--;
             g_filesUploaded++;
+            uploadedThisPass++;
             g_mbUploaded += fileMb;
             if (g_mbQueued >= fileMb) g_mbQueued -= fileMb; else g_mbQueued = 0.0f;
         }
-        if (g_filesQueued > 0) {
-            log_write("Upload: scan found no files but q=%u — possible FATFS stale cache", g_filesQueued);
+        if (g_filesQueued > 0 && !g_harvesting) {
+            // The scan found no uploadable files yet the queue counter is non-zero — a
+            // STALE count (e.g. orphaned from a prior session). Reset it: a non-zero
+            // g_filesQueued keeps `uploading` true forever, which forces logInterval=0
+            // and SUPPRESSES the periodic S3 log append — so the session log never grows
+            // past its first chunk (TEST 18). An empty scan means /upload is truly drained.
+            log_write("Upload: scan found no files but q=%u — resetting stale queue counter", g_filesQueued);
+            g_filesQueued = 0;
+            g_mbQueued = 0.0f;
         }
     }
 }
@@ -3609,18 +3650,35 @@ extern "C" void app_main(void) {
                 nvs_commit(h);
                 ESP_LOGI(TAG, "S3 upload credentials provisioned");
             }
-            // Auto-generate device_id from MAC
-            len = sizeof(tmp);
-            if (nvs_get_str(h, "device_id", tmp, &len) != ESP_OK || tmp[0] == '\0') {
-                uint8_t mac[6];
-                esp_read_mac(mac, ESP_MAC_WIFI_STA);
-                char macStr[16];
-                snprintf(macStr, sizeof(macStr), "%02X%02X%02X%02X%02X%02X",
-                         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            // Device ID from MAC.
+            uint8_t mac[6];
+            esp_read_mac(mac, ESP_MAC_WIFI_STA);
+            char macStr[16];
+            snprintf(macStr, sizeof(macStr), "%02X%02X%02X%02X%02X%02X",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            char curId[40] = "";
+            size_t idLen = sizeof(curId);
+            bool haveId = (nvs_get_str(h, "device_id", curId, &idLen) == ESP_OK && curId[0]);
+#ifdef ALLOW_CDC_PERSIST
+            // E2E build (test-only): force a TEST_-prefixed device id so ALL uploads
+            // (logs, files, manifest) route to the test bucket via the backend's
+            // _pick_bucket. Overwrites any production id while this firmware is flashed.
+            if (strncmp(curId, "TEST_", 5) != 0) {
+                char id[40];
+                snprintf(id, sizeof(id), "TEST_%s", macStr);
+                nvs_set_str(h, "device_id", id);
+                nvs_commit(h);
+                ESP_LOGW(TAG, "E2E build: device_id forced to %s (test-bucket routing)", id);
+            }
+#else
+            // Production: ensure the real MAC id; strip any leftover TEST_ identity
+            // from a prior e2e build so routing returns to the production bucket.
+            if (!haveId || strncmp(curId, "TEST_", 5) == 0) {
                 nvs_set_str(h, "device_id", macStr);
                 nvs_commit(h);
                 ESP_LOGI(TAG, "Device ID: %s", macStr);
             }
+#endif
             nvs_close(h);
         }
     }
@@ -3682,6 +3740,16 @@ extern "C" void app_main(void) {
             remove(path);
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
+#ifdef ALLOW_CDC_PERSIST
+        // CDC_PERSIST on P2 — persistent CDC+MSC, NOT removed (re-read every boot).
+        snprintf(path, sizeof(path), "%s/%s", SD_MOUNT, CDC_PERSIST_MAGIC);
+        if (access(path, F_OK) == 0) {
+            ESP_LOGW(TAG, "SD: CDC_PERSIST found — CDC+MSC (persistent until removed)");
+            disp("USB Mode", "CDC (persist)");
+            g_msc_only = false;
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+#endif
         // ── WIFI_CONFIG — two lines: ssid, password ─────────────────────
         snprintf(path, sizeof(path), "%s/WIFI_CONFIG", SD_MOUNT);
         {

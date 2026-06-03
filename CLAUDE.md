@@ -69,6 +69,7 @@ Magic files on **P2** (standard path, `SD_MOUNT=/sdcard`):
 | File | Effect |
 |------|--------|
 | `ENABLE_CDC` | Boot CDC+MSC this once (deleted after processing, no NVS change) |
+| `CDC_PERSIST` | Boot CDC+MSC **persistently** — re-read every boot, NOT deleted; remove the file to revert to MSC-only. Honored only in `-DALLOW_CDC_PERSIST` builds (the `esp32s3-e2e` env); production OTA builds ignore it. Used by the hardware E2E run. |
 | `WIFI_CONFIG` | Two lines: ssid, password |
 | `S3_CONFIG` | Two lines: api_host, api_key |
 | `firmware.bin` | SD-flash: write to OTA partition + reboot |
@@ -79,6 +80,7 @@ Magic files on **P1** (fallback path, accessible via USB MSC even when P2 FATFS 
 | File | Effect |
 |------|--------|
 | `ENABLE_CDC` | Same as P2 — works even if P2 FATFS fails to mount |
+| `CDC_PERSIST` | Same as P2 — persistent CDC+MSC (E2E builds only) |
 | `REBOOT` | Same as P2 |
 
 P1 magic files are checked by `check_p1_magic()` at boot after `sd_init()`. This breaks
@@ -225,7 +227,13 @@ esp32/
 lambda/presign.py                # S3 pre-signed URLs, fw version check, DSU cookie, OTA URL, log append
 scripts/
 ├── e2e_unified.sh               # Unified E2E suite (~15 tests; consolidated lifecycle + manifest +
-│                                #   power-cut tests; state-triggered waits). --target emulator | device
+│                                #   power-cut tests; state-triggered waits). --target emulator | device.
+│                                #   Device runs the SAME consolidated tests via persistent CDC + a
+│                                #   serial-log tap (/tmp/dev_e2e.log) + host_dsu.py (see docs/testing.md).
+├── host_dsu.py                  # Cookie-aware host-side DSU sim (port of sim_dsu.h): mounts the ESP32
+│                                #   USB volume, reads dsuCookie.easdf, emits only un-sent flights. Backs
+│                                #   write_dsu_file on --target device. Modes: emit/slice/plant-cookie/
+│                                #   read-cookie/partial/--ignore-cookie.
 ├── commission.sh                # Device commissioning (flash, format SD, verify cellular/OTA/USB)
 ├── coolgear.py                  # CoolGear USB hub power control for automated power-cycle tests
 ├── test_e2e_esp32.py            # Python E2E harness (hardware)
