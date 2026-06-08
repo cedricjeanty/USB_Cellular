@@ -325,6 +325,13 @@ def handler(event, context):
         # Advance hwm to the highest consecutive flight reachable from current hwm
         hwm = manifest.get("high_water_mark", 0)
         all_files = sorted(manifest["files"], key=lambda x: x.get("first_flight", 0))
+        # Bootstrap the floor: a DSU only retains back to some flight (e.g. ~flight 1000
+        # for an aircraft a couple years old), so the earliest full download rarely
+        # starts at flight 1. Without this, hwm stays 0 forever (no file has
+        # first_flight <= hwm+1 == 1) and the skip/dedup optimization never engages.
+        # The earliest first_flight ever seen defines the aircraft's floor.
+        if hwm == 0 and all_files:
+            hwm = all_files[0].get("first_flight", 1) - 1
         changed = True
         while changed:
             changed = False

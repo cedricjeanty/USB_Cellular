@@ -456,6 +456,26 @@ print('Seeded manifest: serial=$serial hwm=$hwm')
 " 2>/dev/null && log "  Seeded manifest: $serial hwm=$hwm"
 }
 
+# Seed a manifest with EXPLICIT file ranges (for gapped / non-flight-1 floor scenarios).
+# Usage: seed_manifest_files <serial> <hwm> <first:last> [<first:last> ...]
+seed_manifest_files() {
+    local serial="$1" hwm="$2"; shift 2
+    BUCKET="$BUCKET" python3 - "$serial" "$hwm" "$@" <<'PY' 2>/dev/null && log "  Seeded manifest: $serial hwm=$hwm ranges=$*"
+import json, boto3, datetime, sys, os
+serial, hwm = sys.argv[1], int(sys.argv[2])
+files = []
+for r in sys.argv[3:]:
+    ff, lf = (int(x) for x in r.split(':'))
+    files.append({'key': f'aircraft/{serial}/seed_{lf:05d}.eaofh',
+                  'first_flight': ff, 'last_flight': lf})
+manifest = {'serial': serial, 'high_water_mark': hwm, 'files': files,
+            'last_updated': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}
+boto3.client('s3', region_name='us-west-2').put_object(
+    Bucket=os.environ['BUCKET'], Key=f'aircraft/{serial}/manifest.json',
+    Body=json.dumps(manifest), ContentType='application/json')
+PY
+}
+
 cleanup_aircraft_s3() {  # <serial>
     local serial="$1"
     aws s3 rm "s3://$BUCKET/aircraft/$serial/" --recursive 2>/dev/null || true
@@ -1726,6 +1746,56 @@ if [ "$TARGET" = "emulator" ]; then
     cleanup_aircraft_s3 "$SERIAL"
 else
     skip "TEST 24: part-PUT retry — emulator-only (needs network fault injection)"
+fi
+
+# ── TEST 25: Manifest gap-fill + non-flight-1 floor (bootstrap) ───────────────
+# Two single-watermark behaviors the manifest must get right, neither covered before:
+#  (A) BOOTSTRAP — a DSU only retains back to some flight (e.g. ~1000 for an aircraft a
+#      couple years old), so the first full download starts well above flight 1. The hwm
+#      must anchor to that floor (min first_flight − 1); otherwise it stays 0 forever (no
+#      file has first_flight ≤ hwm+1 == 1) and skip/dedup never engages.
+#  (B) GAP-FILL — with fragmented S3 coverage [1000-1071] + [1100-1150] the hwm stops at
+#      the gap (1071). Filling 1072-1099 makes the isolated [1100-1150] reachable, so the
+#      consecutive-advance jumps the hwm to 1150.
+log ""; log "TEST 25: Manifest gap-fill + non-flight-1 floor (bootstrap)"
+if [ "$TARGET" = "emulator" ]; then
+    rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory"
+    rm -f "$FW_DIR/emu_nvs.dat"
+    cleanup_aircraft_s3 "$SERIAL"
+    start_device 5
+
+    # ── Part A: bootstrap — first full download from a non-1 floor (flights 1000-1071) ──
+    m=$(log_mark)
+    write_dsu_file "01071" 100
+    echo "1000:1071" > "$SD_EMU/flightHistory/${SERIAL}_01071_$(date +%Y%m%d).eaofh.meta"
+    if wait_for_manifest "$SERIAL" 1071 180; then
+        pass "Gap A: bootstrap — non-1 floor, hwm advanced to 1071 (not stuck at 0)"
+    else
+        fail "Gap A: hwm did not bootstrap to 1071 (got $(get_manifest_hwm "$SERIAL"))"
+    fi
+
+    # ── Part B: fragmented S3 — a disjoint [1100-1150] sits above the hwm, gap at 1072-1099 ──
+    seed_manifest_files "$SERIAL" 1071 "1000:1071" "1100:1150"
+    sleep 2
+    HWM_GAP=$(get_manifest_hwm "$SERIAL")   # should be 1071 — stopped at the gap
+    m=$(log_mark)
+    write_dsu_file "01099" 100              # device fills the gap (1072-1099)
+    echo "1072:1099" > "$SD_EMU/flightHistory/${SERIAL}_01099_$(date +%Y%m%d).eaofh.meta"
+    if wait_for_manifest "$SERIAL" 1150 180; then
+        pass "Gap B: filled 1072-1099 → hwm jumped $HWM_GAP -> $(get_manifest_hwm "$SERIAL") (reaches isolated 1100-1150)"
+    else
+        fail "Gap B: hwm did not jump to 1150 after gap fill (got $(get_manifest_hwm "$SERIAL"))"
+    fi
+    if aws s3 ls "s3://$BUCKET/aircraft/$SERIAL/" 2>/dev/null | grep -q "_01099_"; then
+        pass "Gap B: gap-filler .eaofh uploaded to S3"
+    else
+        fail "Gap B: gap-filler not uploaded to S3"
+    fi
+
+    stop_device
+    cleanup_aircraft_s3 "$SERIAL"
+else
+    skip "TEST 25: manifest gap-fill / bootstrap — emulator-only"
 fi
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
