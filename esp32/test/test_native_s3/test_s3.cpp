@@ -86,6 +86,33 @@ void test_load_increments_retries(void) {
     TEST_ASSERT_EQUAL_UINT32(2, retries);
 }
 
+// A session with completed parts (startPart > 1) must NOT be abandoned at retries>=3 —
+// on a marginal cellular link each part can take several windows, and discarding 10s of MB
+// of completed parts (to restart a fresh multipart) is exactly the bug that stranded a
+// 14/15-part 74MB upload in the field. It keeps resuming the SAME session.
+void test_load_keeps_session_with_progress(void) {
+    s_nvs.set_str("s3up", "name", "big.bin");
+    s_nvs.set_str("s3up", "uid", "upload-prog");
+    s_nvs.set_str("s3up", "key", "DEV01/big.bin");
+    s_nvs.set_u32("s3up", "part", 15);    // 14 parts done, resuming at part 15
+    s_nvs.set_u32("s3up", "parts", 15);
+    s_nvs.set_u32("s3up", "retries", 4);  // would clear under the old flat >=3 rule
+    MultipartSession s = loadMultipartSession("big.bin");
+    TEST_ASSERT_TRUE(s.isResume);
+    TEST_ASSERT_FALSE(s.cleared);
+    TEST_ASSERT_EQUAL_UINT32(15, s.startPart);
+}
+
+// A no-progress session (still at part 1) is still abandoned at retries>=3.
+void test_load_no_progress_still_clears(void) {
+    s_nvs.set_str("s3up", "name", "stuck.bin");
+    s_nvs.set_str("s3up", "uid", "upload-stuck");
+    s_nvs.set_u32("s3up", "part", 1);
+    s_nvs.set_u32("s3up", "retries", 3);
+    MultipartSession s = loadMultipartSession("stuck.bin");
+    TEST_ASSERT_TRUE(s.cleared);
+}
+
 // ── saveMultipartSession tests ──────────────────────────────────────────────
 
 void test_save_new_session(void) {
@@ -435,6 +462,8 @@ int main(int argc, char** argv) {
     RUN_TEST(test_load_resume_existing);
     RUN_TEST(test_load_wrong_filename_ignored);
     RUN_TEST(test_load_retry_limit_clears);
+    RUN_TEST(test_load_keeps_session_with_progress);
+    RUN_TEST(test_load_no_progress_still_clears);
     RUN_TEST(test_load_increments_retries);
 
     // Save session

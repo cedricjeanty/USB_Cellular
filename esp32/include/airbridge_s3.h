@@ -48,11 +48,17 @@ inline MultipartSession loadMultipartSession(const char* filename) {
     g_hal->nvs->get_str("s3up", "name", storedName, sizeof(storedName));
 
     if (strcmp(storedName, filename) == 0) {
-        uint32_t retries = 0;
+        uint32_t retries = 0, startPart = 1;
         g_hal->nvs->get_u32("s3up", "retries", &retries);
+        g_hal->nvs->get_u32("s3up", "part", &startPart);   // next part (1-based)
 
-        if (retries >= 3) {
-            // Too many resume failures — clear session
+        // Abandon only a session that has made NO real progress. A session with completed
+        // parts (startPart > 1) is real uploaded data — on a marginal cellular link it may
+        // take several windows to land each part, and `retries` resets on every completed
+        // part, so a high limit here lets it keep resuming the SAME multipart instead of
+        // discarding 10s of MB and starting fresh (which strands the parts as an orphan).
+        uint32_t limit = (startPart > 1) ? 50 : 3;
+        if (retries >= limit) {
             s.cleared = true;
             clearMultipartSession();
             return s;
@@ -61,7 +67,7 @@ inline MultipartSession loadMultipartSession(const char* filename) {
         // Resume existing session
         g_hal->nvs->get_str("s3up", "uid", s.uploadId, sizeof(s.uploadId));
         g_hal->nvs->get_str("s3up", "key", s.key, sizeof(s.key));
-        g_hal->nvs->get_u32("s3up", "part", &s.startPart);
+        s.startPart = startPart;
         g_hal->nvs->get_u32("s3up", "parts", &s.totalParts);
         g_hal->nvs->set_u32("s3up", "retries", retries + 1);
         s.isResume = true;

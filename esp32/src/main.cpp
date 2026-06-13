@@ -303,10 +303,19 @@ public:
         esp_tls_t* tls = (esp_tls_t*)conn;
         const char* p = (const char*)data;
         size_t rem = len;
+        // Wall-clock no-progress timeout: on a non-blocking esp-tls socket a DEAD cellular
+        // link returns WANT_WRITE forever (SO_SNDTIMEO never fires), which would spin this
+        // loop indefinitely and wedge the upload task — the device then stops reconnecting.
+        // Bail after 30s of zero accepted bytes so the upload fails and the modem reconnect
+        // logic can run. (main.cpp's httpStreamChunk has the same guard.)
+        uint32_t lastProgress = millis();
         while (rem > 0) {
             int w = esp_tls_conn_write(tls, p, rem);
-            if (w > 0) { p += w; rem -= w; }
-            else if (w == ESP_TLS_ERR_SSL_WANT_WRITE) { vTaskDelay(pdMS_TO_TICKS(5)); }
+            if (w > 0) { p += w; rem -= w; lastProgress = millis(); }
+            else if (w == ESP_TLS_ERR_SSL_WANT_WRITE) {
+                if (millis() - lastProgress > 30000) return false;  // dead link — let reconnect run
+                vTaskDelay(pdMS_TO_TICKS(5));
+            }
             else return false;
         }
         return true;
