@@ -19,6 +19,7 @@
 #include "airbridge_utils.h"
 #include "airbridge_proto.h"
 #include "hal/hal.h"
+#include "hal/net_util.h"
 #include "airbridge_display.h"
 #include "airbridge_wifi_creds.h"
 #include "airbridge_harvest.h"
@@ -299,26 +300,18 @@ public:
     TlsHandle connect(const char* host) override {
         return (TlsHandle)tls_connect(host);
     }
+    // Non-blocking primitive: WANT_WRITE -> 0 (would-block), other errors -> -1. A dead
+    // cellular link returns WANT_WRITE indefinitely (the non-blocking socket never trips
+    // SO_SNDTIMEO); the shared netWriteAll() bounds it with a wall-clock no-progress timeout
+    // so the upload fails and reconnect can run instead of the task wedging forever.
+    int writeSome(TlsHandle conn, const void* data, size_t len) override {
+        int w = esp_tls_conn_write((esp_tls_t*)conn, data, len);
+        if (w > 0) return w;
+        if (w == ESP_TLS_ERR_SSL_WANT_WRITE) return 0;
+        return -1;
+    }
     bool write(TlsHandle conn, const void* data, size_t len) override {
-        esp_tls_t* tls = (esp_tls_t*)conn;
-        const char* p = (const char*)data;
-        size_t rem = len;
-        // Wall-clock no-progress timeout: on a non-blocking esp-tls socket a DEAD cellular
-        // link returns WANT_WRITE forever (SO_SNDTIMEO never fires), which would spin this
-        // loop indefinitely and wedge the upload task — the device then stops reconnecting.
-        // Bail after 30s of zero accepted bytes so the upload fails and the modem reconnect
-        // logic can run. (main.cpp's httpStreamChunk has the same guard.)
-        uint32_t lastProgress = millis();
-        while (rem > 0) {
-            int w = esp_tls_conn_write(tls, p, rem);
-            if (w > 0) { p += w; rem -= w; lastProgress = millis(); }
-            else if (w == ESP_TLS_ERR_SSL_WANT_WRITE) {
-                if (millis() - lastProgress > 30000) return false;  // dead link — let reconnect run
-                vTaskDelay(pdMS_TO_TICKS(5));
-            }
-            else return false;
-        }
-        return true;
+        return netWriteAll(this, conn, data, len);
     }
     int read(TlsHandle conn, void* buf, size_t len) override {
         return esp_tls_conn_read((esp_tls_t*)conn, buf, len);

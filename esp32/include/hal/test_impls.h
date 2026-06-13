@@ -311,13 +311,16 @@ public:
                            ? response_queue[queue_pos++] : next_response;
         return new MockConn{resp, 0, ""};
     }
-    bool write(TlsHandle conn, const void* data, size_t len) override {
+    int writeSome(TlsHandle conn, const void* data, size_t len) override {
         auto* c = (MockConn*)conn;
         bool first = c->captured.empty();
         c->captured.append((const char*)data, len);
         last_request = c->captured;
         if (first) requests.push_back(c->captured); else requests.back() = c->captured;
-        return true;
+        return (int)len;  // mock accepts everything in one shot
+    }
+    bool write(TlsHandle conn, const void* data, size_t len) override {
+        return writeSome(conn, data, len) >= 0;
     }
     int read(TlsHandle conn, void* buf, size_t len) override {
         auto* c = (MockConn*)conn;
@@ -335,6 +338,7 @@ public:
 class StubNetwork : public INetwork {
 public:
     TlsHandle connect(const char*) override { return nullptr; }
+    int writeSome(TlsHandle, const void*, size_t) override { return -1; }
     bool write(TlsHandle, const void*, size_t) override { return false; }
     int read(TlsHandle, void*, size_t) override { return 0; }
     void destroy(TlsHandle) override {}

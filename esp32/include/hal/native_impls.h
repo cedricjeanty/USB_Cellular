@@ -5,6 +5,7 @@
 #if !defined(ESP_PLATFORM)
 
 #include "hal/hal.h"
+#include "hal/net_util.h"
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -220,6 +221,17 @@ public:
         return (TlsHandle)new Conn{ssl, fd};
     }
 
+    // Non-blocking primitive for netWriteAll(). SSL sockets here are blocking, so SSL_write
+    // returns >0 or <=0(error) and never WANT_WRITE — but map it the same way for the shared
+    // helper (>0 bytes, 0 would-block, <0 error).
+    int writeSome(TlsHandle conn, const void* data, size_t len) override {
+        auto* c = (Conn*)conn;
+        int w = SSL_write(c->ssl, data, len);
+        if (w > 0) return w;
+        int err = SSL_get_error(c->ssl, w);
+        if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) return 0;
+        return -1;
+    }
     bool write(TlsHandle conn, const void* data, size_t len) override {
         auto* c = (Conn*)conn;
         // Detect a part PUT (request line starts with "PUT ") on its first write,
@@ -230,14 +242,7 @@ public:
             if (dropPutResponseOnPart > 0 && putCount_ == dropPutResponseOnPart)
                 c->dropResp = true;
         }
-        const char* p = (const char*)data;
-        size_t rem = len;
-        while (rem > 0) {
-            int w = SSL_write(c->ssl, p, rem);
-            if (w <= 0) return false;
-            p += w; rem -= w;
-        }
-        return true;
+        return netWriteAll(this, conn, data, len);
     }
 
     int read(TlsHandle conn, void* buf, size_t len) override {
