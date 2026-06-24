@@ -39,6 +39,7 @@ enum CmdType {
     CMD_FORMAT_SD,   // set NVS format flag + reboot            — boot-only (destructive)
     CMD_WIFI,        // args: <ssid> <pass>                     — runtime-safe (NVS)
     CMD_S3,          // args: <api_host> <api_key>              — runtime-safe (NVS)
+    CMD_SURVEY,      // antenna signal-survey mode (no PPP)     — boot-only (changes duty cycle)
 };
 
 struct Command {
@@ -59,6 +60,7 @@ inline CmdType cmdVerbType(const char* verb, bool* runtimeSafe) {
         { "format_sd", CMD_FORMAT_SD, false },
         { "wifi",      CMD_WIFI,      true  },
         { "s3",        CMD_S3,        true  },
+        { "survey",    CMD_SURVEY,    false },
     };
     for (auto& e : table) {
         if (strcmp(verb, e.v) == 0) { if (runtimeSafe) *runtimeSafe = e.rt; return e.t; }

@@ -122,6 +122,26 @@ void test_init_signal_metrics_custom(void) {
     TEST_ASSERT_EQUAL_STRING("EUTRAN-BAND12", r.band);
 }
 
+void test_survey_sample(void) {
+    // The antenna survey reads CSQ+CESQ+CPSI+COPS without dialing PPP.
+    s_modem->rssi = 20;
+    s_modem->rsrpIdx = 65;   // -76 dBm
+    s_modem->rsrqIdx = 24;   // -8 dB
+    s_modem->sinr    = 9;
+    s_modem->band    = "EUTRAN-BAND2";
+    s_modem->operatorName = "Verizon";
+
+    modemAtSync();
+    ModemSignalSample s;
+    modemSurveySample(&s);
+    TEST_ASSERT_EQUAL_INT(20, s.rssi);
+    TEST_ASSERT_EQUAL_INT(65 - 141, s.rsrp);       // -76 dBm
+    TEST_ASSERT_EQUAL_INT((24 / 2) - 20, s.rsrq);  // -8 dB
+    TEST_ASSERT_EQUAL_INT(9, s.sinr);
+    TEST_ASSERT_EQUAL_STRING("EUTRAN-BAND2", s.band);
+    TEST_ASSERT_EQUAL_STRING("Verizon", s.carrier);
+}
+
 // Pure parser tests (no modem needed).
 void test_parse_cesq_valid(void) {
     int rsrp = 0, rsrq = 0;
@@ -276,6 +296,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_init_different_operator);
     RUN_TEST(test_init_time_sync);
     RUN_TEST(test_init_signal_metrics_custom);
+    RUN_TEST(test_survey_sample);
     RUN_TEST(test_parse_cesq_valid);
     RUN_TEST(test_parse_cesq_unavailable);
     RUN_TEST(test_parse_cesq_malformed);

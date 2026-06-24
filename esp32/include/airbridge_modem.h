@@ -308,10 +308,11 @@ inline ModemInitResult modemRunInitPre() {
     return r;
 }
 
-// Modem init, part 2: network registration + RSSI/operator + APN + PPP dial.
-// Call after modemRunInitPre() (on the firmware, after the baud upgrade). Fills
-// r.registered / r.rssi / r.operatorName / r.connected in place.
-inline void modemRunInitPost(ModemInitResult& r) {
+// Register on the LTE network and read all signal metrics — NO PPP dial. Shared
+// by modemRunInitPost() (which then dials PPP) and the antenna signal-survey
+// (which loops sampling instead). Fills r.registered/rssi/rsrp/rsrq/sinr/band/
+// operatorName. All AT-command mode, so no +++ escape / data-session disruption.
+inline void modemRegisterAndReadSignal(ModemInitResult& r) {
     char resp[512];
 
     // Enable LTE registration URCs + auto RSSI.
@@ -346,8 +347,7 @@ inline void modemRunInitPost(ModemInitResult& r) {
     }
 
     // Read richer LTE signal quality — RSRP/RSRQ (CESQ) + band/SINR (CPSI).
-    // Both run in AT command mode before the PPP dial, so no +++ escape is
-    // needed. Best-effort: fields stay MODEM_SIG_NA / empty if unsupported.
+    // Best-effort: fields stay MODEM_SIG_NA / empty if unsupported.
     r.rsrp = r.rsrq = r.sinr = MODEM_SIG_NA;
     r.band[0] = '\0';
     if (modem_at_cmd("AT+CESQ", resp, sizeof(resp), 2000) > 0)
@@ -368,6 +368,55 @@ inline void modemRunInitPost(ModemInitResult& r) {
             }
         }
     }
+}
+
+// One signal snapshot for the antenna survey: CSQ + CESQ + CPSI + COPS. Pure AT
+// reads (no PPP/+++), safe to call repeatedly while registered but NOT in a data
+// session. Carrier/band/metrics fall back to sentinels if unsupported.
+struct ModemSignalSample {
+    int  rssi;             // 0-31, 99=unknown
+    int  rsrp, rsrq, sinr; // dBm/dB, MODEM_SIG_NA=unknown
+    char band[16];
+    char carrier[32];
+};
+
+inline void modemSurveySample(ModemSignalSample* s) {
+    char resp[512];
+    s->rssi = 99;
+    s->rsrp = s->rsrq = s->sinr = MODEM_SIG_NA;
+    s->band[0] = '\0';
+    s->carrier[0] = '\0';
+
+    if (modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000) > 0) {
+        char* p = strstr(resp, "+CSQ:");
+        if (p) sscanf(p, "+CSQ: %d", &s->rssi);
+    }
+    if (modem_at_cmd("AT+CESQ", resp, sizeof(resp), 2000) > 0)
+        parseCesq(resp, &s->rsrp, &s->rsrq);
+    if (modem_at_cmd("AT+CPSI?", resp, sizeof(resp), 2000) > 0)
+        parseCpsi(resp, s->band, sizeof(s->band), &s->sinr);
+    if (modem_at_cmd("AT+COPS?", resp, sizeof(resp), 2000) > 0) {
+        char* q1 = strchr(resp, '"');
+        if (q1) {
+            char* q2 = strchr(q1 + 1, '"');
+            if (q2) {
+                int n = q2 - q1 - 1;
+                if (n > 31) n = 31;
+                memcpy(s->carrier, q1 + 1, n);
+                s->carrier[n] = '\0';
+            }
+        }
+    }
+}
+
+// Modem init, part 2: network registration + RSSI/operator + APN + PPP dial.
+// Call after modemRunInitPre() (on the firmware, after the baud upgrade). Fills
+// r.registered / r.rssi / r.operatorName / r.connected in place.
+inline void modemRunInitPost(ModemInitResult& r) {
+    char resp[512];
+
+    // Register + read signal (shared with the survey path), then dial PPP.
+    modemRegisterAndReadSignal(r);
 
     // Set APN
     modem_at_cmd("AT+CGDCONT=1,\"IP\",\"hologram\"", resp, sizeof(resp), 5000);

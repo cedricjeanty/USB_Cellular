@@ -105,6 +105,7 @@ lives in `esp32/include/airbridge_commands.h` (unit-tested in `test/test_native_
 | `format_sd once` | Set NVS format flag + reboot (full reformat) | boot-only |
 | `wifi <ssid> <pass>` | Save a WiFi network (NVS) | runtime-safe |
 | `s3 <api_host> <api_key>` | Save S3 creds (NVS) | runtime-safe |
+| `survey` | Antenna signal-survey mode (see below) | boot-only |
 
 The file is processed at **boot** (`check_p1_magic()` for P1, the P2 magic block) **and during
 the 15s-quiet harvest cycle** (`doHarvest()`, after the P1 fresh-mount). Runtime-safe directives
@@ -144,6 +145,24 @@ dump_logs once
 | harvest | 16 KB | 1 | 1 | SD file harvest from root to /harvested/ |
 | main_loop | 4 KB | 0 | 1 | Display, USB delay, modem watchdog, heartbeat |
 | watchdog | 3 KB | 0 | 5 | No-progress reboot if main loop wedges |
+
+### Antenna Signal Survey
+
+For comparing antennas, the `survey` directive puts the unit in a **dedicated measurement
+mode**: the modem task registers on the network and then **loops `modemSurveySample()`**
+(`AT+CSQ` + `AT+CESQ` + `AT+CPSI` + `AT+COPS?`) every 2 s, logging
+`SURVEY N: carrier=… band=… RSSI=… RSRP=… RSRQ=… SINR=…`. It **never dials PPP**, so the AT
+polling never collides with an upload (mixing the two is what broke uploads before — once PPP
+is up, escaping with `+++` to run AT commands stalls the data session). Survey mode and normal
+upload operation are mutually exclusive.
+
+Procedure (bench, with persistent CDC): flash `esp32s3-e2e`, put `cdc` + `survey` in
+`airbridge.cmd` on the USB volume, power-cycle, and read the `SURVEY` lines live on
+`/dev/ttyACM*`. Swap antennas and watch RSRP/SINR settle — no reboot per antenna. Compare on
+**RSRP** (dBm, coverage/path-loss — the primary antenna metric) and **SINR** (dB, quality);
+the log also records carrier/band since the Hologram SIM can latch a different carrier. Remove
+`survey` from `airbridge.cmd` to return to normal operation. `modemRegisterAndReadSignal()` is
+shared with `modemRunInitPost()`; `modemSurveySample()` is unit-tested against `sim_modem.h`.
 
 ### No-Progress Watchdog
 

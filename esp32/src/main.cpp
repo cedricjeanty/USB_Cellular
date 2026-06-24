@@ -557,6 +557,12 @@ static volatile uint32_t g_mainLoopHeartbeat = 0;
 #define WATCHDOG_STALL_MS  300000   // 5 min main-loop stall → force reboot
 #define WATCHDOG_CHECK_MS   15000   // watchdog poll cadence
 
+// Antenna signal-survey mode: set by the `survey` airbridge.cmd directive at boot.
+// The modem task registers then loops sampling RSSI/RSRP/RSRQ/SINR (never dials
+// PPP), so AT polling never collides with an upload. Read live over CDC serial.
+static volatile bool     g_surveyMode = false;
+#define SURVEY_INTERVAL_MS 2000
+
 // ── CDC CLI ─────────────────────────────────────────────────────────────────
 // CLI removed — CDC serial is now a log-only output stream.
 // Configuration via SD magic files: WIFI_CONFIG, S3_CONFIG, ENABLE_CDC, firmware.bin
@@ -1070,6 +1076,11 @@ static CmdRunResult run_command_file(const char* cmdPath, const char* diagDir,
             }
             case CMD_REBOOT:    res.reboot = true; break;
             case CMD_FORMAT_SD: res.format = true; break;
+            case CMD_SURVEY:
+                g_surveyMode = true;
+                airbridge_log("CMD: survey — antenna signal-survey mode (no PPP/upload)");
+                disp("Survey mode", "measuring signal");
+                break;
             case CMD_WIFI: { CliResult r = cliSetWifi(c.args); airbridge_log("CMD: %s", r.output); break; }
             case CMD_S3:   { CliResult r = cliSetS3(c.args);   airbridge_log("CMD: %s", r.output); break; }
             default:       airbridge_log("CMD: unknown directive '%s'", c.verb); break;
@@ -2524,6 +2535,35 @@ static void modemTask(void* param) {
             cdc_printf("Modem: staying at 115200\r\n");
             log_write("Modem: baud 115200 (upgrade failed)");
         }
+    }
+
+    // ── Antenna signal-survey mode (no PPP) ──────────────────────────────
+    // Register, then loop sampling RSSI/RSRP/RSRQ/SINR forever. We NEVER dial
+    // PPP, so these AT reads never collide with an upload (the reason mid-PPP
+    // polling was removed). Swap antennas and watch the SURVEY lines live over
+    // CDC serial. Triggered by the `survey` airbridge.cmd directive.
+    if (g_surveyMode) {
+        ModemInitResult sr = {};
+        modemRegisterAndReadSignal(sr);
+        g_modemReady = true;
+        log_write("SURVEY: registered=%d op=%s — sampling every %dms, no PPP",
+                  sr.registered, sr.operatorName[0] ? sr.operatorName : "?", SURVEY_INTERVAL_MS);
+        cdc_printf("SURVEY: registered=%d op=%s\r\n", sr.registered, sr.operatorName);
+        uint32_t n = 0;
+        for (;;) {
+            ModemSignalSample s;
+            modemSurveySample(&s);
+            n++;
+            g_modemRssi = s.rssi; g_modemRsrp = s.rsrp;
+            g_modemRsrq = s.rsrq; g_modemSinr = s.sinr;
+            strlcpy(g_modemBand, s.band, sizeof(g_modemBand));
+            if (s.carrier[0]) strlcpy(g_modemOp, s.carrier, sizeof(g_modemOp));
+            log_write("SURVEY %lu: carrier=%s band=%s RSSI=%d RSRP=%d RSRQ=%d SINR=%d",
+                      (unsigned long)n, s.carrier[0] ? s.carrier : "?",
+                      s.band[0] ? s.band : "?", s.rssi, s.rsrp, s.rsrq, s.sinr);
+            vTaskDelay(pdMS_TO_TICKS(SURVEY_INTERVAL_MS));
+        }
+        // never returns
     }
 
     // ── Registration + RSSI/operator + APN + PPP dial — shared with emulator ──
