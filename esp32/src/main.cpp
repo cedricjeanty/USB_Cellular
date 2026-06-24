@@ -27,6 +27,7 @@
 #include "airbridge_s3.h"
 #include "airbridge_triggers.h"
 #include "airbridge_cli.h"
+#include "airbridge_commands.h"
 #include "airbridge_modem.h"
 #include "airbridge_runtime.h"
 #include "airbridge_log.h"
@@ -545,6 +546,16 @@ static volatile bool     g_pppNeedsReconnect = false;
 static volatile bool     g_modemReady   = false;
 static char              g_modemOp[32]  = "";
 static int               g_modemRssi    = 99;
+static int               g_modemRsrp    = MODEM_SIG_NA;  // LTE RSRP dBm (9999=N/A)
+static int               g_modemRsrq    = MODEM_SIG_NA;  // LTE RSRQ dB
+static int               g_modemSinr    = MODEM_SIG_NA;  // LTE SINR dB
+static char              g_modemBand[16] = "";           // LTE band (CPSI)
+
+// No-progress watchdog: main_loop stamps this each iteration; an independent
+// watchdog task reboots if it goes stale (main loop wedged). See watchdog_task().
+static volatile uint32_t g_mainLoopHeartbeat = 0;
+#define WATCHDOG_STALL_MS  300000   // 5 min main-loop stall → force reboot
+#define WATCHDOG_CHECK_MS   15000   // watchdog poll cadence
 
 // ── CDC CLI ─────────────────────────────────────────────────────────────────
 // CLI removed — CDC serial is now a log-only output stream.
@@ -1013,6 +1024,70 @@ static bool sd_reinit_and_mount() {
     return sd_mount_fatfs();
 }
 
+// ── Unified command file (airbridge.cmd) ────────────────────────────────────
+// One persistent text file of directives (see airbridge_commands.h). Processed
+// at boot (all directives) and during harvest (runtimeOnly=true => only
+// directives that don't need a reboot). `once` directives are stripped after
+// running. Reboot/format are signalled back to the caller, which owns the SD
+// teardown. logsDir/uploadDir are always on P2 (where logs live); diagDir is the
+// USB-visible destination chosen by the caller.
+struct CmdRunResult { bool ran; bool reboot; bool format; };
+
+static CmdRunResult run_command_file(const char* cmdPath, const char* diagDir,
+                                     bool runtimeOnly) {
+    CmdRunResult res = {};
+    char text[2048];
+    if (!cmdReadFile(cmdPath, text, sizeof(text))) return res;
+
+    Command cmds[16];
+    int n = parseCommands(text, cmds, 16);
+    bool anyConsumed = false;
+    for (int i = 0; i < n; i++) {
+        Command& c = cmds[i];
+        if (!cmdExecuted(c, runtimeOnly)) continue;  // boot-only skipped at harvest
+        res.ran = true;
+        switch (c.type) {
+            case CMD_CDC:
+                if (c.once) {
+                    g_msc_only = false;
+                    airbridge_log("CMD: cdc once — CDC+MSC this boot");
+                    disp("USB Mode", "CDC (cmd)");
+                } else {
+#ifdef ALLOW_CDC_PERSIST
+                    g_msc_only = false;
+                    airbridge_log("CMD: cdc — CDC+MSC (persistent)");
+                    disp("USB Mode", "CDC (persist)");
+#else
+                    airbridge_log("CMD: cdc (persistent) ignored in production build");
+#endif
+                }
+                break;
+            case CMD_DUMP_LOGS: {
+                int copied = dumpLogs("/sdcard/logs", "/sdcard/upload", diagDir);
+                airbridge_log("CMD: dump_logs — copied %d log(s) to %s", copied, diagDir);
+                disp("Diag dump", "logs -> USB");
+                break;
+            }
+            case CMD_REBOOT:    res.reboot = true; break;
+            case CMD_FORMAT_SD: res.format = true; break;
+            case CMD_WIFI: { CliResult r = cliSetWifi(c.args); airbridge_log("CMD: %s", r.output); break; }
+            case CMD_S3:   { CliResult r = cliSetS3(c.args);   airbridge_log("CMD: %s", r.output); break; }
+            default:       airbridge_log("CMD: unknown directive '%s'", c.verb); break;
+        }
+        if (c.once) anyConsumed = true;
+    }
+
+    // Strip executed `once` directives; delete the file if nothing remains.
+    if (anyConsumed) {
+        char out[2048];
+        if (emitPersistent(text, runtimeOnly, out, sizeof(out)))
+            cmdWriteFile(cmdPath, out);
+        else if (g_hal && g_hal->filesys)
+            g_hal->filesys->remove(cmdPath);
+    }
+    return res;
+}
+
 // ── P1 magic files (dual-partition mode) ────────────────────────────────────
 // In dual-partition mode, P2 (logs, config) is invisible to USB MSC.  This
 // makes ENABLE_CDC on P2 unreachable when P2 FATFS is down — breaking the
@@ -1047,6 +1122,29 @@ static void check_p1_magic() {
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 #endif
+
+    // Unified command file on P1 (airbridge.cmd). Diag dump dest is on P1 (USB-
+    // visible). Runs all directives at boot; reboot/format handled below.
+    {
+        char cmdPath[80], diagDir[80];
+        snprintf(cmdPath, sizeof(cmdPath), "%s/%s", DSU_MOUNT, COMMAND_FILE_NAME);
+        snprintf(diagDir, sizeof(diagDir), "%s/diag", DSU_MOUNT);
+        CmdRunResult cr = run_command_file(cmdPath, diagDir, /*runtimeOnly=*/false);
+        if (cr.format) {
+            airbridge_log("CMD: format_sd — full reformat on next boot");
+            nvs_handle_t fh;
+            if (nvs_open("sys", NVS_READWRITE, &fh) == ESP_OK) {
+                nvs_set_u8(fh, "format", 1); nvs_commit(fh); nvs_close(fh);
+            }
+            unmount_dsu(); vTaskDelay(pdMS_TO_TICKS(500));
+            sd_before_restart(); esp_restart();
+        }
+        if (cr.reboot) {
+            airbridge_log("CMD: reboot — restarting");
+            unmount_dsu(); vTaskDelay(pdMS_TO_TICKS(500));
+            sd_before_restart(); esp_restart();
+        }
+    }
 
     // REBOOT on P1 — clean restart
     snprintf(path, sizeof(path), "%s/REBOOT", DSU_MOUNT);
@@ -1545,107 +1643,133 @@ static void otaDisplayProgress(int pct, uint32_t received, uint32_t total) {
 }
 
 static bool otaDownloadAndFlash(const char* host, const char* path, uint32_t expectedSize) {
-    // Use raw esp_tls (same as upload path which works reliably over cellular)
-    g_tlsActive = true;
-    log_write("OTA: connecting to %s heap=%lu", host, (unsigned long)esp_get_free_heap_size());
+    // Download + flash with RESUME. A mid-stream link drop (the field failure that
+    // left a unit on old firmware) no longer abandons the whole image: we keep the
+    // esp_ota handle and reconnect with an HTTP Range header to continue from where
+    // we stopped, up to OTA_MAX_ATTEMPTS times. esp_ota_write is sequential, so
+    // continuing to write the next bytes into the same handle resumes cleanly.
+    const int OTA_MAX_ATTEMPTS = 4;
+    uint32_t total = expectedSize;   // full image size (from the version check)
 
-    esp_tls_t* tls = tls_connect(host);
-    if (!tls) {
-        log_write("OTA: TLS connect failed heap=%lu", (unsigned long)esp_get_free_heap_size());
-        g_tlsActive = false;
-        return false;
-    }
-
-    // Send GET request
-    char hdr[2700];
-    int hlen = snprintf(hdr, sizeof(hdr),
-        "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host);
-    if (!tls_write_all(tls, hdr, hlen)) {
-        log_write("OTA: header send failed");
-        tls_destroy(tls); g_tlsActive = false; return false;
-    }
-
-    // Read HTTP status line + headers
-    int contentLength = expectedSize;
-    {
-        char line[512];
-        int status = 0;
-        while (true) {
-            int pos = 0;
-            while (pos < (int)sizeof(line) - 1) {
-                char c;
-                int r = esp_tls_conn_read(tls, &c, 1);
-                if (r <= 0) goto done_hdr;
-                line[pos++] = c;
-                if (c == '\n') break;
-            }
-            line[pos] = '\0';
-            if (status == 0 && strncmp(line, "HTTP/", 5) == 0) {
-                const char* sp = strchr(line, ' ');
-                if (sp) status = atoi(sp + 1);
-            }
-            if (strncasecmp(line, "Content-Length:", 15) == 0)
-                contentLength = atoi(line + 15);
-            if (pos <= 2 && (line[0] == '\r' || line[0] == '\n')) break;
-        }
-done_hdr:
-        log_write("OTA: HTTP %d, %d bytes", status, contentLength);
-        if (status != 200) {
-            tls_destroy(tls); g_tlsActive = false; return false;
-        }
-    }
-
-    // Prepare OTA partition
     const esp_partition_t* update_part = esp_ota_get_next_update_partition(NULL);
-    if (!update_part) { log_write("OTA: no partition"); tls_destroy(tls); g_tlsActive = false; return false; }
+    if (!update_part) { log_write("OTA: no partition"); return false; }
 
     esp_ota_handle_t ota_handle;
     esp_err_t err = esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
-    if (err != ESP_OK) { log_write("OTA: begin failed"); tls_destroy(tls); g_tlsActive = false; return false; }
+    if (err != ESP_OK) { log_write("OTA: begin failed"); return false; }
 
-    // Stream body to flash
-    // SO_RCVTIMEO (30s) catches fully stalled reads.
-    // Progress timeout (60s) catches trickle connections.
-    char buf[2048];
-    uint32_t received = 0;
-    uint32_t lastProgressMs = millis();
-    uint32_t lastProgressBytes = 0;
-    while (received < (uint32_t)contentLength) {
-        int len = esp_tls_conn_read(tls, buf, sizeof(buf));
-        if (len > 0) {
-            err = esp_ota_write(ota_handle, buf, len);
-            if (err != ESP_OK) {
-                log_write("OTA: flash write failed at %lu", (unsigned long)received);
-                esp_ota_abort(ota_handle);
-                tls_destroy(tls); g_tlsActive = false;
-                return false;
-            }
-            received += len;
-            if ((received % 16384) < (uint32_t)len)
-                otaDisplayProgress((received * 100) / contentLength, received, contentLength);
-            // Reset progress timer on meaningful progress (>4KB since last check)
-            if (received - lastProgressBytes >= 4096) {
-                lastProgressMs = millis();
-                lastProgressBytes = received;
-            }
-        } else if (len == 0) {
-            break;
-        } else {
-            log_write("OTA: read error at %lu/%d", (unsigned long)received, contentLength);
-            break;
+    uint32_t received = 0;           // bytes flashed so far (persists across attempts)
+    bool complete = false;
+    bool hardFail = false;
+
+    for (int attempt = 0; attempt < OTA_MAX_ATTEMPTS && !complete && !hardFail; attempt++) {
+        g_tlsActive = true;
+        if (attempt == 0)
+            log_write("OTA: connecting to %s heap=%lu", host, (unsigned long)esp_get_free_heap_size());
+        else
+            log_write("OTA: resume attempt %d from %lu/%lu", attempt, (unsigned long)received, (unsigned long)total);
+
+        esp_tls_t* tls = tls_connect(host);
+        if (!tls) {
+            log_write("OTA: TLS connect failed (attempt %d)", attempt);
+            g_tlsActive = false;
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            continue;
         }
-        // Abort if no meaningful progress for 60s
-        if (millis() - lastProgressMs > 60000) {
-            log_write("OTA: stalled at %lu/%d — aborting", (unsigned long)received, contentLength);
-            break;
+
+        // GET with a Range header when resuming (received>0).
+        std::string req = buildRangeGetRequest(host, path, received);
+        if (!tls_write_all(tls, req.c_str(), req.size())) {
+            log_write("OTA: header send failed");
+            tls_destroy(tls); g_tlsActive = false;
+            continue;
         }
+
+        // Read HTTP status line + headers.
+        int status = 0, contentLength = 0;
+        {
+            char line[512];
+            while (true) {
+                int pos = 0;
+                while (pos < (int)sizeof(line) - 1) {
+                    char c;
+                    int r = esp_tls_conn_read(tls, &c, 1);
+                    if (r <= 0) goto hdr_done;
+                    line[pos++] = c;
+                    if (c == '\n') break;
+                }
+                line[pos] = '\0';
+                if (status == 0 && strncmp(line, "HTTP/", 5) == 0) {
+                    const char* sp = strchr(line, ' ');
+                    if (sp) status = atoi(sp + 1);
+                }
+                if (strncasecmp(line, "Content-Length:", 15) == 0)
+                    contentLength = atoi(line + 15);
+                if (pos <= 2 && (line[0] == '\r' || line[0] == '\n')) break;
+            }
+        }
+hdr_done:
+        log_write("OTA: HTTP %d (have %lu/%lu)", status, (unsigned long)received, (unsigned long)total);
+
+        // 200 = full body (expected on first attempt). 206 = partial (expected on
+        // resume). If we asked to resume but got 200, the server ignored Range and
+        // is resending from byte 0 — restart the handle cleanly to avoid corruption.
+        if (received > 0 && status == 200) {
+            log_write("OTA: server ignored Range — restarting from 0");
+            esp_ota_abort(ota_handle);
+            if (esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle) != ESP_OK) {
+                log_write("OTA: re-begin failed"); tls_destroy(tls); g_tlsActive = false; hardFail = true; break;
+            }
+            received = 0;
+        } else if (!(status == 200 || status == 206)) {
+            log_write("OTA: bad status %d", status);
+            tls_destroy(tls); g_tlsActive = false;
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            continue;
+        }
+        if (total == 0 && status == 200 && contentLength > 0) total = (uint32_t)contentLength;
+
+        // Stream this connection's body into the OTA handle.
+        char buf[2048];
+        uint32_t lastProgressMs = millis();
+        uint32_t lastProgressBytes = received;
+        while (total == 0 || received < total) {
+            int len = esp_tls_conn_read(tls, buf, sizeof(buf));
+            if (len > 0) {
+                err = esp_ota_write(ota_handle, buf, len);
+                if (err != ESP_OK) {
+                    log_write("OTA: flash write failed at %lu", (unsigned long)received);
+                    tls_destroy(tls); g_tlsActive = false;
+                    hardFail = true; break;
+                }
+                received += (uint32_t)len;
+                if (total > 0 && (received % 16384) < (uint32_t)len)
+                    otaDisplayProgress((received * 100) / total, received, total);
+                if (received - lastProgressBytes >= 4096) {
+                    lastProgressMs = millis();
+                    lastProgressBytes = received;
+                }
+            } else if (len == 0) {
+                break;                  // connection closed (maybe mid-stream)
+            } else {
+                log_write("OTA: read error at %lu/%lu", (unsigned long)received, (unsigned long)total);
+                break;                  // link dropped — will resume on next attempt
+            }
+            if (millis() - lastProgressMs > 60000) {
+                log_write("OTA: stalled at %lu/%lu", (unsigned long)received, (unsigned long)total);
+                break;
+            }
+        }
+
+        tls_destroy(tls);
+        g_tlsActive = false;
+
+        if (total > 0 && received >= total) complete = true;
+        else if (attempt < OTA_MAX_ATTEMPTS - 1) vTaskDelay(pdMS_TO_TICKS(3000));  // backoff before resume
     }
 
-    tls_destroy(tls);
-    g_tlsActive = false;
-
-    if (received < (uint32_t)contentLength) {
-        log_write("OTA: incomplete %lu/%d", (unsigned long)received, contentLength);
+    if (!complete) {
+        log_write("OTA: incomplete %lu/%lu after retries", (unsigned long)received, (unsigned long)total);
         esp_ota_abort(ota_handle);
         return false;
     }
@@ -1656,7 +1780,7 @@ done_hdr:
     if (err != ESP_OK) { log_write("OTA: set_boot failed"); return false; }
 
     log_write("OTA: success — %lu bytes", (unsigned long)received);
-    otaDisplayProgress(100, received, contentLength);
+    otaDisplayProgress(100, received, total);
     return true;
 }
 
@@ -2408,11 +2532,15 @@ static void modemTask(void* param) {
     // upgrade so the modem dials at the upgraded baud, same as before.
     modemRunInitPost(mr);
     g_modemRssi = mr.rssi;
+    g_modemRsrp = mr.rsrp; g_modemRsrq = mr.rsrq; g_modemSinr = mr.sinr;
+    strlcpy(g_modemBand, mr.band, sizeof(g_modemBand));
     if (mr.operatorName[0]) strlcpy(g_modemOp, mr.operatorName, sizeof(g_modemOp));
     if (!mr.registered)
         log_write("Modem: CEREG timeout — dialed unregistered");
     cdc_printf("Modem: %s RSSI=%d reg=%d\r\n", g_modemOp, g_modemRssi, mr.registered);
-    log_write("Modem: operator=%s RSSI=%d", g_modemOp, g_modemRssi);
+    log_write("Modem: operator=%s RSSI=%d RSRP=%d RSRQ=%d SINR=%d band=%s",
+              g_modemOp, g_modemRssi, g_modemRsrp, g_modemRsrq, g_modemSinr,
+              g_modemBand[0] ? g_modemBand : "?");
     bool connected = mr.connected;
 
     // Retry indefinitely if initial PPP dial fails.
@@ -3360,6 +3488,25 @@ static void doHarvest() {
         cdc_printf("Cookie: %s flight %lu\r\n", hr.dsuSerial, (unsigned long)hr.maxFlight);
     }
 
+    // Unified command file (runtime) — the host may have dropped airbridge.cmd on
+    // the USB-visible volume; process runtime-safe directives (dump_logs/wifi/s3/
+    // reboot) now, without a reboot. harvestSrc is the USB-visible source (/dsu in
+    // dual-partition mode, /sdcard single).
+    {
+        char cmdPath[80], diagDir[80];
+        snprintf(cmdPath, sizeof(cmdPath), "%s/%s", harvestSrc, COMMAND_FILE_NAME);
+        snprintf(diagDir, sizeof(diagDir), "%s/diag", harvestSrc);
+        CmdRunResult cr = run_command_file(cmdPath, diagDir, /*runtimeOnly=*/true);
+        if (cr.reboot) {
+            airbridge_log("CMD: reboot — restarting after harvest");
+            if (dsu_mounted) unmount_dsu();
+            xSemaphoreGive(g_sd_mutex);
+            g_harvesting = false; g_msc_ejected = false;
+            vTaskDelay(pdMS_TO_TICKS(500));
+            sd_before_restart(); esp_restart();
+        }
+    }
+
     // Unmount P1 if we mounted it
     if (dsu_mounted) unmount_dsu();
 
@@ -3411,6 +3558,34 @@ static void harvestTask(void* param) {
 
 
 // ── Main loop task ──────────────────────────────────────────────────────────
+// Independent no-progress watchdog. Takes NO contended locks, so it keeps running
+// even when every other task is wedged. If the main loop's heartbeat goes stale
+// (>5 min) the device has hard-hung — reboot it. This is the safety net for the
+// 9-hour field brick: a task spun holding the SD/log mutex, the main loop blocked,
+// and idle tasks kept feeding the ESP task-WDT so it never tripped. Records the
+// reboot in NVS (no log mutex — that may be the wedged resource) for the next boot.
+static void watchdog_task(void* param) {
+    (void)param;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(WATCHDOG_CHECK_MS));
+        uint32_t hb = g_mainLoopHeartbeat;
+        if (watchdogShouldReboot(hb, millis(), WATCHDOG_STALL_MS)) {
+            uint32_t stallS = (millis() - hb) / 1000;
+            ESP_LOGE(TAG, "WATCHDOG: main loop stalled %lus — rebooting", (unsigned long)stallS);
+            nvs_handle_t h;
+            if (nvs_open("dbg", NVS_READWRITE, &h) == ESP_OK) {
+                uint32_t cnt = 0;
+                nvs_get_u32(h, "wdt_reboots", &cnt);
+                nvs_set_u32(h, "wdt_reboots", cnt + 1);
+                nvs_set_u32(h, "wdt_stall_s", stallS);
+                nvs_commit(h);
+                nvs_close(h);
+            }
+            esp_restart();
+        }
+    }
+}
+
 static void main_loop_task(void* param) {
     (void)param;
 
@@ -3422,6 +3597,11 @@ static void main_loop_task(void* param) {
     uint32_t usbPresentMs = millis();
 
     for (;;) {
+        // Heartbeat for the no-progress watchdog. Stamped first thing each
+        // iteration: if the loop body wedges (e.g. blocked on a mutex a hung
+        // task holds), this stops advancing and watchdog_task reboots us.
+        g_mainLoopHeartbeat = millis();
+
         // Watchdog: restart modem task if it died (init failure OR runtime crash)
         if (g_modem_task == nullptr) {
             log_write("Modem: task died — restarting");
@@ -3510,10 +3690,10 @@ static void main_loop_task(void* param) {
             static uint32_t lastStatusMs = 0;
             if (now - lastStatusMs >= 60000) {
                 lastStatusMs = now;
-                airbridge_log("STATUS fw=%s device=%s net=%s rssi=%d q=%u up=%u mbq=%.1f mbup=%.1f heap=%lu",
+                airbridge_log("STATUS fw=%s device=%s net=%s rssi=%d rsrp=%d sinr=%d q=%u up=%u mbq=%.1f mbup=%.1f heap=%lu",
                     FW_VERSION, g_deviceId,
                     g_pppConnected ? "ppp" : (g_netConnected ? "wifi" : "none"),
-                    g_modemRssi, g_filesQueued, g_filesUploaded,
+                    g_modemRssi, g_modemRsrp, g_modemSinr, g_filesQueued, g_filesUploaded,
                     g_mbQueued, g_mbUploaded,
                     (unsigned long)esp_get_free_heap_size());
             }
@@ -3534,6 +3714,23 @@ extern "C" void app_main(void) {
     ESP_ERROR_CHECK(ret);
     log_init();
     airbridge_log("AirBridge fw=%s heap=%lu", FW_VERSION, (unsigned long)esp_get_free_heap_size());
+
+    // Surface a prior watchdog-forced reboot (set by watchdog_task before restart).
+    {
+        nvs_handle_t h;
+        if (nvs_open("dbg", NVS_READWRITE, &h) == ESP_OK) {
+            uint32_t cnt = 0, stallS = 0;
+            nvs_get_u32(h, "wdt_reboots", &cnt);
+            nvs_get_u32(h, "wdt_stall_s", &stallS);
+            if (stallS > 0) {
+                airbridge_log("WATCHDOG: previous boot force-rebooted after %lus stall (total=%lu)",
+                              (unsigned long)stallS, (unsigned long)cnt);
+                nvs_set_u32(h, "wdt_stall_s", 0);  // clear so it's reported once
+                nvs_commit(h);
+            }
+            nvs_close(h);
+        }
+    }
 
     // ── HAL initialization ─────────────────────────────────────────────
     static Esp32Display  s_display;
@@ -3752,6 +3949,26 @@ extern "C" void app_main(void) {
             vTaskDelay(pdMS_TO_TICKS(500));
         }
 #endif
+        // ── Unified command file on P2 (airbridge.cmd) ──────────────────
+        // Mainly relevant on single-partition cards (SD_MOUNT is the USB-visible
+        // volume there). Diag dump lands at SD_MOUNT/diag.
+        {
+            char cmdPath[80], diagDir[80];
+            snprintf(cmdPath, sizeof(cmdPath), "%s/%s", SD_MOUNT, COMMAND_FILE_NAME);
+            snprintf(diagDir, sizeof(diagDir), "%s/diag", SD_MOUNT);
+            CmdRunResult cr = run_command_file(cmdPath, diagDir, /*runtimeOnly=*/false);
+            if (cr.format) {
+                nvs_handle_t fh;
+                if (nvs_open("sys", NVS_READWRITE, &fh) == ESP_OK) {
+                    nvs_set_u8(fh, "format", 1); nvs_commit(fh); nvs_close(fh);
+                }
+                vTaskDelay(pdMS_TO_TICKS(500)); sd_before_restart(); esp_restart();
+            }
+            if (cr.reboot) {
+                vTaskDelay(pdMS_TO_TICKS(500)); sd_before_restart(); esp_restart();
+            }
+        }
+
         // ── WIFI_CONFIG — two lines: ssid, password ─────────────────────
         snprintf(path, sizeof(path), "%s/WIFI_CONFIG", SD_MOUNT);
         {
@@ -4063,6 +4280,8 @@ extern "C" void app_main(void) {
     xTaskCreatePinnedToCore(harvestTask,   "harvest",   16384, nullptr, 1, &g_harvest_task, 1);
     xTaskCreatePinnedToCore(modemTask,     "modem",     16384, nullptr, 2, &g_modem_task,   0);  // core 0, 16KB stack for reconnection
     xTaskCreatePinnedToCore(main_loop_task, "main_loop", 4096, nullptr, 1, nullptr,         0);
+    // High priority + core 0; takes no contended locks so it survives any wedge.
+    xTaskCreatePinnedToCore(watchdog_task,  "watchdog",   3072, nullptr, 5, nullptr,        0);
 
     // ── Scan /upload/ subfolders for leftover files from before last reboot ──
     if (g_fatfs_mounted) {

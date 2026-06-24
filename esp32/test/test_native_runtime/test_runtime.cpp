@@ -215,6 +215,35 @@ void test_ota_no_firmware(void) {
     TEST_ASSERT_EQUAL_INT(0, r.status);  // no firmware = don't retry
 }
 
+// ── No-progress watchdog ────────────────────────────────────────────────────
+
+void test_watchdog_not_started(void) {
+    // Heartbeat 0 = main loop hasn't run yet → never reboot.
+    TEST_ASSERT_FALSE(watchdogShouldReboot(0, 1000000, 300000));
+}
+
+void test_watchdog_fresh_heartbeat(void) {
+    // Heartbeat recent → no reboot.
+    TEST_ASSERT_FALSE(watchdogShouldReboot(1000000, 1000000, 300000));
+    TEST_ASSERT_FALSE(watchdogShouldReboot(1000000, 1000000 + 299999, 300000));
+}
+
+void test_watchdog_stalled(void) {
+    // Heartbeat older than the stall threshold → reboot.
+    TEST_ASSERT_TRUE(watchdogShouldReboot(1000000, 1000000 + 300001, 300000));
+    // The 9-hour field freeze: heartbeat frozen, hours elapse → definitely reboot.
+    TEST_ASSERT_TRUE(watchdogShouldReboot(500000, 500000 + 9u*3600u*1000u, 300000));
+}
+
+void test_watchdog_millis_wraparound(void) {
+    // now wrapped past 0; small real elapsed must NOT falsely trip.
+    uint32_t hb = 0xFFFFFF00u;          // near uint32 max
+    uint32_t now = 0x00000100u;         // wrapped; real elapsed = 0x200 = 512ms
+    TEST_ASSERT_FALSE(watchdogShouldReboot(hb, now, 300000));
+    // ...but a genuine long stall across the wrap still trips.
+    TEST_ASSERT_TRUE(watchdogShouldReboot(hb, hb + 400000u, 300000));
+}
+
 // ── Test runner ─────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -246,6 +275,11 @@ int main(int argc, char** argv) {
     RUN_TEST(test_ota_update_available);
     RUN_TEST(test_ota_connect_fails);
     RUN_TEST(test_ota_no_firmware);
+
+    RUN_TEST(test_watchdog_not_started);
+    RUN_TEST(test_watchdog_fresh_heartbeat);
+    RUN_TEST(test_watchdog_stalled);
+    RUN_TEST(test_watchdog_millis_wraparound);
 
     return UNITY_END();
 }

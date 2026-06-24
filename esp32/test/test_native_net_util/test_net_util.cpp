@@ -50,6 +50,28 @@ public:
     void destroy(TlsHandle) override {}
 };
 
+// Link alive at first (accepts a prefix), then DIES mid-transfer: writeSome
+// returns 0 (would-block) forever after `aliveBytes`. This is exactly the field
+// scenario that bricked a unit — the cellular link dropped partway through an
+// upload and the (old, unbounded) write loop spun forever holding the SD mutex.
+class LinkDiesNetwork : public INetwork {
+public:
+    size_t aliveBytes;
+    size_t accepted = 0;
+    explicit LinkDiesNetwork(size_t alive) : aliveBytes(alive) {}
+    TlsHandle connect(const char*) override { return (TlsHandle)1; }
+    int writeSome(TlsHandle, const void*, size_t len) override {
+        if (accepted >= aliveBytes) return 0;            // link is dead now
+        size_t room = aliveBytes - accepted;
+        size_t n = (len < room) ? len : room;
+        accepted += n;
+        return (int)n;
+    }
+    bool write(TlsHandle c, const void* d, size_t l) override { return netWriteAll(this, c, d, l); }
+    int read(TlsHandle, void*, size_t) override { return 0; }
+    void destroy(TlsHandle) override {}
+};
+
 // Writes a few bytes, then errors (<0).
 class ErrorNetwork : public INetwork {
 public:
@@ -105,6 +127,23 @@ void test_custom_timeout_honored(void) {
     TEST_ASSERT_TRUE(elapsed < 30000);  // honored the short bound, didn't wait the default
 }
 
+void test_link_dies_mid_upload_is_bounded(void) {
+    // Regression for the 9-hour field brick: link accepts 100 KB of a larger
+    // upload, then dies. The OLD code spun forever here; netWriteAll must give up
+    // after the no-progress timeout instead of hanging (and holding the SD mutex).
+    LinkDiesNetwork net(100 * 1024);
+    static char big[300 * 1024];
+    uint32_t start = g_hal->clock->millis();
+    bool ok = netWriteAll(&net, (TlsHandle)1, big, sizeof(big));
+    TEST_ASSERT_FALSE(ok);
+    uint32_t elapsed = g_hal->clock->millis() - start;
+    // It made real progress (100 KB) then timed out ~30s after progress stopped —
+    // bounded, NOT a 9-hour spin.
+    TEST_ASSERT_EQUAL_UINT32(100u * 1024u, net.accepted);
+    TEST_ASSERT_TRUE(elapsed > 30000);
+    TEST_ASSERT_TRUE(elapsed < 35000);
+}
+
 void test_error_aborts_immediately(void) {
     ErrorNetwork net;
     char buf[64] = {0};
@@ -126,6 +165,7 @@ int main(int, char**) {
     RUN_TEST(test_single_call_full_buffer);
     RUN_TEST(test_dead_link_times_out);
     RUN_TEST(test_custom_timeout_honored);
+    RUN_TEST(test_link_dies_mid_upload_is_bounded);
     RUN_TEST(test_error_aborts_immediately);
     RUN_TEST(test_zero_length_is_noop_success);
     return UNITY_END();

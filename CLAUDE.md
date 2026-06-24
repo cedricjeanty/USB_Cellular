@@ -86,6 +86,43 @@ Magic files on **P1** (fallback path, accessible via USB MSC even when P2 FATFS 
 P1 magic files are checked by `check_p1_magic()` at boot after `sd_init()`. This breaks
 the catch-22 where P2 FATFS failure made ENABLE_CDC unreachable without physical SD removal.
 
+#### Unified command file (`airbridge.cmd`) — preferred over single-purpose magic files
+
+A single text file `airbridge.cmd` (on P1 — USB-visible — and also honored on P2) holds one
+directive per line. Unlike the legacy single-purpose files above, it **persists across boots**
+(re-applied every boot, not deleted) so it needn't be re-written each time — *unless* a
+directive carries the `once` modifier, which makes it one-shot (run once, then the firmware
+rewrites the file with that line removed; the file is deleted when nothing remains). `#`/`;`
+comments and blank lines are ignored; verbs are case-insensitive. Shared parse/rewrite logic
+lives in `esp32/include/airbridge_commands.h` (unit-tested in `test/test_native_commands`).
+
+| Directive | Effect | Lifetime / build gate |
+|-----------|--------|-----------------------|
+| `cdc` | Boot CDC+MSC persistently | persistent ⇒ honored only in `-DALLOW_CDC_PERSIST` builds (production stays MSC-only) |
+| `cdc once` | Boot CDC+MSC for one boot (= legacy `ENABLE_CDC`) | honored in **all** builds |
+| `dump_logs [once]` | Copy P2 `/sdcard/logs/*.log` + the `/sdcard/upload/NNNN/` backlog onto the USB-visible partition at `/diag/` (backlog flattened to `up_<NNNN>_<name>.log`) | all builds; read-only, non-destructive |
+| `reboot once` | Reboot | runtime-safe |
+| `format_sd once` | Set NVS format flag + reboot (full reformat) | boot-only |
+| `wifi <ssid> <pass>` | Save a WiFi network (NVS) | runtime-safe |
+| `s3 <api_host> <api_key>` | Save S3 creds (NVS) | runtime-safe |
+
+The file is processed at **boot** (`check_p1_magic()` for P1, the P2 magic block) **and during
+the 15s-quiet harvest cycle** (`doHarvest()`, after the P1 fresh-mount). Runtime-safe directives
+(`dump_logs`/`wifi`/`s3`/`reboot`) take effect at harvest **without a reboot** — drop the file,
+stop writing, wait ~15s, then **replug** the USB drive (no power-cycle) to read `/diag/`.
+Directives that need USB re-enumeration (`cdc`) or are destructive (`format_sd`) only apply at
+boot. `airbridge.cmd` and `diag/` are in the harvest skip-list so they aren't swept into
+`/harvested/`. The legacy single-purpose magic files above remain honored for backward
+compatibility (`scripts/hw_flash.sh`, the hardware E2E suite).
+
+**Example `airbridge.cmd`:**
+```
+# keep CDC serial up across reboots (E2E builds)
+cdc
+# dump the stored log backlog to the USB drive once, then forget it
+dump_logs once
+```
+
 ### NVS Namespaces
 
 | Namespace | Keys | Purpose |
@@ -105,7 +142,37 @@ the catch-22 where P2 FATFS failure made ENABLE_CDC unreachable without physical
 | modem | 16 KB | 0 | 2 | UART→PPPoS pump, reconnection, log upload |
 | upload | 16 KB | 1 | 1 | OTA check, S3 file upload |
 | harvest | 16 KB | 1 | 1 | SD file harvest from root to /harvested/ |
-| main_loop | 4 KB | 0 | 1 | Display, USB delay, modem watchdog |
+| main_loop | 4 KB | 0 | 1 | Display, USB delay, modem watchdog, heartbeat |
+| watchdog | 3 KB | 0 | 5 | No-progress reboot if main loop wedges |
+
+### No-Progress Watchdog
+
+`main_loop_task` stamps `g_mainLoopHeartbeat = millis()` at the top of every iteration.
+An independent high-priority `watchdog_task` (core 0, prio 5, takes **no contended locks**)
+reboots the device via `esp_restart()` if the heartbeat goes stale for `WATCHDOG_STALL_MS`
+(5 min) — i.e. the main loop hard-wedged. Decision logic is the unit-tested
+`watchdogShouldReboot()` (`airbridge_runtime.h`, handles millis() wraparound). The reboot is
+recorded in NVS (`dbg/wdt_reboots`, `dbg/wdt_stall_s`) — **not** via `airbridge_log` (the log
+mutex may be the wedged resource) — and surfaced on the next boot's `AirBridge fw=` banner as
+`WATCHDOG: previous boot force-rebooted after Ns stall`.
+
+**Why this exists:** a field unit (`9C139EF40188`) froze for **9 hours** on "Connecting…"
+after an OTA download failed mid-stream on a marginal link: the old firmware's unbounded
+`esp_tls` write loop spun on a dead link **holding the SD mutex**, wedging the main loop. It
+yielded every 5 ms, so idle tasks kept feeding the ESP task-WDT (`CONFIG_ESP_TASK_WDT_TIMEOUT_S=30`)
+and it never tripped. The `netWriteAll()` 30 s write timeout fixes that specific spin; this
+watchdog is the defense-in-depth net for any *other* wedge path (a 9-hour brick on an aircraft
+is unacceptable). See [[project_diagnostics_command_file]] history.
+
+### OTA Download Resume
+
+`otaDownloadAndFlash()` keeps the `esp_ota` handle across up to 4 attempts and **resumes** a
+dropped download with an HTTP `Range: bytes=<received>-` header (`buildRangeGetRequest()` in
+`airbridge_http.h`, unit-tested) instead of re-fetching the whole image — so a transient link
+hiccup mid-download no longer abandons the firmware (the cause of the unit staying on old fw).
+`esp_ota_write` is sequential, so continuing to write the next bytes resumes cleanly; accepts
+`200` (full) on attempt 0 and `206` (partial) on resume, and restarts cleanly if a server
+ignores `Range` and resends from 0.
 
 ### Modem Recovery
 
@@ -139,6 +206,12 @@ ATD*99#
   stale context where IPCP never completes (no IP assigned).
 - CFUN=0/1 is only for genuinely unresponsive modem (not responding to AT at any baud).
 - Carrier (T-Mobile/Hologram) terminates sessions every ~4-6 hours — this is normal.
+- **Signal metrics:** `modemRunInitPost()` reads `AT+CSQ` (RSSI 0-31) plus, before the PPP
+  dial, `AT+CESQ` (RSRP dBm / RSRQ dB, 3GPP indices converted) and `AT+CPSI?` (band + SINR,
+  best-effort parse). All in command mode (no `+++`), so no PPP disruption. Logged on the
+  `Modem: …` init line and the 60s `STATUS` line (`rsrp=`/`sinr=`). `MODEM_SIG_NA` (9999) =
+  unavailable. Parsing is in `airbridge_modem.h` (`parseCesq`/`parseCpsi`), unit-tested;
+  `sim_modem.h` simulates both for the emulator/tests.
 
 **Reconnect sequence** — both soft and hard paths send `+++` guard first (escapes PPP
 data mode — safe no-op if already in command mode):

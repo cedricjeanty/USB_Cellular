@@ -148,8 +148,9 @@ const char* const SKIP_NAMES[] = {
     "System Volume Information", "desktop.ini", "Thumbs.db",
     ".Spotlight-V100", ".Trashes", ".fseventsd", "upload", "logs",
     "airbridge.log", "dsuCookie.easdf",
-    "firmware.bin", "_firmware.bin", "ENABLE_CDC",
+    "firmware.bin", "_firmware.bin", "ENABLE_CDC", "CDC_PERSIST",
     "WIFI_CONFIG", "S3_CONFIG", "FORMAT_SD", "REBOOT",
+    "airbridge.cmd", "diag",
     "metrics", "downloadReport.txt",
     nullptr
 };

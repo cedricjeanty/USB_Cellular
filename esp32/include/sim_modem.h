@@ -33,6 +33,10 @@ public:
     // Configurable state
     int         rssi = 22;
     int         ber = 99;
+    int         rsrpIdx = 70;      // AT+CESQ rsrp index (0..97; 70 => -71 dBm); 255=N/A
+    int         rsrqIdx = 26;      // AT+CESQ rsrq index (0..34; 26 => -7 dB); 255=N/A
+    int         sinr = 12;         // AT+CPSI SINR in dB
+    const char* band = "EUTRAN-BAND4";  // AT+CPSI LTE band token
     int         regStat = 1;       // +CREG stat: 1=home, 5=roaming
     const char* operatorName = "SimCellular";
     bool        echoEnabled = true;
@@ -261,6 +265,22 @@ private:
         } else if (upper == "AT+CSQ") {
             char buf[32];
             snprintf(buf, sizeof(buf), "+CSQ: %d,%d", rssi, ber);
+            respond(buf);
+            respond("OK");
+        } else if (upper == "AT+CESQ") {
+            // LTE: rxlev/ber/rscp/ecno = 255 (n/a); rsrq/rsrp are the indices.
+            char buf[48];
+            snprintf(buf, sizeof(buf), "+CESQ: 99,99,255,255,%d,%d", rsrqIdx, rsrpIdx);
+            respond(buf);
+            respond("OK");
+        } else if (upper == "AT+CPSI?") {
+            // LTE info line ending in RSRQ,RSRP,RSSI,SINR (firmware reads band + SINR).
+            char buf[128];
+            int rsrpDbm = (rsrpIdx >= 0 && rsrpIdx <= 97) ? rsrpIdx - 141 : -999;
+            int rsrqDb  = (rsrqIdx >= 0 && rsrqIdx <= 34) ? (rsrqIdx / 2) - 20 : -999;
+            snprintf(buf, sizeof(buf),
+                     "+CPSI: LTE,Online,310-260,0x1234,12345678,256,%s,5110,5,5,%d,%d,-65,%d",
+                     band, rsrqDb, rsrpDbm, sinr);
             respond(buf);
             respond("OK");
         } else if (upper == "AT+COPS?") {

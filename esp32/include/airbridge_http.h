@@ -94,6 +94,25 @@ inline std::string buildApiRequestRaw(const char* host, const char* apiKey, cons
     return std::string(req);
 }
 
+// Build a GET request for a (possibly presigned) URL path, optionally resuming
+// from `startByte` via an HTTP Range header. startByte==0 → plain full GET.
+// Used by the OTA downloader to resume after a mid-stream link drop instead of
+// re-fetching the whole firmware image. (S3 presigned GETs honor Range.)
+inline std::string buildRangeGetRequest(const char* host, const char* path,
+                                        uint32_t startByte) {
+    char req[3200];
+    if (startByte > 0) {
+        snprintf(req, sizeof(req),
+            "GET %s HTTP/1.1\r\nHost: %s\r\nRange: bytes=%lu-\r\nConnection: close\r\n\r\n",
+            path, host, (unsigned long)startByte);
+    } else {
+        snprintf(req, sizeof(req),
+            "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
+            path, host);
+    }
+    return std::string(req);
+}
+
 inline std::string s3ApiGetPathViaHal(const char* host, const char* apiKey, const char* path) {
     if (!g_hal || !g_hal->network) return "";
     TlsHandle tls = g_hal->network->connect(host);

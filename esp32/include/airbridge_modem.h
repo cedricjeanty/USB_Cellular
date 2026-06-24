@@ -7,8 +7,13 @@
 #include "airbridge_utils.h"
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <ctime>
 #include <string>
+
+// Sentinel for "metric not available" in ModemInitResult signal fields (RSRP/
+// RSRQ/SINR are negative-ish dBm/dB, so a large positive value is unambiguous).
+static const int MODEM_SIG_NA = 9999;
 
 // Forward declarations — these are defined in main.cpp for ESP32,
 // or must be provided by the emulator.
@@ -174,9 +179,64 @@ struct ModemInitResult {
     bool registered;       // Network registration succeeded
     bool connected;        // PPP CONNECT received
     int  rssi;             // Signal quality (0-31, 99=unknown)
+    int  rsrp;             // LTE RSRP in dBm (MODEM_SIG_NA if unavailable)
+    int  rsrq;             // LTE RSRQ in dB  (MODEM_SIG_NA if unavailable)
+    int  sinr;             // LTE SINR in dB  (MODEM_SIG_NA if unavailable)
+    char band[16];         // LTE band token from CPSI (e.g. "EUTRAN-BAND4")
     char operatorName[32]; // Network operator
     uint32_t epoch;        // UTC epoch from AT+CCLK (0 if unavailable)
 };
+
+// Parse an AT+CESQ response: "+CESQ: rxlev,ber,rscp,ecno,rsrq,rsrp".
+// For LTE only rsrq/rsrp are valid (others 255). Converts the 3GPP indices to
+// dBm/dB: RSRP = idx-141 (idx 0..97), RSRQ = idx/2-20 (idx 0..34); 255 => N/A.
+inline void parseCesq(const char* resp, int* rsrpOut, int* rsrqOut) {
+    int rsrp = MODEM_SIG_NA, rsrq = MODEM_SIG_NA;
+    const char* p = resp ? strstr(resp, "+CESQ:") : nullptr;
+    if (p) {
+        int rxlev, ber, rscp, ecno, rq, rp;
+        if (sscanf(p, "+CESQ: %d,%d,%d,%d,%d,%d",
+                   &rxlev, &ber, &rscp, &ecno, &rq, &rp) == 6) {
+            if (rp >= 0 && rp <= 97) rsrp = rp - 141;
+            if (rq >= 0 && rq <= 34) rsrq = (rq / 2) - 20;
+        }
+    }
+    if (rsrpOut) *rsrpOut = rsrp;
+    if (rsrqOut) *rsrqOut = rsrq;
+}
+
+// Parse an AT+CPSI? LTE response (best-effort — field order varies by SIM7600
+// firmware). Pulls the band token (the comma-field containing "BAND") and SINR
+// (the last integer field on the line). Leaves band empty / SINR=N/A if absent.
+inline void parseCpsi(const char* resp, char* band, size_t bandSz, int* sinrOut) {
+    if (band && bandSz) band[0] = '\0';
+    int sinr = MODEM_SIG_NA;
+    const char* p = resp ? strstr(resp, "+CPSI:") : nullptr;
+    if (!p) { if (sinrOut) *sinrOut = sinr; return; }
+
+    char line[256];
+    strlcpy(line, p, sizeof(line));
+    char* nl = strpbrk(line, "\r\n");
+    if (nl) *nl = '\0';
+
+    char* fields[24]; int nf = 0;
+    char* save = nullptr;
+    for (char* t = strtok_r(line, ",", &save); t && nf < 24;
+         t = strtok_r(nullptr, ",", &save)) {
+        while (*t == ' ') t++;       // trim leading spaces
+        fields[nf++] = t;
+    }
+    if (band && bandSz) {
+        for (int i = 0; i < nf; i++)
+            if (strstr(fields[i], "BAND")) { strlcpy(band, fields[i], bandSz); break; }
+    }
+    for (int i = nf - 1; i >= 0; i--) {
+        char* end = nullptr;
+        long v = strtol(fields[i], &end, 10);
+        if (end != fields[i] && *end == '\0') { sinr = (int)v; break; }
+    }
+    if (sinrOut) *sinrOut = sinr;
+}
 
 // Attempt AT sync at 115200. Returns true if modem responds to AT.
 inline bool modemAtSync() {
@@ -284,6 +344,16 @@ inline void modemRunInitPost(ModemInitResult& r) {
         if (p) sscanf(p, "+CSQ: %d", &r.rssi);
         else r.rssi = 99;
     }
+
+    // Read richer LTE signal quality — RSRP/RSRQ (CESQ) + band/SINR (CPSI).
+    // Both run in AT command mode before the PPP dial, so no +++ escape is
+    // needed. Best-effort: fields stay MODEM_SIG_NA / empty if unsupported.
+    r.rsrp = r.rsrq = r.sinr = MODEM_SIG_NA;
+    r.band[0] = '\0';
+    if (modem_at_cmd("AT+CESQ", resp, sizeof(resp), 2000) > 0)
+        parseCesq(resp, &r.rsrp, &r.rsrq);
+    if (modem_at_cmd("AT+CPSI?", resp, sizeof(resp), 2000) > 0)
+        parseCpsi(resp, r.band, sizeof(r.band), &r.sinr);
 
     // Read operator
     if (modem_at_cmd("AT+COPS?", resp, sizeof(resp), 2000) > 0) {

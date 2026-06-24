@@ -101,6 +101,64 @@ void test_full_init(void) {
     TEST_ASSERT_EQUAL_INT(18, r.rssi);
     TEST_ASSERT_EQUAL_STRING("TestNet", r.operatorName);
     TEST_ASSERT_TRUE(r.epoch > 0);  // SimModem returns real UTC time
+    // Richer LTE metrics from SimModem defaults (rsrpIdx=70, rsrqIdx=26, sinr=12).
+    TEST_ASSERT_EQUAL_INT(70 - 141, r.rsrp);     // -71 dBm
+    TEST_ASSERT_EQUAL_INT((26 / 2) - 20, r.rsrq); // -7 dB
+    TEST_ASSERT_EQUAL_INT(12, r.sinr);
+    TEST_ASSERT_EQUAL_STRING("EUTRAN-BAND4", r.band);
+}
+
+void test_init_signal_metrics_custom(void) {
+    s_modem->rsrpIdx = 30;   // -111 dBm (weak)
+    s_modem->rsrqIdx = 10;   // -15 dB
+    s_modem->sinr    = -2;
+    s_modem->band    = "EUTRAN-BAND12";
+
+    modemAtSync();
+    ModemInitResult r = modemRunInit();
+    TEST_ASSERT_EQUAL_INT(30 - 141, r.rsrp);      // -111 dBm
+    TEST_ASSERT_EQUAL_INT((10 / 2) - 20, r.rsrq); // -15 dB
+    TEST_ASSERT_EQUAL_INT(-2, r.sinr);
+    TEST_ASSERT_EQUAL_STRING("EUTRAN-BAND12", r.band);
+}
+
+// Pure parser tests (no modem needed).
+void test_parse_cesq_valid(void) {
+    int rsrp = 0, rsrq = 0;
+    parseCesq("\r\n+CESQ: 99,99,255,255,26,70\r\n\r\nOK\r\n", &rsrp, &rsrq);
+    TEST_ASSERT_EQUAL_INT(-71, rsrp);
+    TEST_ASSERT_EQUAL_INT(-7, rsrq);
+}
+
+void test_parse_cesq_unavailable(void) {
+    int rsrp = 0, rsrq = 0;
+    parseCesq("+CESQ: 99,99,255,255,255,255", &rsrp, &rsrq);
+    TEST_ASSERT_EQUAL_INT(MODEM_SIG_NA, rsrp);
+    TEST_ASSERT_EQUAL_INT(MODEM_SIG_NA, rsrq);
+}
+
+void test_parse_cesq_malformed(void) {
+    int rsrp = 0, rsrq = 0;
+    parseCesq("garbage response OK", &rsrp, &rsrq);
+    TEST_ASSERT_EQUAL_INT(MODEM_SIG_NA, rsrp);
+    TEST_ASSERT_EQUAL_INT(MODEM_SIG_NA, rsrq);
+}
+
+void test_parse_cpsi_band_and_sinr(void) {
+    char band[16] = "";
+    int sinr = 0;
+    parseCpsi("+CPSI: LTE,Online,310-260,0x1234,12345678,256,"
+              "EUTRAN-BAND4,5110,5,5,-7,-71,-65,14\r\nOK", band, sizeof(band), &sinr);
+    TEST_ASSERT_EQUAL_STRING("EUTRAN-BAND4", band);
+    TEST_ASSERT_EQUAL_INT(14, sinr);
+}
+
+void test_parse_cpsi_absent(void) {
+    char band[16] = "x";
+    int sinr = 123;
+    parseCpsi("NO SERVICE", band, sizeof(band), &sinr);
+    TEST_ASSERT_EQUAL_STRING("", band);
+    TEST_ASSERT_EQUAL_INT(MODEM_SIG_NA, sinr);
 }
 
 void test_init_no_registration(void) {
@@ -217,6 +275,12 @@ int main(int argc, char** argv) {
     RUN_TEST(test_init_weak_signal);
     RUN_TEST(test_init_different_operator);
     RUN_TEST(test_init_time_sync);
+    RUN_TEST(test_init_signal_metrics_custom);
+    RUN_TEST(test_parse_cesq_valid);
+    RUN_TEST(test_parse_cesq_unavailable);
+    RUN_TEST(test_parse_cesq_malformed);
+    RUN_TEST(test_parse_cpsi_band_and_sinr);
+    RUN_TEST(test_parse_cpsi_absent);
 
     // Reconnect
     RUN_TEST(test_reconnect_sets_apn);

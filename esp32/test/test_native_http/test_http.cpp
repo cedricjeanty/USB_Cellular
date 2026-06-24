@@ -78,6 +78,19 @@ void test_buildApiCompleteRequest(void) {
     TEST_ASSERT_TRUE(req.find("\"key\":\"s3/key/path\"") != std::string::npos);
 }
 
+void test_buildRangeGetRequest_full(void) {
+    std::string req = buildRangeGetRequest("s3.amazonaws.com", "/bucket/fw.bin?sig=abc", 0);
+    TEST_ASSERT_TRUE(req.find("GET /bucket/fw.bin?sig=abc HTTP/1.1") != std::string::npos);
+    TEST_ASSERT_TRUE(req.find("Host: s3.amazonaws.com") != std::string::npos);
+    TEST_ASSERT_TRUE(req.find("Range:") == std::string::npos);  // no Range on a full GET
+}
+
+void test_buildRangeGetRequest_resume(void) {
+    std::string req = buildRangeGetRequest("s3.amazonaws.com", "/bucket/fw.bin?sig=abc", 574013);
+    TEST_ASSERT_TRUE(req.find("GET /bucket/fw.bin?sig=abc HTTP/1.1") != std::string::npos);
+    TEST_ASSERT_TRUE(req.find("Range: bytes=574013-") != std::string::npos);  // resume from the drop point
+}
+
 // ── s3ApiGetViaHal tests ────────────────────────────────────────────────────
 
 void test_s3ApiGet_success(void) {
@@ -133,6 +146,8 @@ int main(int argc, char** argv) {
     // Request building
     RUN_TEST(test_buildApiGetRequest);
     RUN_TEST(test_buildApiCompleteRequest);
+    RUN_TEST(test_buildRangeGetRequest_full);
+    RUN_TEST(test_buildRangeGetRequest_resume);
 
     // S3 API via HAL
     RUN_TEST(test_s3ApiGet_success);

@@ -21,6 +21,19 @@ struct OtaCheckResult {
     char downloadUrl[2500]; // presigned download URL
 };
 
+// ── No-progress watchdog ────────────────────────────────────────────────────
+// The main loop stamps a heartbeat every iteration. An independent watchdog task
+// (which takes no contended locks) reboots the device if the heartbeat goes stale
+// — i.e. the main loop wedged. This catches the hard-hang class that bricked a
+// field unit for 9 hours (a task spun holding the SD/log mutex; idle tasks kept
+// feeding the ESP task-WDT, so it never tripped). Unsigned subtraction tolerates
+// millis() wraparound. lastHeartbeatMs==0 means "not started yet" → never reboot.
+inline bool watchdogShouldReboot(uint32_t lastHeartbeatMs, uint32_t nowMs,
+                                 uint32_t stallMs) {
+    if (lastHeartbeatMs == 0) return false;
+    return (uint32_t)(nowMs - lastHeartbeatMs) > stallMs;
+}
+
 // Check for OTA firmware update via the S3 API.
 // Does NOT download or flash — just checks version and gets URL.
 inline OtaCheckResult halOtaCheck(const char* currentVersion) {
