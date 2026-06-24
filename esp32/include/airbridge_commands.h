@@ -181,7 +181,9 @@ inline bool cmdCopyFile(const char* src, const char* dst) {
     if (!sf) return false;
     void* df = g_hal->filesys->open(dst, "wb");
     if (!df) { g_hal->filesys->close(sf); return false; }
-    uint8_t cpbuf[4096];
+    // 1KB chunk (not 4KB): this can run in app_main on the small main task stack
+    // (CONFIG_ESP_MAIN_TASK_STACK_SIZE=3584) when dump_logs is processed at boot.
+    uint8_t cpbuf[1024];
     bool ok = true;
     for (;;) {
         size_t r = g_hal->filesys->read(sf, cpbuf, sizeof(cpbuf));

@@ -1041,11 +1041,16 @@ struct CmdRunResult { bool ran; bool reboot; bool format; };
 
 static CmdRunResult run_command_file(const char* cmdPath, const char* diagDir,
                                      bool runtimeOnly) {
+    // These buffers are STATIC, not on the stack: this runs in app_main on the
+    // small main task (CONFIG_ESP_MAIN_TASK_STACK_SIZE=3584) via check_p1_magic,
+    // and ~4.5KB of stack arrays here overflowed it and hung the boot. Safe as
+    // static — check_p1_magic finishes before any task starts, and the harvest
+    // task (the only other caller) never overlaps it.
+    static char text[2048];
+    static Command cmds[16];
     CmdRunResult res = {};
-    char text[2048];
     if (!cmdReadFile(cmdPath, text, sizeof(text))) return res;
 
-    Command cmds[16];
     int n = parseCommands(text, cmds, 16);
     bool anyConsumed = false;
     for (int i = 0; i < n; i++) {
@@ -1090,7 +1095,7 @@ static CmdRunResult run_command_file(const char* cmdPath, const char* diagDir,
 
     // Strip executed `once` directives; delete the file if nothing remains.
     if (anyConsumed) {
-        char out[2048];
+        static char out[2048];   // static: keep off the small main-task stack
         if (emitPersistent(text, runtimeOnly, out, sizeof(out)))
             cmdWriteFile(cmdPath, out);
         else if (g_hal && g_hal->filesys)
