@@ -561,6 +561,7 @@ static volatile uint32_t g_mainLoopHeartbeat = 0;
 // The modem task registers then loops sampling RSSI/RSRP/RSRQ/SINR (never dials
 // PPP), so AT polling never collides with an upload. Read live over CDC serial.
 static volatile bool     g_surveyMode = false;
+static volatile int      g_surveyBand = 0;   // 0=no change, -1=restore auto, >0=lock LTE band N
 #define SURVEY_INTERVAL_MS 2000
 
 // ── CDC CLI ─────────────────────────────────────────────────────────────────
@@ -1081,11 +1082,20 @@ static CmdRunResult run_command_file(const char* cmdPath, const char* diagDir,
             }
             case CMD_REBOOT:    res.reboot = true; break;
             case CMD_FORMAT_SD: res.format = true; break;
-            case CMD_SURVEY:
+            case CMD_SURVEY: {
                 g_surveyMode = true;
-                airbridge_log("CMD: survey — antenna signal-survey mode (no PPP/upload)");
+                // Optional "band=N" (lock LTE band N for apples-to-apples antenna
+                // tests) or "band=auto" (restore auto — band lock persists in modem
+                // NVS, so this MUST be run before returning the unit to service).
+                const char* b = strstr(c.args, "band=");
+                if (b) {
+                    b += 5;
+                    g_surveyBand = (strncmp(b, "auto", 4) == 0) ? -1 : atoi(b);
+                }
+                airbridge_log("CMD: survey — signal-survey mode (no PPP), band=%d", g_surveyBand);
                 disp("Survey mode", "measuring signal");
                 break;
+            }
             case CMD_WIFI: { CliResult r = cliSetWifi(c.args); airbridge_log("CMD: %s", r.output); break; }
             case CMD_S3:   { CliResult r = cliSetS3(c.args);   airbridge_log("CMD: %s", r.output); break; }
             default:       airbridge_log("CMD: unknown directive '%s'", c.verb); break;
@@ -2548,6 +2558,34 @@ static void modemTask(void* param) {
     // polling was removed). Swap antennas and watch the SURVEY lines live over
     // CDC serial. Triggered by the `survey` airbridge.cmd directive.
     if (g_surveyMode) {
+        // Optional band lock so antennas are compared on identical RF (the modem's
+        // own band/cell reselection swings RSRP 10+ dB and otherwise swamps any
+        // antenna difference). CNMP/CNBP persist in modem NVS — `band=auto` restores.
+        // Self-verifying: we log the modem's CNBP format + the per-sample band so a
+        // wrong mask is obvious. Bands <=32 only (mask = 1<<(N-1)).
+        if (g_surveyBand != 0) {
+            char r[512];
+            modem_at_cmd("AT+CNBP=?", r, sizeof(r), 3000);
+            for (char* p = r; *p; p++) if (*p == '\r' || *p == '\n') *p = ' ';
+            log_write("SURVEY: CNBP format = %s", r);
+            if (g_surveyBand < 0) {
+                modem_at_cmd("AT+CNMP=2", r, sizeof(r), 5000);          // auto mode
+                modem_at_cmd("AT+CNBP=0xFFFFFFFFFFFFFFFF,0xFFFFFFFFFFFFFFFF", r, sizeof(r), 5000);
+                log_write("SURVEY: band lock CLEARED (auto)");
+            } else {
+                modem_at_cmd("AT+CNMP=38", r, sizeof(r), 5000);         // LTE only
+                char cmd[80];
+                uint32_t lo = (g_surveyBand <= 32) ? (1u << (g_surveyBand - 1)) : 0;
+                snprintf(cmd, sizeof(cmd), "AT+CNBP=0xFFFFFFFFFFFFFFFF,0x00000000%08lX",
+                         (unsigned long)lo);
+                int rc = modem_at_cmd(cmd, r, sizeof(r), 5000);
+                for (char* p = r; *p; p++) if (*p == '\r' || *p == '\n') *p = ' ';
+                log_write("SURVEY: lock LTE band %d via %s -> %s", g_surveyBand, cmd,
+                          (rc > 0 ? r : "(no resp)"));
+            }
+            g_hal->clock->delay_ms(8000);   // let it re-register on the (un)locked band
+        }
+
         ModemInitResult sr = {};
         modemRegisterAndReadSignal(sr);
         g_modemReady = true;

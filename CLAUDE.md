@@ -167,6 +167,16 @@ dBm at the same spot). Remove `survey` from `airbridge.cmd` to return to normal 
 `modemRegisterAndReadSignal()` is shared with `modemRunInitPost()`; `modemSurveySample()` is
 unit-tested against `sim_modem.h`.
 
+**Band lock (essential for valid comparisons).** The modem freely reselects band/cell, swinging
+RSRP 10+ dB and swamping antenna differences — a real gotcha here: an antenna looked "13 dB
+better" only because the modem camped on Verizon Band 5 vs Band 4; locked to the same band all
+four antennas read within ~3 dB. Use `survey band=N` to lock LTE band N (`AT+CNMP=38` LTE-only +
+`AT+CNBP=0xFFFFFFFFFFFFFFFF,0x<1<<(N-1)>`) so every antenna sees identical RF. Verified on
+hardware (`band=5` forces Band 5, `band=4` forces Band 4). **`AT+CNMP`/`AT+CNBP` persist in the
+MODEM's NVS** (survive reboot/reflash) — you MUST run `survey band=auto` to restore auto-band
+before a unit returns to service. (`AT+CNBP=?` returns ERROR on this SIM7600 firmware — harmless;
+the 2-arg set form works.) `scripts/antenna_survey.py` summarizes per antenna.
+
 ### Button-free flash / recovery (`scripts/jtag_flash.py`)
 
 Normal button-free flashing is the 1200-baud touch on CDC (`docs/deployment.md`) — but that
