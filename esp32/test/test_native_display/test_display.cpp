@@ -124,8 +124,8 @@ void test_updateDisplay_no_network(void) {
 void test_updateDisplay_cellular_connected(void) {
     DisplayState ds = make_default_state();
     ds.pppConnected = true;
-    // Bars now reflect link bandwidth (% of peak), not RSSI. At-peak + fresh → 4 bars.
-    ds.linkKBps = 100.0f; ds.linkMaxKBps = 100.0f; ds.linkAgeMs = 1000;
+    // Bars now reflect link bandwidth (% of the 150 KB/s ceiling), not RSSI.
+    ds.linkKBps = 150.0f; ds.linkAgeMs = 1000;   // at ceiling + fresh → 4 bars
     strlcpy(ds.modemOp, "T-Mobile", sizeof(ds.modemOp));
     ds.mbQueued = 100.0f;
     ds.mbUploaded = 50.0f;
@@ -152,6 +152,27 @@ void test_link_quality_bars(void) {
     // Not calibrated yet (no peak): alive→1, nothing→0.
     TEST_ASSERT_EQUAL_INT(1, linkQualityBars(5, 0, 1000));
     TEST_ASSERT_EQUAL_INT(0, linkQualityBars(0, 0, 1000));
+}
+
+void test_link_window_peak_hold(void) {
+    LinkWindow w = {};
+    // A burst hits 120 KB/s at t=1000; small samples follow. The windowed max
+    // holds the 120 peak for the whole window (stable bars), not the last value.
+    linkWindowAdd(w, 1000, 120);
+    linkWindowAdd(w, 3000, 20);
+    linkWindowAdd(w, 5000, 15);
+    TEST_ASSERT_EQUAL_FLOAT(120.0f, linkWindowMax(w, 5000, 60000));   // peak held
+    // 60s after the peak it has aged out; only the recent low samples remain.
+    TEST_ASSERT_EQUAL_FLOAT(20.0f, linkWindowMax(w, 62000, 60000));
+    // Long after everything: nothing in window → 0.
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, linkWindowMax(w, 200000, 60000));
+}
+
+void test_link_window_ring_wrap(void) {
+    LinkWindow w = {};
+    // Overfill past CAP=16; the peak must still be found among the kept samples.
+    for (int i = 0; i < 30; i++) linkWindowAdd(w, 1000 + i, (float)(i));   // last 16: 14..29
+    TEST_ASSERT_EQUAL_FLOAT(29.0f, linkWindowMax(w, 1030, 60000));
 }
 
 void test_updateDisplay_wifi_connected(void) {
@@ -213,10 +234,10 @@ void test_updateDisplay_modem_connecting(void) {
 void test_updateDisplay_no_signal(void) {
     DisplayState ds = make_default_state();
     ds.pppConnected = true;
-    ds.modemRssi = 0;  // PPP up but no signal
+    // PPP claims up but no successful transfer recently (stale) → 0 quality bars.
+    ds.linkKBps = 0; ds.linkAgeMs = 200000;
 
     updateDisplay(ds);
-    // Should show "No Signal", 0 bars
     // Verify no signal bar pixels (bar positions start at x=108)
     TEST_ASSERT_FALSE(s_display.pixel_at(108, 6)); // bar 0 not drawn
 }
@@ -279,6 +300,8 @@ int main(int argc, char** argv) {
     RUN_TEST(test_updateDisplay_no_network);
     RUN_TEST(test_updateDisplay_cellular_connected);
     RUN_TEST(test_link_quality_bars);
+    RUN_TEST(test_link_window_peak_hold);
+    RUN_TEST(test_link_window_ring_wrap);
     RUN_TEST(test_updateDisplay_wifi_connected);
     RUN_TEST(test_updateDisplay_progress_bar_half);
     RUN_TEST(test_updateDisplay_eta_shown);

@@ -377,16 +377,16 @@ static float    g_uploadKBps     = 0.0f; // live upload speed for display
 // Connection quality from the data path (no AT/+++ needed). Bandwidth is set by
 // real file/OTA transfers; the 60s log upload refreshes g_linkOkMs as a liveness
 // heartbeat. Drives the OLED quality bars (replaces RSSI bars) + STATUS line.
-static float    g_linkKBps       = 0.0f;
-static float    g_linkMaxKBps    = 0.0f; // best throughput seen (auto-calibrating peak)
+static LinkWindow g_linkWindow   = {};   // recent throughput samples (peak-held for the bars)
 static uint32_t g_linkOkMs       = 0;    // millis() of last successful transfer (any size)
+#define LINK_WINDOW_MS 60000             // hold the peak throughput over the last ~minute
 static inline void noteLinkTransfer(uint32_t bytes, float kBps) {
     g_linkOkMs = millis();                                   // liveness for any success
-    if (bytes >= 4096 && kBps > 0) {                         // bandwidth only from meaningful xfers
-        g_linkKBps = kBps;
-        if (kBps > g_linkMaxKBps) g_linkMaxKBps = kBps;      // grow the peak (bars = % of this)
-    }
+    if (bytes >= 1024 && kBps > 0)                           // usable bandwidth sample
+        linkWindowAdd(g_linkWindow, g_linkOkMs, kBps);
 }
+// Windowed-peak throughput (KB/s) for the display + STATUS line.
+static inline float linkKBpsNow() { return linkWindowMax(g_linkWindow, millis(), LINK_WINDOW_MS); }
 static uint32_t g_lastDisplayMs  = 0;
 static uint32_t g_lastHarvestMs  = 0;
 static uint32_t g_harvestCoolMs  = 30000;
@@ -1299,8 +1299,7 @@ static void doUpdateDisplay() {
     g_displayState.uploadingMb   = g_uploadingMb;
     g_displayState.usbWriteKBps  = g_usbWriteKBps;
     g_displayState.uploadKBps    = g_uploadKBps;
-    g_displayState.linkKBps      = g_linkKBps;
-    g_displayState.linkMaxKBps   = g_linkMaxKBps;
+    g_displayState.linkKBps      = linkKBpsNow();
     g_displayState.linkAgeMs     = g_linkOkMs ? (millis() - g_linkOkMs) : 0xFFFFFFFFu;
     updateDisplay(g_displayState);
 }
@@ -3806,7 +3805,7 @@ static void main_loop_task(void* param) {
                     FW_VERSION, g_deviceId,
                     g_pppConnected ? "ppp" : (g_netConnected ? "wifi" : "none"),
                     g_modemRssi, g_modemRsrp, g_modemSinr,
-                    g_linkKBps, (unsigned long)(g_linkOkMs ? (now - g_linkOkMs) / 1000 : 0),
+                    linkKBpsNow(), (unsigned long)(g_linkOkMs ? (now - g_linkOkMs) / 1000 : 0),
                     g_filesQueued, g_filesUploaded,
                     g_mbQueued, g_mbUploaded,
                     (unsigned long)esp_get_free_heap_size());

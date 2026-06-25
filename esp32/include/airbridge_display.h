@@ -12,8 +12,7 @@ struct DisplayState {
     bool     netConnected;
     bool     modemReady;
     int      modemRssi;
-    float    linkKBps;      // effective link throughput (bandwidth) — connection-quality signal
-    float    linkMaxKBps;   // best throughput seen (auto-calibrating peak); bars = % of this
+    float    linkKBps;      // windowed-peak throughput (KB/s) — connection-quality signal
     uint32_t linkAgeMs;     // ms since the last successful transfer (liveness)
     char     modemOp[32];
     char     wifiLabel[22];
@@ -30,24 +29,52 @@ struct DisplayState {
     char     otaVersion[20];
 };
 
-// Connection-quality bars (0-4) from effective link throughput, as a PERCENT of
-// the best bandwidth this unit has achieved (maxKBps, an auto-calibrating peak).
-// Relative (not absolute) so it self-adapts to the hardware ceiling — the UART-
-// capped prototype (~14 KB/s) and the 3 Mbaud PCB (~167 KB/s) both reach 4 bars
-// at their own best. Bars are quartiles: ~25/50/75/100% of peak.
-// We can't read RSSI without escaping PPP (disrupts data), so quality comes from
-// the data path itself: bandwidth from real file/OTA transfers, with the 60s log
-// upload keeping `ageMs` fresh as a liveness heartbeat. Stale (no success in >2
-// log cycles) => 0 bars even if PPP claims up; alive but slow/uncalibrated => 1.
+// Effective link-throughput ceiling (KB/s). The 3 Mbaud + HW-flow-control UART to
+// the modem caps practical TLS upload throughput at ~150 KB/s, so the quality bars
+// are scaled to that fixed maximum (not an auto-peak).
+#define LINK_MAX_KBPS 150.0f
+
+// Peak-hold over a sliding window: the displayed throughput is the MAX seen in the
+// last windowMs. Bandwidth jitters every transfer; holding the recent peak makes
+// the quality bars read like a steady signal meter (snap up to peaks, decay slowly
+// only when nothing better arrives) even though the underlying metric is bandwidth.
+// Pure (nowMs passed in) so it's unit-testable. Iterating 0..count-1 covers every
+// stored slot (the ring fills 0..CAP-1 before wrapping).
+struct LinkWindow {
+    static const int CAP = 16;
+    uint32_t ms[CAP];
+    float    kBps[CAP];
+    uint8_t  count;
+    uint8_t  head;
+};
+inline void linkWindowAdd(LinkWindow& w, uint32_t nowMs, float kBps) {
+    w.ms[w.head] = nowMs;
+    w.kBps[w.head] = kBps;
+    w.head = (uint8_t)((w.head + 1) % LinkWindow::CAP);
+    if (w.count < LinkWindow::CAP) w.count++;
+}
+inline float linkWindowMax(const LinkWindow& w, uint32_t nowMs, uint32_t windowMs) {
+    float mx = 0;
+    for (int i = 0; i < w.count; i++)
+        if ((uint32_t)(nowMs - w.ms[i]) <= windowMs && w.kBps[i] > mx) mx = w.kBps[i];
+    return mx;
+}
+
+// Connection-quality bars (0-4) from windowed-peak throughput as a PERCENT of the
+// fixed LINK_MAX_KBPS ceiling, at quartiles ~25/50/75/100%. Quality comes from the
+// data path (no RSSI/+++ which would disrupt PPP): bandwidth from real file/OTA
+// transfers, with the 60s log upload keeping `ageMs` fresh as a liveness heartbeat.
+// Stale (no success in >2 log cycles) => 0 bars even if PPP claims up; alive but no
+// recent bandwidth sample => 1 bar.
 inline int linkQualityBars(float kBps, float maxKBps, uint32_t ageMs) {
     if (ageMs > 150000) return 0;                  // no recent successful transfer
-    if (maxKBps < 1.0f) return kBps > 0 ? 1 : 0;   // not calibrated yet
-    float pct = kBps / maxKBps;                    // fraction of best-ever throughput
+    if (maxKBps < 1.0f) return kBps > 0 ? 1 : 0;
+    float pct = kBps / maxKBps;
     if (pct >= 0.95f) return 4;                    // ~100%
     if (pct >= 0.70f) return 3;                    // ~75%
     if (pct >= 0.45f) return 2;                    // ~50%
     if (pct >= 0.20f) return 1;                    // ~25%
-    return 1;                                      // alive but below 25% of peak
+    return 1;                                      // alive but below 25% of ceiling
 }
 
 // Render the main operational display
@@ -63,7 +90,7 @@ inline void updateDisplay(DisplayState& ds) {
             // can't be read mid-PPP without disrupting the data stream).
             if (ds.modemOp[0]) strlcpy(label, ds.modemOp, sizeof(label));
             else               strlcpy(label, "Cellular", sizeof(label));
-            bars = linkQualityBars(ds.linkKBps, ds.linkMaxKBps, ds.linkAgeMs);
+            bars = linkQualityBars(ds.linkKBps, LINK_MAX_KBPS, ds.linkAgeMs);
         } else if (ds.netConnected) {
             strlcpy(label, ds.wifiLabel, sizeof(label));
             bars = ds.wifiBars;
