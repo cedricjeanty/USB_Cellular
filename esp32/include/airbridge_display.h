@@ -65,15 +65,20 @@ inline float linkWindowMin(const LinkWindow& w, uint32_t nowMs, uint32_t windowM
 // (good signal => low RTT). The 60s log upload gives a fresh latency sample every
 // minute with no extra traffic; `rttMs` is the windowed MIN (best recent) so the
 // bars read like a steady signal meter. `ageMs` = time since the last successful
-// request; stale (>3 missed cycles) or no sample => 0 bars. Thresholds include
-// server processing time (the log POST hits a Lambda); may need field tuning.
+// request; stale (>3 missed cycles) or no sample => 0 bars.
+//
+// Thresholds CALIBRATED from field logs: the log POST and presign/manifest all hit
+// API Gateway + Lambda, so server processing dominates the floor — round-trips run
+// ~1-3s (typ. ~2s) even on a strong link (RSSI 20). So this metric is best at
+// flagging DEGRADATION (>4s = link struggling), not distinguishing great-vs-good
+// (both ~1-2s). The windowed MIN excludes Lambda cold-start spikes.
 inline int linkQualityBarsLatency(float rttMs, uint32_t ageMs) {
     if (ageMs > 200000 || rttMs < 0) return 0;     // no recent successful request
-    if (rttMs < 500)  return 4;                    // excellent
-    if (rttMs < 1000) return 3;                    // good
-    if (rttMs < 2000) return 2;                    // fair
-    if (rttMs < 5000) return 1;                    // poor
-    return 0;                                       // very poor
+    if (rttMs < 2000)  return 4;                   // excellent (~floor: strong link)
+    if (rttMs < 4000)  return 3;                   // good
+    if (rttMs < 7000)  return 2;                   // fair
+    if (rttMs < 15000) return 1;                   // poor — link struggling
+    return 0;                                       // very poor / near-timeout
 }
 
 // Render the main operational display

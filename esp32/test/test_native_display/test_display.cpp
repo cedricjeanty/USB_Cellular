@@ -138,14 +138,15 @@ void test_updateDisplay_cellular_connected(void) {
 }
 
 void test_link_quality_bars_latency(void) {
-    // Lower RTT = better. Thresholds 500/1000/2000/5000 ms.
-    TEST_ASSERT_EQUAL_INT(4, linkQualityBarsLatency(200,  1000));  // excellent
-    TEST_ASSERT_EQUAL_INT(3, linkQualityBarsLatency(800,  1000));  // good
-    TEST_ASSERT_EQUAL_INT(2, linkQualityBarsLatency(1500, 1000));  // fair
-    TEST_ASSERT_EQUAL_INT(1, linkQualityBarsLatency(3000, 1000));  // poor
-    TEST_ASSERT_EQUAL_INT(0, linkQualityBarsLatency(8000, 1000));  // very poor
+    // Lower RTT = better. Thresholds 2000/4000/7000/15000 ms — calibrated to the
+    // Lambda-backed request floor (~1-2s on a strong link, from field logs).
+    TEST_ASSERT_EQUAL_INT(4, linkQualityBarsLatency(1500,  1000));  // excellent (good link)
+    TEST_ASSERT_EQUAL_INT(3, linkQualityBarsLatency(3000,  1000));  // good
+    TEST_ASSERT_EQUAL_INT(2, linkQualityBarsLatency(6000,  1000));  // fair
+    TEST_ASSERT_EQUAL_INT(1, linkQualityBarsLatency(10000, 1000));  // poor — struggling
+    TEST_ASSERT_EQUAL_INT(0, linkQualityBarsLatency(20000, 1000));  // very poor
     // Stale (no recent request) → 0 regardless of last RTT.
-    TEST_ASSERT_EQUAL_INT(0, linkQualityBarsLatency(200, 250000));
+    TEST_ASSERT_EQUAL_INT(0, linkQualityBarsLatency(1500, 250000));
     // No sample (min returned <0) → 0.
     TEST_ASSERT_EQUAL_INT(0, linkQualityBarsLatency(-1, 1000));
 }
