@@ -12,6 +12,9 @@ struct DisplayState {
     bool     netConnected;
     bool     modemReady;
     int      modemRssi;
+    float    linkKBps;      // effective link throughput (bandwidth) — connection-quality signal
+    float    linkMaxKBps;   // best throughput seen (auto-calibrating peak); bars = % of this
+    uint32_t linkAgeMs;     // ms since the last successful transfer (liveness)
     char     modemOp[32];
     char     wifiLabel[22];
     int8_t   wifiBars;
@@ -27,6 +30,26 @@ struct DisplayState {
     char     otaVersion[20];
 };
 
+// Connection-quality bars (0-4) from effective link throughput, as a PERCENT of
+// the best bandwidth this unit has achieved (maxKBps, an auto-calibrating peak).
+// Relative (not absolute) so it self-adapts to the hardware ceiling — the UART-
+// capped prototype (~14 KB/s) and the 3 Mbaud PCB (~167 KB/s) both reach 4 bars
+// at their own best. Bars are quartiles: ~25/50/75/100% of peak.
+// We can't read RSSI without escaping PPP (disrupts data), so quality comes from
+// the data path itself: bandwidth from real file/OTA transfers, with the 60s log
+// upload keeping `ageMs` fresh as a liveness heartbeat. Stale (no success in >2
+// log cycles) => 0 bars even if PPP claims up; alive but slow/uncalibrated => 1.
+inline int linkQualityBars(float kBps, float maxKBps, uint32_t ageMs) {
+    if (ageMs > 150000) return 0;                  // no recent successful transfer
+    if (maxKBps < 1.0f) return kBps > 0 ? 1 : 0;   // not calibrated yet
+    float pct = kBps / maxKBps;                    // fraction of best-ever throughput
+    if (pct >= 0.95f) return 4;                    // ~100%
+    if (pct >= 0.70f) return 3;                    // ~75%
+    if (pct >= 0.45f) return 2;                    // ~50%
+    if (pct >= 0.20f) return 1;                    // ~25%
+    return 1;                                      // alive but below 25% of peak
+}
+
 // Render the main operational display
 inline void updateDisplay(DisplayState& ds) {
     g_hal->display->clear();
@@ -35,13 +58,12 @@ inline void updateDisplay(DisplayState& ds) {
     {
         char label[18];
         int bars = 0;
-        if (ds.pppConnected && ds.modemRssi > 0 && ds.modemRssi < 99) {
+        if (ds.pppConnected) {
+            // Bars = connection QUALITY from link throughput (not RSSI, which
+            // can't be read mid-PPP without disrupting the data stream).
             if (ds.modemOp[0]) strlcpy(label, ds.modemOp, sizeof(label));
             else               strlcpy(label, "Cellular", sizeof(label));
-            if      (ds.modemRssi >= 20) bars = 4;
-            else if (ds.modemRssi >= 15) bars = 3;
-            else if (ds.modemRssi >= 10) bars = 2;
-            else                         bars = 1;
+            bars = linkQualityBars(ds.linkKBps, ds.linkMaxKBps, ds.linkAgeMs);
         } else if (ds.netConnected) {
             strlcpy(label, ds.wifiLabel, sizeof(label));
             bars = ds.wifiBars;

@@ -124,7 +124,8 @@ void test_updateDisplay_no_network(void) {
 void test_updateDisplay_cellular_connected(void) {
     DisplayState ds = make_default_state();
     ds.pppConnected = true;
-    ds.modemRssi = 25;
+    // Bars now reflect link bandwidth (% of peak), not RSSI. At-peak + fresh → 4 bars.
+    ds.linkKBps = 100.0f; ds.linkMaxKBps = 100.0f; ds.linkAgeMs = 1000;
     strlcpy(ds.modemOp, "T-Mobile", sizeof(ds.modemOp));
     ds.mbQueued = 100.0f;
     ds.mbUploaded = 50.0f;
@@ -132,9 +133,25 @@ void test_updateDisplay_cellular_connected(void) {
     updateDisplay(ds);
     TEST_ASSERT_EQUAL_INT(1, s_display.flush_count);
 
-    // Signal bars: rssi >= 20 → 4 bars
-    // Bar 4 at x=123, height 8, y=0 → pixels at (123,0) through (125,7)
+    // 4 bars (100% of peak): bar 4 at x=123, height 8 → pixel at (123,0)
     TEST_ASSERT_TRUE(s_display.pixel_at(123, 0));  // top of tallest bar
+}
+
+void test_link_quality_bars(void) {
+    // Relative to the auto-calibrating peak (maxKBps), quartiles 25/50/75/100%.
+    TEST_ASSERT_EQUAL_INT(4, linkQualityBars(100, 100, 1000));  // at peak
+    TEST_ASSERT_EQUAL_INT(3, linkQualityBars(75,  100, 1000));  // ~75%
+    TEST_ASSERT_EQUAL_INT(2, linkQualityBars(50,  100, 1000));  // ~50%
+    TEST_ASSERT_EQUAL_INT(1, linkQualityBars(25,  100, 1000));  // ~25%
+    TEST_ASSERT_EQUAL_INT(1, linkQualityBars(2,   100, 1000));  // alive but slow
+    // Same fraction of a LOWER peak (UART-capped hw) still reads 4 bars.
+    TEST_ASSERT_EQUAL_INT(4, linkQualityBars(14,  14,  1000));
+    TEST_ASSERT_EQUAL_INT(2, linkQualityBars(7,   14,  1000));
+    // Stale (no recent transfer) → 0 bars regardless of last bandwidth.
+    TEST_ASSERT_EQUAL_INT(0, linkQualityBars(100, 100, 200000));
+    // Not calibrated yet (no peak): alive→1, nothing→0.
+    TEST_ASSERT_EQUAL_INT(1, linkQualityBars(5, 0, 1000));
+    TEST_ASSERT_EQUAL_INT(0, linkQualityBars(0, 0, 1000));
 }
 
 void test_updateDisplay_wifi_connected(void) {
@@ -261,6 +278,7 @@ int main(int argc, char** argv) {
     // updateDisplay screens
     RUN_TEST(test_updateDisplay_no_network);
     RUN_TEST(test_updateDisplay_cellular_connected);
+    RUN_TEST(test_link_quality_bars);
     RUN_TEST(test_updateDisplay_wifi_connected);
     RUN_TEST(test_updateDisplay_progress_bar_half);
     RUN_TEST(test_updateDisplay_eta_shown);

@@ -374,6 +374,19 @@ static float    g_uploadingMb    = 0.0f; // live progress of current file upload
 static float    g_uploadBaseMb   = 0.0f; // base offset for multipart (completed parts)
 static float    g_usbWriteKBps   = 0.0f; // live USB write speed for display
 static float    g_uploadKBps     = 0.0f; // live upload speed for display
+// Connection quality from the data path (no AT/+++ needed). Bandwidth is set by
+// real file/OTA transfers; the 60s log upload refreshes g_linkOkMs as a liveness
+// heartbeat. Drives the OLED quality bars (replaces RSSI bars) + STATUS line.
+static float    g_linkKBps       = 0.0f;
+static float    g_linkMaxKBps    = 0.0f; // best throughput seen (auto-calibrating peak)
+static uint32_t g_linkOkMs       = 0;    // millis() of last successful transfer (any size)
+static inline void noteLinkTransfer(uint32_t bytes, float kBps) {
+    g_linkOkMs = millis();                                   // liveness for any success
+    if (bytes >= 4096 && kBps > 0) {                         // bandwidth only from meaningful xfers
+        g_linkKBps = kBps;
+        if (kBps > g_linkMaxKBps) g_linkMaxKBps = kBps;      // grow the peak (bars = % of this)
+    }
+}
 static uint32_t g_lastDisplayMs  = 0;
 static uint32_t g_lastHarvestMs  = 0;
 static uint32_t g_harvestCoolMs  = 30000;
@@ -1286,6 +1299,9 @@ static void doUpdateDisplay() {
     g_displayState.uploadingMb   = g_uploadingMb;
     g_displayState.usbWriteKBps  = g_usbWriteKBps;
     g_displayState.uploadKBps    = g_uploadKBps;
+    g_displayState.linkKBps      = g_linkKBps;
+    g_displayState.linkMaxKBps   = g_linkMaxKBps;
+    g_displayState.linkAgeMs     = g_linkOkMs ? (millis() - g_linkOkMs) : 0xFFFFFFFFu;
     updateDisplay(g_displayState);
 }
 
@@ -1685,6 +1701,7 @@ static bool otaDownloadAndFlash(const char* host, const char* path, uint32_t exp
     if (err != ESP_OK) { log_write("OTA: begin failed"); return false; }
 
     uint32_t received = 0;           // bytes flashed so far (persists across attempts)
+    uint32_t otaT0 = millis();       // for download-bandwidth quality sample
     bool complete = false;
     bool hardFail = false;
 
@@ -1805,6 +1822,10 @@ hdr_done:
     err = esp_ota_set_boot_partition(update_part);
     if (err != ESP_OK) { log_write("OTA: set_boot failed"); return false; }
 
+    {   // OTA download is a substantial transfer — a good link-bandwidth sample
+        float dt = (millis() - otaT0) / 1000.0f;
+        if (dt > 0.5f) noteLinkTransfer(received, (received / 1024.0f) / dt);
+    }
     log_write("OTA: success — %lu bytes", (unsigned long)received);
     otaDisplayProgress(100, received, total);
     return true;
@@ -1983,6 +2004,7 @@ static bool s3UploadFileEx(const char* relPath, const char* s3KeyOverride,
         tls_destroy(tls);
         float elapsed = (millis() - xfrStart) / 1000.0f;
         g_lastUploadKBps = elapsed > 0 ? fileSize / 1024.0f / elapsed : 0;
+        noteLinkTransfer(fileSize, g_lastUploadKBps);
         cdc_printf("S3: uploaded '%s' OK (%u bytes, %.0f KB/s)\r\n", relPath, fileSize, g_lastUploadKBps);
         log_write("Upload OK: %s %u bytes %.0f KB/s", relPath, fileSize, g_lastUploadKBps);
         return true;
@@ -2202,6 +2224,7 @@ static bool s3UploadFileEx(const char* relPath, const char* s3KeyOverride,
 
     float elapsed = (millis() - xfrStart) / 1000.0f;
     g_lastUploadKBps = elapsed > 0 ? fileSize / 1024.0f / elapsed : 0;
+    noteLinkTransfer(fileSize, g_lastUploadKBps);
     log_write("Upload OK: %s %u bytes %u parts %.0f KB/s", relPath, fileSize, totalParts, g_lastUploadKBps);
     cdc_printf("S3: uploaded '%s' OK (%u bytes, %u parts, %.0f KB/s)\r\n",
              relPath, fileSize, totalParts, g_lastUploadKBps);
@@ -3020,11 +3043,17 @@ static void modemTask(void* param) {
                             "Content-Length: %d\r\nConnection: close\r\n\r\n",
                             g_deviceId, g_logFileName, g_apiHost, g_apiKey, readLen);
 
+                        uint32_t wT0 = millis();
                         bool ok = tls_write_all(tls, hdr, hlen) &&
                                   tls_write_all(tls, chunk, readLen);
                         if (ok) {
                             httpReadResponse(tls);
                             lastUploadPos = offset + readLen;
+                            // Liveness heartbeat (any size) + a bandwidth sample if
+                            // the chunk is big enough to be meaningful (idle logs are
+                            // tiny/latency-dominated, so they only refresh liveness).
+                            float dt = (millis() - wT0) / 1000.0f;
+                            noteLinkTransfer(readLen, dt > 0.05f ? (readLen / 1024.0f) / dt : 0);
                         }
                         tls_destroy(tls);
                     } while (0);
@@ -3773,10 +3802,12 @@ static void main_loop_task(void* param) {
             static uint32_t lastStatusMs = 0;
             if (now - lastStatusMs >= 60000) {
                 lastStatusMs = now;
-                airbridge_log("STATUS fw=%s device=%s net=%s rssi=%d rsrp=%d sinr=%d q=%u up=%u mbq=%.1f mbup=%.1f heap=%lu",
+                airbridge_log("STATUS fw=%s device=%s net=%s rssi=%d rsrp=%d sinr=%d link=%.0fKB/s(%lus) q=%u up=%u mbq=%.1f mbup=%.1f heap=%lu",
                     FW_VERSION, g_deviceId,
                     g_pppConnected ? "ppp" : (g_netConnected ? "wifi" : "none"),
-                    g_modemRssi, g_modemRsrp, g_modemSinr, g_filesQueued, g_filesUploaded,
+                    g_modemRssi, g_modemRsrp, g_modemSinr,
+                    g_linkKBps, (unsigned long)(g_linkOkMs ? (now - g_linkOkMs) / 1000 : 0),
+                    g_filesQueued, g_filesUploaded,
                     g_mbQueued, g_mbUploaded,
                     (unsigned long)esp_get_free_heap_size());
             }
