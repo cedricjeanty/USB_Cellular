@@ -12,8 +12,8 @@ struct DisplayState {
     bool     netConnected;
     bool     modemReady;
     int      modemRssi;
-    float    linkKBps;      // windowed-peak throughput (KB/s) — connection-quality signal
-    uint32_t linkAgeMs;     // ms since the last successful transfer (liveness)
+    float    linkLatencyMs; // windowed-best request round-trip (ms) — connection-quality signal
+    uint32_t linkAgeMs;     // ms since the last successful request (liveness)
     char     modemOp[32];
     char     wifiLabel[22];
     int8_t   wifiBars;
@@ -29,52 +29,51 @@ struct DisplayState {
     char     otaVersion[20];
 };
 
-// Effective link-throughput ceiling (KB/s). The 3 Mbaud + HW-flow-control UART to
-// the modem caps practical TLS upload throughput at ~150 KB/s, so the quality bars
-// are scaled to that fixed maximum (not an auto-peak).
-#define LINK_MAX_KBPS 150.0f
-
-// Peak-hold over a sliding window: the displayed throughput is the MAX seen in the
-// last windowMs. Bandwidth jitters every transfer; holding the recent peak makes
-// the quality bars read like a steady signal meter (snap up to peaks, decay slowly
-// only when nothing better arrives) even though the underlying metric is bandwidth.
-// Pure (nowMs passed in) so it's unit-testable. Iterating 0..count-1 covers every
-// stored slot (the ring fills 0..CAP-1 before wrapping).
+// Sliding-window over recent samples (value = whatever the caller stores: here,
+// request round-trip latency in ms). Pure (nowMs passed in) so it's unit-testable.
+// Iterating 0..count-1 covers every stored slot (the ring fills 0..CAP-1 then wraps).
 struct LinkWindow {
     static const int CAP = 16;
     uint32_t ms[CAP];
-    float    kBps[CAP];
+    float    val[CAP];
     uint8_t  count;
     uint8_t  head;
 };
-inline void linkWindowAdd(LinkWindow& w, uint32_t nowMs, float kBps) {
+inline void linkWindowAdd(LinkWindow& w, uint32_t nowMs, float val) {
     w.ms[w.head] = nowMs;
-    w.kBps[w.head] = kBps;
+    w.val[w.head] = val;
     w.head = (uint8_t)((w.head + 1) % LinkWindow::CAP);
     if (w.count < LinkWindow::CAP) w.count++;
 }
 inline float linkWindowMax(const LinkWindow& w, uint32_t nowMs, uint32_t windowMs) {
     float mx = 0;
     for (int i = 0; i < w.count; i++)
-        if ((uint32_t)(nowMs - w.ms[i]) <= windowMs && w.kBps[i] > mx) mx = w.kBps[i];
+        if ((uint32_t)(nowMs - w.ms[i]) <= windowMs && w.val[i] > mx) mx = w.val[i];
     return mx;
 }
+// Best (min) value in the window; returns <0 if no sample in window.
+inline float linkWindowMin(const LinkWindow& w, uint32_t nowMs, uint32_t windowMs) {
+    float mn = -1;
+    for (int i = 0; i < w.count; i++)
+        if ((uint32_t)(nowMs - w.ms[i]) <= windowMs && (mn < 0 || w.val[i] < mn)) mn = w.val[i];
+    return mn;
+}
 
-// Connection-quality bars (0-4) from windowed-peak throughput as a PERCENT of the
-// fixed LINK_MAX_KBPS ceiling, at quartiles ~25/50/75/100%. Quality comes from the
-// data path (no RSSI/+++ which would disrupt PPP): bandwidth from real file/OTA
-// transfers, with the 60s log upload keeping `ageMs` fresh as a liveness heartbeat.
-// Stale (no success in >2 log cycles) => 0 bars even if PPP claims up; alive but no
-// recent bandwidth sample => 1 bar.
-inline int linkQualityBars(float kBps, float maxKBps, uint32_t ageMs) {
-    if (ageMs > 150000) return 0;                  // no recent successful transfer
-    if (maxKBps < 1.0f) return kBps > 0 ? 1 : 0;
-    float pct = kBps / maxKBps;
-    if (pct >= 0.95f) return 4;                    // ~100%
-    if (pct >= 0.70f) return 3;                    // ~75%
-    if (pct >= 0.45f) return 2;                    // ~50%
-    if (pct >= 0.20f) return 1;                    // ~25%
-    return 1;                                      // alive but below 25% of ceiling
+// Connection-quality bars (0-4) from request round-trip LATENCY (ms). RSSI can't be
+// read mid-PPP without +++ (disrupts data) and small transfers can't measure
+// bandwidth, but they CAN measure latency — which tracks cellular quality well
+// (good signal => low RTT). The 60s log upload gives a fresh latency sample every
+// minute with no extra traffic; `rttMs` is the windowed MIN (best recent) so the
+// bars read like a steady signal meter. `ageMs` = time since the last successful
+// request; stale (>3 missed cycles) or no sample => 0 bars. Thresholds include
+// server processing time (the log POST hits a Lambda); may need field tuning.
+inline int linkQualityBarsLatency(float rttMs, uint32_t ageMs) {
+    if (ageMs > 200000 || rttMs < 0) return 0;     // no recent successful request
+    if (rttMs < 500)  return 4;                    // excellent
+    if (rttMs < 1000) return 3;                    // good
+    if (rttMs < 2000) return 2;                    // fair
+    if (rttMs < 5000) return 1;                    // poor
+    return 0;                                       // very poor
 }
 
 // Render the main operational display
@@ -90,7 +89,7 @@ inline void updateDisplay(DisplayState& ds) {
             // can't be read mid-PPP without disrupting the data stream).
             if (ds.modemOp[0]) strlcpy(label, ds.modemOp, sizeof(label));
             else               strlcpy(label, "Cellular", sizeof(label));
-            bars = linkQualityBars(ds.linkKBps, LINK_MAX_KBPS, ds.linkAgeMs);
+            bars = linkQualityBarsLatency(ds.linkLatencyMs, ds.linkAgeMs);
         } else if (ds.netConnected) {
             strlcpy(label, ds.wifiLabel, sizeof(label));
             bars = ds.wifiBars;

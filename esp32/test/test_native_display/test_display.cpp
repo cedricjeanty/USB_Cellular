@@ -124,8 +124,8 @@ void test_updateDisplay_no_network(void) {
 void test_updateDisplay_cellular_connected(void) {
     DisplayState ds = make_default_state();
     ds.pppConnected = true;
-    // Bars now reflect link bandwidth (% of the 150 KB/s ceiling), not RSSI.
-    ds.linkKBps = 150.0f; ds.linkAgeMs = 1000;   // at ceiling + fresh → 4 bars
+    // Bars now reflect request latency (not RSSI). Low RTT + fresh → 4 bars.
+    ds.linkLatencyMs = 200.0f; ds.linkAgeMs = 1000;
     strlcpy(ds.modemOp, "T-Mobile", sizeof(ds.modemOp));
     ds.mbQueued = 100.0f;
     ds.mbUploaded = 50.0f;
@@ -137,42 +137,38 @@ void test_updateDisplay_cellular_connected(void) {
     TEST_ASSERT_TRUE(s_display.pixel_at(123, 0));  // top of tallest bar
 }
 
-void test_link_quality_bars(void) {
-    // Relative to the auto-calibrating peak (maxKBps), quartiles 25/50/75/100%.
-    TEST_ASSERT_EQUAL_INT(4, linkQualityBars(100, 100, 1000));  // at peak
-    TEST_ASSERT_EQUAL_INT(3, linkQualityBars(75,  100, 1000));  // ~75%
-    TEST_ASSERT_EQUAL_INT(2, linkQualityBars(50,  100, 1000));  // ~50%
-    TEST_ASSERT_EQUAL_INT(1, linkQualityBars(25,  100, 1000));  // ~25%
-    TEST_ASSERT_EQUAL_INT(1, linkQualityBars(2,   100, 1000));  // alive but slow
-    // Same fraction of a LOWER peak (UART-capped hw) still reads 4 bars.
-    TEST_ASSERT_EQUAL_INT(4, linkQualityBars(14,  14,  1000));
-    TEST_ASSERT_EQUAL_INT(2, linkQualityBars(7,   14,  1000));
-    // Stale (no recent transfer) → 0 bars regardless of last bandwidth.
-    TEST_ASSERT_EQUAL_INT(0, linkQualityBars(100, 100, 200000));
-    // Not calibrated yet (no peak): alive→1, nothing→0.
-    TEST_ASSERT_EQUAL_INT(1, linkQualityBars(5, 0, 1000));
-    TEST_ASSERT_EQUAL_INT(0, linkQualityBars(0, 0, 1000));
+void test_link_quality_bars_latency(void) {
+    // Lower RTT = better. Thresholds 500/1000/2000/5000 ms.
+    TEST_ASSERT_EQUAL_INT(4, linkQualityBarsLatency(200,  1000));  // excellent
+    TEST_ASSERT_EQUAL_INT(3, linkQualityBarsLatency(800,  1000));  // good
+    TEST_ASSERT_EQUAL_INT(2, linkQualityBarsLatency(1500, 1000));  // fair
+    TEST_ASSERT_EQUAL_INT(1, linkQualityBarsLatency(3000, 1000));  // poor
+    TEST_ASSERT_EQUAL_INT(0, linkQualityBarsLatency(8000, 1000));  // very poor
+    // Stale (no recent request) → 0 regardless of last RTT.
+    TEST_ASSERT_EQUAL_INT(0, linkQualityBarsLatency(200, 250000));
+    // No sample (min returned <0) → 0.
+    TEST_ASSERT_EQUAL_INT(0, linkQualityBarsLatency(-1, 1000));
 }
 
-void test_link_window_peak_hold(void) {
+void test_link_window_min_hold(void) {
     LinkWindow w = {};
-    // A burst hits 120 KB/s at t=1000; small samples follow. The windowed max
-    // holds the 120 peak for the whole window (stable bars), not the last value.
-    linkWindowAdd(w, 1000, 120);
-    linkWindowAdd(w, 3000, 20);
-    linkWindowAdd(w, 5000, 15);
-    TEST_ASSERT_EQUAL_FLOAT(120.0f, linkWindowMax(w, 5000, 60000));   // peak held
-    // 60s after the peak it has aged out; only the recent low samples remain.
-    TEST_ASSERT_EQUAL_FLOAT(20.0f, linkWindowMax(w, 62000, 60000));
-    // Long after everything: nothing in window → 0.
-    TEST_ASSERT_EQUAL_FLOAT(0.0f, linkWindowMax(w, 200000, 60000));
+    // Best (lowest) RTT in the window holds the quality steady. A 180 ms low at
+    // t=1000 keeps min=180 even as later samples are worse.
+    linkWindowAdd(w, 1000, 180);
+    linkWindowAdd(w, 3000, 900);
+    linkWindowAdd(w, 5000, 1200);
+    TEST_ASSERT_EQUAL_FLOAT(180.0f, linkWindowMin(w, 5000, 180000));  // best held
+    // After the 180 ms sample ages out of the window, min rises to the next best.
+    TEST_ASSERT_EQUAL_FLOAT(900.0f, linkWindowMin(w, 182000, 180000));
+    // Nothing in window → <0 (no sample).
+    TEST_ASSERT_TRUE(linkWindowMin(w, 500000, 180000) < 0);
 }
 
 void test_link_window_ring_wrap(void) {
     LinkWindow w = {};
-    // Overfill past CAP=16; the peak must still be found among the kept samples.
-    for (int i = 0; i < 30; i++) linkWindowAdd(w, 1000 + i, (float)(i));   // last 16: 14..29
-    TEST_ASSERT_EQUAL_FLOAT(29.0f, linkWindowMax(w, 1030, 60000));
+    // Overfill past CAP=16; min must still be found among the kept samples (last 16).
+    for (int i = 0; i < 30; i++) linkWindowAdd(w, 1000 + i, (float)(100 - i));  // last 16: 86..71
+    TEST_ASSERT_EQUAL_FLOAT(71.0f, linkWindowMin(w, 1030, 60000));
 }
 
 void test_updateDisplay_wifi_connected(void) {
@@ -234,8 +230,8 @@ void test_updateDisplay_modem_connecting(void) {
 void test_updateDisplay_no_signal(void) {
     DisplayState ds = make_default_state();
     ds.pppConnected = true;
-    // PPP claims up but no successful transfer recently (stale) → 0 quality bars.
-    ds.linkKBps = 0; ds.linkAgeMs = 200000;
+    // PPP claims up but no successful request recently (stale) → 0 quality bars.
+    ds.linkLatencyMs = 200.0f; ds.linkAgeMs = 200001;
 
     updateDisplay(ds);
     // Verify no signal bar pixels (bar positions start at x=108)
@@ -299,8 +295,8 @@ int main(int argc, char** argv) {
     // updateDisplay screens
     RUN_TEST(test_updateDisplay_no_network);
     RUN_TEST(test_updateDisplay_cellular_connected);
-    RUN_TEST(test_link_quality_bars);
-    RUN_TEST(test_link_window_peak_hold);
+    RUN_TEST(test_link_quality_bars_latency);
+    RUN_TEST(test_link_window_min_hold);
     RUN_TEST(test_link_window_ring_wrap);
     RUN_TEST(test_updateDisplay_wifi_connected);
     RUN_TEST(test_updateDisplay_progress_bar_half);

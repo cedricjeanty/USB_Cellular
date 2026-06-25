@@ -377,16 +377,19 @@ static float    g_uploadKBps     = 0.0f; // live upload speed for display
 // Connection quality from the data path (no AT/+++ needed). Bandwidth is set by
 // real file/OTA transfers; the 60s log upload refreshes g_linkOkMs as a liveness
 // heartbeat. Drives the OLED quality bars (replaces RSSI bars) + STATUS line.
-static LinkWindow g_linkWindow   = {};   // recent throughput samples (peak-held for the bars)
-static uint32_t g_linkOkMs       = 0;    // millis() of last successful transfer (any size)
-#define LINK_WINDOW_MS 60000             // hold the peak throughput over the last ~minute
-static inline void noteLinkTransfer(uint32_t bytes, float kBps) {
-    g_linkOkMs = millis();                                   // liveness for any success
-    if (bytes >= 1024 && kBps > 0)                           // usable bandwidth sample
-        linkWindowAdd(g_linkWindow, g_linkOkMs, kBps);
+// Connection quality from the data path (no AT/+++): the round-trip LATENCY of the
+// small requests the device already makes (esp. the 60s log upload) tracks cellular
+// quality without needing a big transfer to measure bandwidth. Drives the OLED
+// quality bars (replaces RSSI bars). Bandwidth is shown separately during uploads.
+static LinkWindow g_linkLatWin   = {};   // recent request RTT samples (ms)
+static uint32_t g_linkOkMs       = 0;    // millis() of last successful request (liveness)
+#define LINK_LAT_WINDOW_MS 180000        // best RTT over the last ~3 min (steady bars)
+static inline void noteLinkLatency(uint32_t rttMs) {
+    g_linkOkMs = millis();
+    if (rttMs > 0) linkWindowAdd(g_linkLatWin, g_linkOkMs, (float)rttMs);
 }
-// Windowed-peak throughput (KB/s) for the display + STATUS line.
-static inline float linkKBpsNow() { return linkWindowMax(g_linkWindow, millis(), LINK_WINDOW_MS); }
+// Windowed-best (min) RTT for the display + STATUS line; <0 if no recent sample.
+static inline float linkLatencyNow() { return linkWindowMin(g_linkLatWin, millis(), LINK_LAT_WINDOW_MS); }
 static uint32_t g_lastDisplayMs  = 0;
 static uint32_t g_lastHarvestMs  = 0;
 static uint32_t g_harvestCoolMs  = 30000;
@@ -1299,7 +1302,7 @@ static void doUpdateDisplay() {
     g_displayState.uploadingMb   = g_uploadingMb;
     g_displayState.usbWriteKBps  = g_usbWriteKBps;
     g_displayState.uploadKBps    = g_uploadKBps;
-    g_displayState.linkKBps      = linkKBpsNow();
+    g_displayState.linkLatencyMs = linkLatencyNow();
     g_displayState.linkAgeMs     = g_linkOkMs ? (millis() - g_linkOkMs) : 0xFFFFFFFFu;
     updateDisplay(g_displayState);
 }
@@ -1821,9 +1824,9 @@ hdr_done:
     err = esp_ota_set_boot_partition(update_part);
     if (err != ESP_OK) { log_write("OTA: set_boot failed"); return false; }
 
-    {   // OTA download is a substantial transfer — a good link-bandwidth sample
+    {   // OTA download is a real throughput sample — log it (quality bars use latency)
         float dt = (millis() - otaT0) / 1000.0f;
-        if (dt > 0.5f) noteLinkTransfer(received, (received / 1024.0f) / dt);
+        if (dt > 0.5f) log_write("OTA: download %.0f KB/s", (received / 1024.0f) / dt);
     }
     log_write("OTA: success — %lu bytes", (unsigned long)received);
     otaDisplayProgress(100, received, total);
@@ -2003,7 +2006,6 @@ static bool s3UploadFileEx(const char* relPath, const char* s3KeyOverride,
         tls_destroy(tls);
         float elapsed = (millis() - xfrStart) / 1000.0f;
         g_lastUploadKBps = elapsed > 0 ? fileSize / 1024.0f / elapsed : 0;
-        noteLinkTransfer(fileSize, g_lastUploadKBps);
         cdc_printf("S3: uploaded '%s' OK (%u bytes, %.0f KB/s)\r\n", relPath, fileSize, g_lastUploadKBps);
         log_write("Upload OK: %s %u bytes %.0f KB/s", relPath, fileSize, g_lastUploadKBps);
         return true;
@@ -2223,7 +2225,6 @@ static bool s3UploadFileEx(const char* relPath, const char* s3KeyOverride,
 
     float elapsed = (millis() - xfrStart) / 1000.0f;
     g_lastUploadKBps = elapsed > 0 ? fileSize / 1024.0f / elapsed : 0;
-    noteLinkTransfer(fileSize, g_lastUploadKBps);
     log_write("Upload OK: %s %u bytes %u parts %.0f KB/s", relPath, fileSize, totalParts, g_lastUploadKBps);
     cdc_printf("S3: uploaded '%s' OK (%u bytes, %u parts, %.0f KB/s)\r\n",
              relPath, fileSize, totalParts, g_lastUploadKBps);
@@ -3048,11 +3049,11 @@ static void modemTask(void* param) {
                         if (ok) {
                             httpReadResponse(tls);
                             lastUploadPos = offset + readLen;
-                            // Liveness heartbeat (any size) + a bandwidth sample if
-                            // the chunk is big enough to be meaningful (idle logs are
-                            // tiny/latency-dominated, so they only refresh liveness).
-                            float dt = (millis() - wT0) / 1000.0f;
-                            noteLinkTransfer(readLen, dt > 0.05f ? (readLen / 1024.0f) / dt : 0);
+                            // Round-trip latency of this small POST (post-handshake)
+                            // is the always-on connection-quality sample driving the
+                            // OLED bars — too small to measure bandwidth, but latency
+                            // tracks link quality and costs no extra traffic.
+                            noteLinkLatency(millis() - wT0);
                         }
                         tls_destroy(tls);
                     } while (0);
@@ -3801,11 +3802,12 @@ static void main_loop_task(void* param) {
             static uint32_t lastStatusMs = 0;
             if (now - lastStatusMs >= 60000) {
                 lastStatusMs = now;
-                airbridge_log("STATUS fw=%s device=%s net=%s rssi=%d rsrp=%d sinr=%d link=%.0fKB/s(%lus) q=%u up=%u mbq=%.1f mbup=%.1f heap=%lu",
+                airbridge_log("STATUS fw=%s device=%s net=%s rssi=%d rsrp=%d sinr=%d lat=%.0fms(%lus) up=%.0fKB/s q=%u upn=%u mbq=%.1f mbup=%.1f heap=%lu",
                     FW_VERSION, g_deviceId,
                     g_pppConnected ? "ppp" : (g_netConnected ? "wifi" : "none"),
                     g_modemRssi, g_modemRsrp, g_modemSinr,
-                    linkKBpsNow(), (unsigned long)(g_linkOkMs ? (now - g_linkOkMs) / 1000 : 0),
+                    linkLatencyNow(), (unsigned long)(g_linkOkMs ? (now - g_linkOkMs) / 1000 : 0),
+                    g_lastUploadKBps,
                     g_filesQueued, g_filesUploaded,
                     g_mbQueued, g_mbUploaded,
                     (unsigned long)esp_get_free_heap_size());
