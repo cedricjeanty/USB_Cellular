@@ -31,6 +31,30 @@ struct ModemReconnectResult {
     bool registered;
 };
 
+// Reconnect escalation plan derived from the consecutive-failure count — the
+// pure decision logic the modem task's pump loop runs (the AT sequence itself
+// is modemReconnect()). Extracted so it's shared + unit-tested.
+//
+// Attempts 1-4 (failures 0-3): soft reconnect (no CFUN) — handles the common
+// carrier-terminated drop where the radio stays registered.
+// Attempt 5 (failures=4) and every 5th after: full CFUN=0/1 radio reset.
+// After the 2nd reset (failures>=9): a progressive backoff (30s * reset#, capped
+// at 300s) precedes each reset.
+// Documented in CLAUDE.md "Reconnect backoff".
+struct ModemReconnectPlan {
+    bool     radioReset;       // do a CFUN=0/1 reset this attempt
+    uint32_t backoffSeconds;   // wait before the attempt (0 = none)
+};
+inline ModemReconnectPlan modemReconnectPlan(int failures) {
+    ModemReconnectPlan p = {};
+    p.radioReset = (failures >= 4 && (failures - 4) % 5 == 0);
+    if (p.radioReset && failures >= 9) {
+        uint32_t b = 30u * (uint32_t)((failures - 4) / 5);
+        p.backoffSeconds = (b < 300u) ? b : 300u;
+    }
+    return p;
+}
+
 // Reconnect PPP after a connection drop.
 //
 // resetRadio=false (preferred): PDP-context deactivate + re-register + redial.

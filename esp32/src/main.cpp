@@ -2894,17 +2894,14 @@ static void modemTask(void* param) {
             // Soft reconnect (no CFUN) for the first 4 attempts — soft now includes
             // a +++ guard so it handles the "modem stuck in PPP data mode" case.
             // CFUN=0/1 (full radio reset) starts at attempt 5 and every 5th after.
-            // This avoids forced de-registration on carrier-terminated sessions where
-            // the radio is already correctly registered on CEREG.
-            bool doRadioReset = (s_reconnect_failures >= 4 &&
-                                 (s_reconnect_failures - 4) % 5 == 0);
-            // After the second CFUN attempt (failures>=9), add increasing wait.
-            if (doRadioReset && s_reconnect_failures >= 9) {
-                uint32_t backoffS = std::min<uint32_t>(300u, 30u * (uint32_t)((s_reconnect_failures - 4) / 5));
+            // Escalation/backoff is the shared, unit-tested modemReconnectPlan().
+            ModemReconnectPlan plan = modemReconnectPlan(s_reconnect_failures);
+            bool doRadioReset = plan.radioReset;
+            if (plan.backoffSeconds > 0) {
                 log_write("Modem: backoff %lus before radio reset (failure #%d)",
-                          (unsigned long)backoffS, s_reconnect_failures);
-                cdc_printf("Modem: backoff %lus before radio reset\r\n", (unsigned long)backoffS);
-                vTaskDelay(pdMS_TO_TICKS(backoffS * 1000));
+                          (unsigned long)plan.backoffSeconds, s_reconnect_failures);
+                cdc_printf("Modem: backoff %lus before radio reset\r\n", (unsigned long)plan.backoffSeconds);
+                vTaskDelay(pdMS_TO_TICKS(plan.backoffSeconds * 1000));
             }
             log_write("Modem: reconnect attempt %d (%s)",
                       s_reconnect_failures + 1, doRadioReset ? "full reset" : "soft");

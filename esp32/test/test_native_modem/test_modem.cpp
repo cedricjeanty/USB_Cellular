@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include "sim_modem.h"
 #include "hal/uart_pty.h"
+#include "airbridge_modem.h"   // modemReconnectPlan
 
 static SimModem* s_modem = nullptr;
 static PtyUart   s_uart;
@@ -210,6 +211,43 @@ void test_full_init_sequence(void) {
     TEST_ASSERT_TRUE(resp.find("CONNECT") != std::string::npos);
 }
 
+// ── Reconnect escalation plan (pure decision logic) ─────────────────────────
+
+void test_reconnect_plan_soft_first_four(void) {
+    // Failures 0-3 = attempts 1-4: soft, no backoff.
+    for (int f = 0; f < 4; f++) {
+        ModemReconnectPlan p = modemReconnectPlan(f);
+        TEST_ASSERT_FALSE_MESSAGE(p.radioReset, "attempts 1-4 are soft");
+        TEST_ASSERT_EQUAL_UINT32(0, p.backoffSeconds);
+    }
+}
+
+void test_reconnect_plan_first_cfun_at_five(void) {
+    ModemReconnectPlan p = modemReconnectPlan(4);   // attempt 5
+    TEST_ASSERT_TRUE(p.radioReset);
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, p.backoffSeconds, "first CFUN has no backoff yet");
+}
+
+void test_reconnect_plan_soft_between_resets(void) {
+    for (int f = 5; f < 9; f++)                     // attempts 6-9
+        TEST_ASSERT_FALSE(modemReconnectPlan(f).radioReset);
+}
+
+void test_reconnect_plan_backoff_after_second_reset(void) {
+    ModemReconnectPlan p9 = modemReconnectPlan(9);  // 2nd CFUN reset
+    TEST_ASSERT_TRUE(p9.radioReset);
+    TEST_ASSERT_EQUAL_UINT32(30, p9.backoffSeconds);
+    ModemReconnectPlan p14 = modemReconnectPlan(14); // 3rd reset
+    TEST_ASSERT_TRUE(p14.radioReset);
+    TEST_ASSERT_EQUAL_UINT32(60, p14.backoffSeconds);
+}
+
+void test_reconnect_plan_backoff_capped(void) {
+    // Very high failure counts cap the backoff at 300s.
+    TEST_ASSERT_EQUAL_UINT32(300, modemReconnectPlan(4 + 5 * 11).backoffSeconds);
+    TEST_ASSERT_LESS_OR_EQUAL_UINT32(300, modemReconnectPlan(1000).backoffSeconds);
+}
+
 // ── Test runner ─────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -235,6 +273,13 @@ int main(int argc, char** argv) {
 
     // Full sequence
     RUN_TEST(test_full_init_sequence);
+
+    // Reconnect escalation plan
+    RUN_TEST(test_reconnect_plan_soft_first_four);
+    RUN_TEST(test_reconnect_plan_first_cfun_at_five);
+    RUN_TEST(test_reconnect_plan_soft_between_resets);
+    RUN_TEST(test_reconnect_plan_backoff_after_second_reset);
+    RUN_TEST(test_reconnect_plan_backoff_capped);
 
     return UNITY_END();
 }
