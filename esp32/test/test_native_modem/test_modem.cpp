@@ -248,6 +248,44 @@ void test_reconnect_plan_backoff_capped(void) {
     TEST_ASSERT_LESS_OR_EQUAL_UINT32(300, modemReconnectPlan(1000).backoffSeconds);
 }
 
+// ── Flaky-link injection (marginal cellular) ────────────────────────────────
+// The flight-cycle test's "flaky approach" window drops a % of IP packets. The
+// load-bearing invariant: ONLY PPP_IP is ever dropped — dropping LCP/IPCP would
+// tear the link down instead of making it lossy.
+
+void test_flaky_never_drops_control_frames(void) {
+    SimModem m;
+    m.setFlaky(100);  // maximum loss
+    for (int i = 0; i < 100; i++) {
+        TEST_ASSERT_FALSE_MESSAGE(m.flakyDropsFrame(PPP_LCP),  "LCP must NEVER be dropped");
+        TEST_ASSERT_FALSE_MESSAGE(m.flakyDropsFrame(PPP_IPCP), "IPCP must NEVER be dropped");
+    }
+}
+
+void test_flaky_zero_drops_nothing(void) {
+    SimModem m; m.setFlaky(0);
+    for (int i = 0; i < 100; i++) TEST_ASSERT_FALSE(m.flakyDropsFrame(PPP_IP));
+}
+
+void test_flaky_full_drops_all_ip(void) {
+    SimModem m; m.setFlaky(100);
+    for (int i = 0; i < 100; i++) TEST_ASSERT_TRUE(m.flakyDropsFrame(PPP_IP));
+}
+
+void test_flaky_partial_drops_roughly_half(void) {
+    SimModem m; m.setFlaky(50); srand(12345);
+    int dropped = 0; const int N = 4000;
+    for (int i = 0; i < N; i++) if (m.flakyDropsFrame(PPP_IP)) dropped++;
+    TEST_ASSERT_TRUE_MESSAGE(dropped > N * 4 / 10 && dropped < N * 6 / 10,
+                             "~50% of IP frames dropped at flaky=50");
+}
+
+void test_flaky_clamps_range(void) {
+    SimModem m;
+    m.setFlaky(-10); TEST_ASSERT_EQUAL_INT(0, m.flakyDropPct.load());
+    m.setFlaky(250); TEST_ASSERT_EQUAL_INT(100, m.flakyDropPct.load());
+}
+
 // ── Test runner ─────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -280,6 +318,13 @@ int main(int argc, char** argv) {
     RUN_TEST(test_reconnect_plan_soft_between_resets);
     RUN_TEST(test_reconnect_plan_backoff_after_second_reset);
     RUN_TEST(test_reconnect_plan_backoff_capped);
+
+    // Flaky-link injection
+    RUN_TEST(test_flaky_never_drops_control_frames);
+    RUN_TEST(test_flaky_zero_drops_nothing);
+    RUN_TEST(test_flaky_full_drops_all_ip);
+    RUN_TEST(test_flaky_partial_drops_roughly_half);
+    RUN_TEST(test_flaky_clamps_range);
 
     return UNITY_END();
 }

@@ -43,6 +43,23 @@ public:
     bool        apnSet = false;    // tracks AT+CGDCONT state (cleared by AT+CFUN=0, set by AT+CGDCONT)
     int         baudRate = 115200;  // tracks actual baud (persisted via AT+IPR, like real SIM7600 NVS)
 
+    // Flaky-link injection (marginal-cellular simulation, e.g. an approach window).
+    // When >0, that percentage of forwarded IP packets are dropped in BOTH
+    // directions — modelling packet loss on a poor link, which stalls TCP/TLS and
+    // forces upload retries. ONLY PPP_IP is ever dropped; LCP/IPCP control frames
+    // are NEVER dropped (dropping them would tear the link down, not make it flaky).
+    std::atomic<int> flakyDropPct{0};
+    void setFlaky(int pct) { flakyDropPct = (pct < 0) ? 0 : (pct > 100 ? 100 : pct); }
+
+    // Decision helper (pure given rand()): true if a frame of this PPP protocol
+    // should be dropped under the current flaky setting. Unit-tested.
+    bool flakyDropsFrame(uint16_t protocol) {
+        if (protocol != PPP_IP) return false;        // never drop control frames
+        int p = flakyDropPct.load();
+        if (p <= 0) return false;
+        return (rand() % 100) < p;
+    }
+
     // PTY file descriptors (firmware side)
     int master_fd = -1;   // simulator reads/writes this
     int slave_fd = -1;    // firmware reads/writes this
@@ -383,6 +400,7 @@ private:
         } else if (protocol == PPP_IPCP) {
             handleIpcp(payload);
         } else if (protocol == PPP_IP) {
+            if (flakyDropsFrame(PPP_IP)) return;  // flaky link: drop this uplink IP packet
             handleIpPacket(payload);
         }
     }
@@ -540,7 +558,9 @@ private:
                 if (tun_fd_ >= 0 && ipcpUp_ && bytesThisTick < maxBytesPerTick) {
                     uint8_t tunBuf[1500];
                     int tn = ::read(tun_fd_, tunBuf, sizeof(tunBuf));
-                    if (tn > 0) {
+                    if (tn > 0 && flakyDropsFrame(PPP_IP)) {
+                        // flaky link: drop this downlink IP packet (lost; TCP will retransmit)
+                    } else if (tn > 0) {
                         auto frame = ppp_build_frame(PPP_IP, tunBuf, tn);
                         // Throttle: limit how fast we send to firmware
                         int allowed = maxBytesPerTick - bytesThisTick;

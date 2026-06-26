@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <sys/stat.h>   // stat() for the EMU_CELL_FILE mtime poll
 #include <vector>
 #include <thread>
 #include <atomic>
@@ -87,6 +88,12 @@ static SimModem* s_modem = nullptr;
 // Set by SIGUSR1 — main loop checks and toggles cellular (mirrors 'C' keypress)
 static volatile sig_atomic_t s_cellularToggle = 0;
 static void sigusr1_handler(int) { s_cellularToggle = 1; }
+// EMU_CELL_FILE: a control file the test harness writes (atomically) to script a
+// time-varying cellular profile — "full" | "weak" | "off" | "flaky [pct]". Polled
+// in the main loop (mtime-gated). Empty/unset ⇒ boot default stays "full", so
+// existing tests are unaffected. See applyCellState() + scripts/flight_cycle_test.sh.
+static std::string s_cellFilePath;
+static time_t      s_cellFileMtime = 0;
 static const char* SD_ROOT = "./emu_sdcard";           // Partition 1 (DSU-facing)
 static const char* SD_INTERNAL = "./emu_sdcard_internal"; // Partition 2 (firmware internal)
 // EMU_SD_BLOCK=1: route the SD through real FatFs on an in-memory FakeSd block
@@ -404,6 +411,39 @@ static void renderFramebuffer(SDL_Renderer* renderer) {
     SDL_RenderPresent(renderer);
 }
 
+// Apply a cellular-profile state word (from EMU_CELL_FILE) to the emulated link.
+// Maps the word → ds.pppConnected (gates uploads) + sim_modem signal members +
+// flaky %. "off" drops the real PPP session on the on→off transition (cutting any
+// in-flight upload, like losing signal at takeoff); the firmware then reconnects
+// when a connected state ("full"/"weak"/"flaky") returns. Returns true if the word
+// was recognized (state changed).
+static bool applyCellState(const char* word, DisplayState& ds, SimModem* m) {
+    char w[16] = ""; int pct = 0;
+    sscanf(word, "%15s %d", w, &pct);              // e.g. "flaky 30" → w="flaky", pct=30
+    bool wasOn = ds.pppConnected;
+    if (!strcmp(w, "full")) {
+        ds.pppConnected = true; ds.modemReady = true; ds.modemRssi = 22;
+        if (m) { m->rssi = 22; m->rsrpIdx = 70; m->rsrqIdx = 26; m->sinr = 12; m->setFlaky(0); }
+    } else if (!strcmp(w, "weak")) {
+        ds.pppConnected = true; ds.modemReady = true; ds.modemRssi = 8;
+        if (m) { m->rssi = 8; m->rsrpIdx = 30; m->rsrqIdx = 10; m->sinr = 2; m->setFlaky(0); }
+    } else if (!strcmp(w, "off")) {
+        if (m) { m->setFlaky(0); if (wasOn && m->pppUp) m->dropSession(); }  // cut link only on on→off
+        ds.pppConnected = false;
+    } else if (!strcmp(w, "flaky")) {
+        if (pct <= 0) pct = 30;
+        ds.pppConnected = true; ds.modemReady = true; ds.modemRssi = 12;
+        if (m) { m->rssi = 12; m->setFlaky(pct); }
+    } else {
+        return false;                               // unknown word — ignore
+    }
+    printf("[CELL] state=%s rssi=%d flaky=%d ppp=%d\n", w, ds.modemRssi,
+           m ? m->flakyDropPct.load() : 0, ds.pppConnected ? 1 : 0);
+    airbridge_log("CELL: profile=%s ppp=%d flaky=%d", w, ds.pppConnected ? 1 : 0,
+                  m ? m->flakyDropPct.load() : 0);
+    return true;
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
@@ -463,6 +503,12 @@ int main(int argc, char* argv[]) {
         s_net.dropPutResponseOnPart = atoi(e);
         printf("Flaky-link: drop response of part PUT #%d (retry test)\n", s_net.dropPutResponseOnPart);
     }
+    // EMU_CELL_FILE: scripted cellular-profile control file (full|weak|off|flaky).
+    if (const char* e = getenv("EMU_CELL_FILE"); e && e[0]) {
+        s_cellFilePath = e;
+        printf("Cellular profile: scripted via %s\n", s_cellFilePath.c_str());
+    }
+    if (const char* e = getenv("EMU_CELL_SEED"); e && e[0]) srand((unsigned)atoi(e));
 
     s_nvs.set_str("s3", "device_id", deviceId);
 
@@ -1237,6 +1283,23 @@ int main(int argc, char* argv[]) {
             ds.pppConnected = !ds.pppConnected;
             if (ds.pppConnected) { ds.modemRssi = 22; ds.modemReady = true; }
             printf("Cellular (SIGUSR1): %s\n", ds.pppConnected ? "ON" : "OFF");
+        }
+
+        // Scripted cellular profile (EMU_CELL_FILE): poll on mtime change, apply.
+        if (!s_cellFilePath.empty()) {
+            struct stat cst;
+            if (::stat(s_cellFilePath.c_str(), &cst) == 0 && cst.st_mtime != s_cellFileMtime) {
+                s_cellFileMtime = cst.st_mtime;
+                FILE* cf = fopen(s_cellFilePath.c_str(), "r");
+                if (cf) {
+                    char line[32] = "";
+                    if (fgets(line, sizeof(line), cf)) {
+                        line[strcspn(line, "\r\n")] = 0;
+                        applyCellState(line, ds, s_modem);
+                    }
+                    fclose(cf);
+                }
+            }
         }
 
         // ── SD health (block mode): probe → degrade → reformat ──────────────
