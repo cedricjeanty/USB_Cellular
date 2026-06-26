@@ -410,6 +410,10 @@ static uint32_t msc_visible_sectors() {
 static bool     g_dual_partition   = false;
 static bool     g_p2_needs_format  = false; // deferred: format P2 only in upload task
 static bool     g_needs_full_format = false; // deferred: full repartition in upload task
+// Runtime SD-health recovery (see sdRecoveryAction in airbridge_runtime.h)
+static uint32_t g_sd_fail_count    = 0;     // consecutive failed SD probes/remounts
+static volatile bool g_sd_degraded = false; // card declared unusable at runtime (drives OLED + cellular log egress)
+static volatile bool g_sd_reformatting = false; // destructive reformat scheduled (OLED)
 static uint32_t g_p2_start_sector  = 0;  // partition 2 LBA start
 static uint32_t g_p2_sectors       = 0;  // partition 2 size in sectors
 static FATFS*   g_p2_fs            = nullptr; // partition 2 FATFS object
@@ -1304,6 +1308,12 @@ static void doUpdateDisplay() {
     g_displayState.uploadKBps    = g_uploadKBps;
     g_displayState.linkLatencyMs = linkLatencyNow();
     g_displayState.linkAgeMs     = g_linkOkMs ? (millis() - g_linkOkMs) : 0xFFFFFFFFu;
+    // Card physically present but no filesystem mounted = SD fault — covers both
+    // a boot-time mount failure and a runtime degrade, and auto-clears the moment
+    // a (re)mount/reformat succeeds. (main_loop starts after sd_init + any boot
+    // reformat, so this won't flash during the normal first mount.)
+    g_displayState.sdError       = (g_card_sectors > 0 && !g_fatfs_mounted);
+    g_displayState.sdReformatting = g_sd_reformatting;
     updateDisplay(g_displayState);
 }
 
@@ -2979,9 +2989,52 @@ static void modemTask(void* param) {
             }
         }
 
+        // ── SD-independent log egress (degraded mode) ────────────────────
+        // When the SD card is unavailable (corrupt/unmounted) the normal
+        // SD-file upload below is a no-op (no file to read), so the device
+        // would go dark with no way to report *why*. Instead, POST the RAM
+        // ring buffer straight to S3 so an operator can still see the unit is
+        // alive and its SD failed. The modem/PPP path needs no SD, and the
+        // session id (g_logFileName) comes from NVS, not the card — so this
+        // works even with a totally dead FAT. On success we consume exactly
+        // the bytes sent (airbridge_log_consume) so each line egresses once.
+        if (g_pppConnected && !logUpRunning && !g_fatfs_mounted && g_logFileName[0] &&
+            (firstUpload || (logInterval > 0 && (millis() - lastLogUploadMs) > logInterval))) {
+            lastLogUploadMs = millis();
+            logUpRunning = true;
+            xTaskCreatePinnedToCore([](void*) {
+                do {
+                    if (!s3LoadCreds()) break;
+                    static char snap[AIRBRIDGE_LOG_BUF_SIZE];
+                    int snapLen = airbridge_log_snapshot(snap, sizeof(snap));
+                    if (snapLen <= 0) break;
+
+                    esp_tls_t* tls = tls_connect(g_apiHost);
+                    if (!tls) break;
+                    char hdr[512];
+                    int hlen = snprintf(hdr, sizeof(hdr),
+                        "POST /prod/log/append?device=%s&session=%s HTTP/1.1\r\n"
+                        "Host: %s\r\nx-api-key: %s\r\n"
+                        "Content-Length: %d\r\nConnection: close\r\n\r\n",
+                        g_deviceId, g_logFileName, g_apiHost, g_apiKey, snapLen);
+                    uint32_t wT0 = millis();
+                    bool ok = tls_write_all(tls, hdr, hlen) &&
+                              tls_write_all(tls, snap, snapLen);
+                    if (ok) {
+                        httpReadResponse(tls);
+                        airbridge_log_consume(snapLen);  // drop only what we sent
+                        noteLinkLatency(millis() - wT0);
+                    }
+                    tls_destroy(tls);
+                } while (0);
+                logUpRunning = false;
+                vTaskDelete(nullptr);
+            }, "log_up_ram", 8192, nullptr, 2, nullptr, 1);
+        }
+
         // Upload log to S3 via /prod/log/append (incremental, per-session)
         static long lastUploadPos = 0;
-        if (g_pppConnected && !logUpRunning && g_logFileName[0] &&
+        if (g_pppConnected && !logUpRunning && g_fatfs_mounted && g_logFileName[0] &&
             (firstUpload || (logInterval > 0 && (millis() - lastLogUploadMs) > logInterval))) {
 
             // Check SD log file size
@@ -3698,6 +3751,98 @@ static void watchdog_task(void* param) {
     }
 }
 
+// ── Runtime SD health probe + recovery escalation ───────────────────────────
+// A card that mounts at boot but fails later (corrupt FAT, SPI flake) must not
+// silently wedge the unit. We probe the SD periodically and escalate per
+// sdRecoveryAction(): DEGRADE (non-destructive — mark unmounted, surface the
+// fault on the OLED, egress logs over cellular from RAM, keep retrying the
+// remount) then, only if it stays dead, REFORMAT (destructive — the DSU
+// re-sends the lost queue via the cookie). Boot-time mount failure is already
+// handled by the deferred format path; this covers the mid-flight case.
+#define SD_DEGRADE_AFTER  5    // consecutive failed probes (~10s at 2s cadence)
+#define SD_REFORMAT_AFTER 20   // persistent failure (~40s) → destructive last resort
+
+static void note_sd_result(bool ok) {
+    if (ok) g_sd_fail_count = 0;
+    else if (g_sd_fail_count < 0xFFFFu) g_sd_fail_count++;
+}
+
+// Record the reformat in NVS (survives the reboot, reported on next boot),
+// give the cellular log-egress a brief window, then reboot into the boot-time
+// reformat path. Does not return.
+static void request_reformat_and_reboot(const char* reason) {
+    g_sd_reformatting = true;
+    airbridge_log("SD: unrecoverable (%s) — reformatting; DSU re-sends data via cookie", reason);
+    doUpdateDisplay();  // show "SD ERROR / reformatting..." before going down
+    {
+        nvs_handle_t h;
+        if (nvs_open("dbg", NVS_READWRITE, &h) == ESP_OK) {
+            uint32_t c = 0; nvs_get_u32(h, "sd_fmt_count", &c);
+            nvs_set_u32(h, "sd_fmt_count", c + 1);
+            nvs_set_u8(h, "sd_fmt_pending", 1);
+            nvs_commit(h); nvs_close(h);
+        }
+    }
+    if (g_pppConnected) vTaskDelay(pdMS_TO_TICKS(3000));  // let degraded egress flush the reason
+    {
+        nvs_handle_t fh;
+        if (nvs_open("sys", NVS_READWRITE, &fh) == ESP_OK) {
+            nvs_set_u8(fh, "format", 1); nvs_commit(fh); nvs_close(fh);
+        }
+    }
+    unmount_dsu();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    sd_before_restart();
+    esp_restart();
+}
+
+static void sd_health_check() {
+    static uint32_t lastMs = 0;
+    uint32_t now = millis();
+    if (now - lastMs < 2000) return;        // ~every 2s
+    lastMs = now;
+    if (g_card_sectors == 0) return;        // no card at all — boot handles that
+
+    // Don't probe mid-harvest (it holds the SD mutex for a long stretch). The
+    // 50ms mutex timeout is the real contention guard against live MSC/upload —
+    // if the bus is busy we skip without counting it as a failure. The probe
+    // itself is a LIGHT directory stat (a couple of sector reads, like the log
+    // flush already does under live MSC), not a full-FAT f_getfree scan.
+    if (g_harvesting) return;
+    if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return; // contended → skip, no count
+
+    if (g_fatfs_mounted) {
+        FILINFO fno;
+        FRESULT fr = f_stat(g_dual_partition ? "1:/logs" : "0:/logs", &fno);
+        // FR_OK or FR_NO_FILE both mean the filesystem responded; a bus/card
+        // failure surfaces as FR_DISK_ERR / FR_NOT_READY / FR_INT_ERR.
+        bool ok = (fr == FR_OK || fr == FR_NO_FILE);
+        note_sd_result(ok);
+    } else {
+        // Degraded/unmounted: try to bring the card back (a transient flake
+        // recovers here, with no data loss and no reformat).
+        bool ok = sd_mount_fatfs();
+        note_sd_result(ok);
+        if (ok) {
+            g_sd_degraded = false; g_sd_error[0] = '\0'; g_sd_fail_count = 0;
+            airbridge_log("SD: remounted — recovered from runtime failure");
+        }
+    }
+    xSemaphoreGive(g_sd_mutex);
+
+    SdRecoveryAction act = sdRecoveryAction(g_sd_fail_count, SD_DEGRADE_AFTER, SD_REFORMAT_AFTER);
+    if (act == SD_RECOVERY_REFORMAT) {
+        request_reformat_and_reboot("runtime SD failure");   // does not return
+    } else if (act == SD_RECOVERY_DEGRADE && !g_sd_degraded) {
+        g_sd_degraded   = true;
+        g_fatfs_mounted = false;   // stop touching the card; log egress falls back to cellular (RAM buffer)
+        snprintf(g_sd_error, sizeof(g_sd_error), "runtime SD failure (n=%lu)",
+                 (unsigned long)g_sd_fail_count);
+        airbridge_log("SD: runtime failure (n=%lu) — degraded; logging via cellular, retrying remount",
+                      (unsigned long)g_sd_fail_count);
+    }
+}
+
 static void main_loop_task(void* param) {
     (void)param;
 
@@ -3771,7 +3916,8 @@ static void main_loop_task(void* param) {
                 }
             }
 
-            // Update SD used space (only when MSC is ejected to avoid SPI conflict)
+            // Update SD used space (only when MSC is ejected to avoid SPI
+            // conflict — f_getfree scans the whole FAT, too heavy for live MSC).
             if (g_fatfs_mounted && g_msc_ejected &&
                 xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 FATFS* fs;
@@ -3785,6 +3931,10 @@ static void main_loop_task(void* param) {
             }
             doUpdateDisplay();
         }
+
+        // Runtime SD health: probe the card, escalate to degrade/reformat if it
+        // has gone bad mid-flight. Self-throttled (~2s); only probes when safe.
+        sd_health_check();
 
         // Snapshot volatile write timestamp to avoid race with MSC callback
         uint32_t lastWr = g_lastWriteMs;
@@ -3841,6 +3991,20 @@ extern "C" void app_main(void) {
                 airbridge_log("WATCHDOG: previous boot force-rebooted after %lus stall (total=%lu)",
                               (unsigned long)stallS, (unsigned long)cnt);
                 nvs_set_u32(h, "wdt_stall_s", 0);  // clear so it's reported once
+                nvs_commit(h);
+            }
+            // Runtime SD-reformat report. The RAM ring buffer is lost on the
+            // reboot, so the reformat event is recorded in NVS and surfaced here
+            // — it egresses to S3 once PPP comes up post-reformat, so the data
+            // loss is visible remotely even if the link was down at the time.
+            uint8_t sdFmt = 0; uint32_t sdFmtCnt = 0;
+            nvs_get_u8(h, "sd_fmt_pending", &sdFmt);
+            nvs_get_u32(h, "sd_fmt_count", &sdFmtCnt);
+            if (sdFmt) {
+                airbridge_log("SD: previous boot reformatted after a runtime card failure "
+                              "(total=%lu) — DSU re-sends harvested data via the cookie",
+                              (unsigned long)sdFmtCnt);
+                nvs_set_u8(h, "sd_fmt_pending", 0);  // report once
                 nvs_commit(h);
             }
             nvs_close(h);

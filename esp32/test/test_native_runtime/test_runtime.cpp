@@ -244,6 +244,36 @@ void test_watchdog_millis_wraparound(void) {
     TEST_ASSERT_TRUE(watchdogShouldReboot(hb, hb + 400000u, 300000));
 }
 
+// ── SD recovery escalation ──────────────────────────────────────────────────
+
+void test_sd_recovery_healthy(void) {
+    // Below both thresholds → keep probing, do nothing.
+    TEST_ASSERT_EQUAL_INT(SD_RECOVERY_NONE, sdRecoveryAction(0, 5, 20));
+    TEST_ASSERT_EQUAL_INT(SD_RECOVERY_NONE, sdRecoveryAction(4, 5, 20));
+}
+
+void test_sd_recovery_degrade_band(void) {
+    // At/above degrade but below reformat → degrade (non-destructive).
+    TEST_ASSERT_EQUAL_INT(SD_RECOVERY_DEGRADE, sdRecoveryAction(5, 5, 20));
+    TEST_ASSERT_EQUAL_INT(SD_RECOVERY_DEGRADE, sdRecoveryAction(19, 5, 20));
+}
+
+void test_sd_recovery_reformat(void) {
+    // At/above reformat → destructive recovery.
+    TEST_ASSERT_EQUAL_INT(SD_RECOVERY_REFORMAT, sdRecoveryAction(20, 5, 20));
+    TEST_ASSERT_EQUAL_INT(SD_RECOVERY_REFORMAT, sdRecoveryAction(1000, 5, 20));
+}
+
+void test_sd_recovery_disabled_tiers(void) {
+    // A zero threshold disables that tier entirely.
+    TEST_ASSERT_EQUAL_INT(SD_RECOVERY_NONE, sdRecoveryAction(100, 0, 0));
+    // reformat disabled, degrade enabled → never escalates past degrade.
+    TEST_ASSERT_EQUAL_INT(SD_RECOVERY_DEGRADE, sdRecoveryAction(100, 5, 0));
+    // degrade disabled, reformat enabled → jumps straight to reformat at threshold.
+    TEST_ASSERT_EQUAL_INT(SD_RECOVERY_NONE,     sdRecoveryAction(10, 0, 20));
+    TEST_ASSERT_EQUAL_INT(SD_RECOVERY_REFORMAT, sdRecoveryAction(20, 0, 20));
+}
+
 // ── Test runner ─────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -280,6 +310,11 @@ int main(int argc, char** argv) {
     RUN_TEST(test_watchdog_fresh_heartbeat);
     RUN_TEST(test_watchdog_stalled);
     RUN_TEST(test_watchdog_millis_wraparound);
+
+    RUN_TEST(test_sd_recovery_healthy);
+    RUN_TEST(test_sd_recovery_degrade_band);
+    RUN_TEST(test_sd_recovery_reformat);
+    RUN_TEST(test_sd_recovery_disabled_tiers);
 
     return UNITY_END();
 }

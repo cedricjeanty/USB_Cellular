@@ -27,6 +27,9 @@ struct DisplayState {
     bool     otaActive;
     int      otaPct;       // -1=checking, 0-100=downloading
     char     otaVersion[20];
+    // SD-fault overlay (shown when the card is unusable / being recovered)
+    bool     sdError;
+    bool     sdReformatting; // true once a destructive reformat has been scheduled
 };
 
 // Sliding-window over recent samples (value = whatever the caller stores: here,
@@ -145,6 +148,21 @@ inline void updateDisplay(DisplayState& ds) {
         }
 
         // Row 55 left empty (was "Do not unplug")
+    } else if (ds.sdError) {
+        // ── SD-fault overlay (card unusable / being recovered) ──────────
+        // Surfaces a card failure to anyone looking at the unit, even with no
+        // serial. The connection bar above still shows cellular state, since in
+        // this mode the firmware is logging the fault over the link.
+        {
+            const char* big = "SD ERROR";
+            int w = g_hal->display->text_width(big, 2);
+            g_hal->display->text((128 - w) / 2, 22, big, 2);
+        }
+        {
+            const char* sub = ds.sdReformatting ? "reformatting..." : "recovering...";
+            int w = strlen(sub) * 6;
+            g_hal->display->text((128 - w) / 2, 44, sub);
+        }
     } else {
         // ── Normal operational display ──────────────────────────────────
         float uploaded  = ds.mbUploaded + ds.uploadingMb;

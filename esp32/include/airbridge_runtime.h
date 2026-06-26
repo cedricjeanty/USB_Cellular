@@ -34,6 +34,34 @@ inline bool watchdogShouldReboot(uint32_t lastHeartbeatMs, uint32_t nowMs,
     return (uint32_t)(nowMs - lastHeartbeatMs) > stallMs;
 }
 
+// ── SD-card runtime health / recovery escalation ────────────────────────────
+// A card that goes bad mid-flight (corrupt FAT, SPI flake) must never silently
+// wedge the unit. The firmware probes the SD periodically and feeds the count of
+// CONSECUTIVE failures here to decide how far to escalate recovery. The gradient
+// is deliberately conservative — non-destructive first, destructive only as a
+// last resort:
+//   NONE     — healthy, or too few failures to act (keep probing/retrying).
+//   DEGRADE  — treat the card as unmounted: stop touching it, surface "SD ERROR"
+//              on the OLED, and egress logs over cellular straight from the RAM
+//              ring buffer (no SD needed) so the failure is visible remotely.
+//              Remount is retried each cycle; a transient flake recovers here
+//              with no data loss and never reaches REFORMAT.
+//   REFORMAT — the card is persistently unusable: reformat it (losing the queued
+//              data, which the DSU re-sends via the cookie) and reboot into the
+//              boot-time format path. The destructive step the user explicitly
+//              authorized: "if the device cannot operate because of a corrupt
+//              fat, we do need to reformat and lose data."
+// degradeAfter/reformatAfter are failure counts (0 disables that tier).
+enum SdRecoveryAction { SD_RECOVERY_NONE = 0, SD_RECOVERY_DEGRADE, SD_RECOVERY_REFORMAT };
+
+inline SdRecoveryAction sdRecoveryAction(uint32_t consecutiveFailures,
+                                         uint32_t degradeAfter,
+                                         uint32_t reformatAfter) {
+    if (reformatAfter > 0 && consecutiveFailures >= reformatAfter) return SD_RECOVERY_REFORMAT;
+    if (degradeAfter  > 0 && consecutiveFailures >= degradeAfter)  return SD_RECOVERY_DEGRADE;
+    return SD_RECOVERY_NONE;
+}
+
 // Check for OTA firmware update via the S3 API.
 // Does NOT download or flash — just checks version and gets URL.
 inline OtaCheckResult halOtaCheck(const char* currentVersion) {

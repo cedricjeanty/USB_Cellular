@@ -154,3 +154,21 @@ inline void airbridge_log_clear() {
         _log_mutex_give();
     }
 }
+
+// Consume (drop) the first n bytes from the front of the ring buffer, keeping
+// any bytes that arrived after the snapshot. Used by the SD-independent log
+// egress: when the SD card is unavailable we snapshot the buffer, POST it to
+// S3, and on success consume exactly the bytes we sent — so each line is
+// uploaded once without needing a stable SD-file byte offset. n is clamped to
+// the current length; consuming everything is equivalent to a clear.
+inline void airbridge_log_consume(int n) {
+    if (n <= 0) return;
+    if (!_log_mutex_take()) return;
+    if (n >= s_loglen) {
+        s_loglen = 0;
+    } else {
+        memmove(s_logbuf, s_logbuf + n, s_loglen - n);
+        s_loglen -= n;
+    }
+    _log_mutex_give();
+}

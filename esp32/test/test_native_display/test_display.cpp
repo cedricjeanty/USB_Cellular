@@ -239,6 +239,43 @@ void test_updateDisplay_no_signal(void) {
     TEST_ASSERT_FALSE(s_display.pixel_at(108, 6)); // bar 0 not drawn
 }
 
+void test_updateDisplay_sd_error(void) {
+    DisplayState ds = make_default_state();
+    ds.sdError = true;
+    updateDisplay(ds);
+    TEST_ASSERT_EQUAL_INT(1, s_display.flush_count);
+    // The SD-fault overlay renders the big "SD ERROR" text...
+    TEST_ASSERT_TRUE(s_display.pixel_count() > 100);
+    // ...and REPLACES the normal gauges: the USB/UPLOAD column divider drawn at
+    // x=63 only in the normal operational layout must be absent here.
+    TEST_ASSERT_FALSE(s_display.pixel_at(63, 11));
+}
+
+void test_updateDisplay_normal_has_divider(void) {
+    // Counterpart to the SD-error test: the normal layout DOES draw the x=63
+    // divider, so the discriminator above is meaningful.
+    DisplayState ds = make_default_state();
+    ds.mbQueued = 10.0f;
+    updateDisplay(ds);
+    TEST_ASSERT_TRUE(s_display.pixel_at(63, 11));
+}
+
+void test_updateDisplay_ota_precedence_over_sd_error(void) {
+    // An active OTA overlay takes precedence over the SD-fault overlay.
+    DisplayState ds = make_default_state();
+    ds.sdError   = true;
+    ds.otaActive = true;
+    ds.otaPct    = 50;
+    strlcpy(ds.otaVersion, "1.2.3", sizeof(ds.otaVersion));
+    updateDisplay(ds);
+    // OTA progress bar outline is at y=38..45 across x=4..123; SD overlay never
+    // draws there. A pixel on the OTA bar frame confirms OTA won.
+    bool otaBarDrawn = false;
+    for (int x = 4; x < 124; x++)
+        if (s_display.pixel_at(x, 38)) { otaBarDrawn = true; break; }
+    TEST_ASSERT_TRUE(otaBarDrawn);
+}
+
 // ── dispSplash tests ────────────────────────────────────────────────────────
 
 void test_dispSplash(void) {
@@ -304,6 +341,9 @@ int main(int argc, char** argv) {
     RUN_TEST(test_updateDisplay_eta_shown);
     RUN_TEST(test_updateDisplay_modem_connecting);
     RUN_TEST(test_updateDisplay_no_signal);
+    RUN_TEST(test_updateDisplay_sd_error);
+    RUN_TEST(test_updateDisplay_normal_has_divider);
+    RUN_TEST(test_updateDisplay_ota_precedence_over_sd_error);
 
     // dispSplash
     RUN_TEST(test_dispSplash);

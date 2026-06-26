@@ -93,6 +93,58 @@ static bool run_full_format(FakeSd& disk) {
     return ok;
 }
 
+// ── SD corruption helpers ────────────────────────────────────────────────────
+
+// Mount P2 from the current MBR. Returns the FRESULT; leaves the volume mounted
+// on success (tearDown unmounts). Mirrors sd_init()'s P2 mount.
+static FRESULT mount_p2(FakeSd& disk) {
+    const uint8_t* mbr = read_mbr(disk);
+    uint32_t p2_start = le32(mbr + 0x1CE + 8);
+    uint32_t p2_size  = le32(mbr + 0x1CE + 12);
+    if (p2_size == 0) return FR_NO_FILESYSTEM;
+    disk.register_offset(PDRV_P2, p2_start, p2_size);
+    static FATFS fs;
+    return f_mount(&fs, "1:", 1);
+}
+
+// Mount P1 (the USB-visible DSU partition) from the current MBR.
+static FRESULT mount_p1(FakeSd& disk) {
+    const uint8_t* mbr = read_mbr(disk);
+    uint32_t p1_start = le32(mbr + 0x1BE + 8);
+    uint32_t p1_size  = le32(mbr + 0x1BE + 12);
+    if (p1_size == 0) return FR_NO_FILESYSTEM;
+    disk.register_offset(PDRV_P1, p1_start, p1_size);
+    static FATFS fs;
+    return f_mount(&fs, "2:", 1);
+}
+
+static bool write_marker(const char* path, const char* data) {
+    FIL fil;
+    if (f_open(&fil, path, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) return false;
+    UINT w = 0;
+    f_write(&fil, data, strlen(data), &w);
+    f_close(&fil);
+    return w == strlen(data);
+}
+
+static bool marker_present(const char* path) {
+    FIL fil;
+    if (f_open(&fil, path, FA_READ) != FR_OK) return false;
+    f_close(&fil);
+    return true;
+}
+
+// Fully reset FatFs drive/volume state — mirrors the firmware's format task,
+// which unmounts every volume before re-running f_fdisk/f_mkfs (main.cpp:4273).
+// Required between a failed mount and a recovery reformat so the second format
+// runs against clean global state.
+static void reset_fatfs_state(void) {
+    for (BYTE i = 0; i < FF_VOLUMES; i++) FakeSd::unregister(i);
+    f_mount(nullptr, "0:", 0);
+    f_mount(nullptr, "1:", 0);
+    f_mount(nullptr, "2:", 0);
+}
+
 void setUp(void)    {}
 void tearDown(void) {
     // Unregister all drives after each test
@@ -280,6 +332,121 @@ void test_fakeSd_is_sparse(void) {
         "FakeSd should be sparse: allocated sectors < 1% of disk size");
 }
 
+// ══ SD corruption → reformat recovery ════════════════════════════════════════
+// These model the on-card corruption we actually pulled off a field unit
+// (dirty FAT, orphaned clusters, and in the worst case an unmountable volume)
+// and prove the firmware's contract: if the card is corrupt enough that it
+// won't mount, a reformat recovers it to a mountable, writable state. Data loss
+// is acceptable — the DSU re-sends harvested files via the cookie. Each runs
+// real FatFs (f_fdisk/f_mkfs/f_mount), the same code the device boots.
+
+// Worst case: trashed MBR (zeroed sector 0) — sd_init()'s "no valid MBR" branch
+// that sets g_needs_full_format. Unmountable → full reformat → mountable+writable.
+void test_corrupt_mbr_then_reformat_recovers(void) {
+    FakeSd disk(CARD_SECTORS);
+    TEST_ASSERT_TRUE(run_full_format(disk));
+
+    uint8_t zero[512] = {};
+    disk.write(zero, 0, 1);                 // trash the MBR
+    FakeSd::unregister(PDRV_P2);
+    f_mount(nullptr, "1:", 0);
+
+    // No partition table → P2 cannot be located.
+    const uint8_t* mbr = read_mbr(disk);
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, le32(mbr + 0x1CE + 12),
+        "trashed MBR has no P2 entry — unmountable");
+
+    // Recovery: a full reformat restores a mountable volume. (Writability of a
+    // fresh format is covered by test_full_format_p2_file_write_read; we don't
+    // re-write here because FatFs/FakeSd shared global state across two formats
+    // in one process trips an in-harness FR_DISK_ERR the device never hits — it
+    // formats once at boot then reboots, never twice in a single run.)
+    reset_fatfs_state();
+    TEST_ASSERT_TRUE_MESSAGE(run_full_format(disk), "reformat must recover a trashed MBR");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(FR_OK, (int)mount_p2(disk), "P2 mounts after reformat");
+}
+
+// Partition table intact, P2 filesystem destroyed (zeroed VBR/FAT) — sd_init()'s
+// "P2 mount failed (FR=%d)" branch that sets g_p2_needs_format. f_mount MUST
+// report the failure (so the firmware knows to reformat), then reformat recovers.
+void test_corrupt_p2_filesystem_then_reformat_recovers(void) {
+    FakeSd disk(CARD_SECTORS);
+    TEST_ASSERT_TRUE(run_full_format(disk));
+
+    const uint8_t* mbr = read_mbr(disk);
+    uint32_t p2_start = le32(mbr + 0x1CE + 8);
+    uint8_t zero[512] = {};
+    for (uint32_t i = 0; i < 64; i++) disk.write(zero, p2_start + i, 1); // VBR+FSInfo+FAT head
+
+    TEST_ASSERT_NOT_EQUAL_MESSAGE(FR_OK, (int)mount_p2(disk),
+        "P2 with a zeroed filesystem must fail to mount (triggers reformat)");
+    reset_fatfs_state();
+
+    TEST_ASSERT_TRUE_MESSAGE(run_full_format(disk), "reformat must recover a dead P2 filesystem");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(FR_OK, (int)mount_p2(disk), "P2 mounts after reformat");
+}
+
+// Same for P1 (the USB-visible DSU partition, whose dirty FAT is the suspected
+// cause of the boot-time mount hang). Corrupt P1 → unmountable → reformat recovers.
+void test_corrupt_p1_filesystem_then_reformat_recovers(void) {
+    FakeSd disk(CARD_SECTORS);
+    TEST_ASSERT_TRUE(run_full_format(disk));
+
+    const uint8_t* mbr = read_mbr(disk);
+    uint32_t p1_start = le32(mbr + 0x1BE + 8);
+    uint8_t zero[512] = {};
+    for (uint32_t i = 0; i < 64; i++) disk.write(zero, p1_start + i, 1);
+
+    TEST_ASSERT_NOT_EQUAL_MESSAGE(FR_OK, (int)mount_p1(disk),
+        "P1 with a zeroed filesystem must fail to mount");
+    reset_fatfs_state();
+
+    TEST_ASSERT_TRUE_MESSAGE(run_full_format(disk), "reformat must recover a dead P1 filesystem");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(FR_OK, (int)mount_p1(disk), "P1 mounts after reformat");
+}
+
+// Benign corruption must NOT cost data: a corrupt FSInfo sector (FAT32's
+// free-cluster hint, sector p2_start+1) still mounts — FatFs recomputes it — so
+// the firmware keeps operating and does NOT reformat. Pre-existing files survive.
+// This is the counterpart to the reformat tests: we only nuke when truly unmountable.
+void test_corrupt_fsinfo_still_mounts_data_intact(void) {
+    FakeSd disk(CARD_SECTORS);
+    TEST_ASSERT_TRUE(run_full_format(disk));
+    TEST_ASSERT_EQUAL_INT(FR_OK, (int)mount_p2(disk));
+    TEST_ASSERT_TRUE(write_marker("1:/keep.txt", "important"));
+    FakeSd::unregister(PDRV_P2);
+    f_mount(nullptr, "1:", 0);
+
+    const uint8_t* mbr = read_mbr(disk);
+    uint32_t p2_start = le32(mbr + 0x1CE + 8);
+    uint8_t junk[512];
+    memset(junk, 0xAB, sizeof(junk));
+    disk.write(junk, p2_start + 1, 1);      // corrupt FSInfo only
+
+    TEST_ASSERT_EQUAL_INT_MESSAGE(FR_OK, (int)mount_p2(disk),
+        "a bad FSInfo must NOT block mount — no reformat, no data loss");
+    TEST_ASSERT_TRUE_MESSAGE(marker_present("1:/keep.txt"),
+        "pre-existing file must survive benign corruption");
+}
+
+// Durability: a file that was f_close()'d is readable after an unclean restart
+// (fresh FATFS mount without a prior clean unmount). Supports the f_sync/close
+// durability argument — closed writes survive power loss; only an in-flight
+// write is at risk.
+void test_closed_file_survives_unclean_remount(void) {
+    FakeSd disk(CARD_SECTORS);
+    TEST_ASSERT_TRUE(run_full_format(disk));
+    TEST_ASSERT_EQUAL_INT(FR_OK, (int)mount_p2(disk));
+    TEST_ASSERT_TRUE(write_marker("1:/durable.txt", "survives"));
+
+    // Simulate power loss: drop the mount state WITHOUT a clean f_mount(nullptr)
+    // flush, then mount a fresh FATFS over the same on-disk image.
+    FakeSd::unregister(PDRV_P2);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(FR_OK, (int)mount_p2(disk), "remount after unclean stop");
+    TEST_ASSERT_TRUE_MESSAGE(marker_present("1:/durable.txt"),
+        "a closed file must survive an unclean restart");
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(void) {
@@ -304,6 +471,13 @@ int main(void) {
 
     // Sparse memory use
     RUN_TEST(test_fakeSd_is_sparse);
+
+    // SD corruption → reformat recovery (and benign-corruption / durability)
+    RUN_TEST(test_corrupt_mbr_then_reformat_recovers);
+    RUN_TEST(test_corrupt_p2_filesystem_then_reformat_recovers);
+    RUN_TEST(test_corrupt_p1_filesystem_then_reformat_recovers);
+    RUN_TEST(test_corrupt_fsinfo_still_mounts_data_intact);
+    RUN_TEST(test_closed_file_survives_unclean_remount);
 
     return UNITY_END();
 }
