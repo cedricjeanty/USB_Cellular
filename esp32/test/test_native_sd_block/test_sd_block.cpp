@@ -20,6 +20,7 @@
 #include <cstdio>
 #include "fake_sd.h"
 #include "ff.h"
+#include "airbridge_sd.h"   // shared dual-partition format sequence (also run by the firmware)
 
 // ── Constants matching the firmware ──────────────────────────────────────────
 
@@ -45,52 +46,28 @@ static const uint8_t* read_mbr(FakeSd& disk) {
     return buf;
 }
 
-// Run the firmware's format sequence on a FakeSd and return true on success.
-// This mirrors FmtTask in main.cpp exactly (the FIXED version).
+// FakeSd-backed implementation of the shared SdDiskOps. The firmware backs these
+// same hooks with sdmmc + ff_diskio_register; the format SEQUENCE is identical
+// (airbridge_sd.h::sdFormatDual), so this test exercises the exact firmware code.
+static SdDiskOps fakeSdOps(FakeSd& disk) {
+    SdDiskOps ops = {};
+    ops.registerRaw    = [](void* c){ ((FakeSd*)c)->register_raw(SD_PDRV_RAW); };
+    ops.registerOffset = [](int pdrv, uint32_t s, uint32_t n, void* c){
+        ((FakeSd*)c)->register_offset((BYTE)pdrv, s, n); };
+    ops.unregister     = [](int pdrv, void* /*c*/){ FakeSd::unregister((BYTE)pdrv); };
+    ops.readMbr        = [](uint8_t* b, void* c){ ((FakeSd*)c)->read_sector(0, b); return true; };
+    ops.writeMbr       = [](const uint8_t* b, void* c){ ((FakeSd*)c)->write(b, 0, 1); return true; };
+    ops.ctx            = &disk;
+    return ops;
+}
+
+// Run the firmware's dual-partition format on a FakeSd. Delegates to the shared
+// sdFormatDual (the same code FmtTask runs), so these tests pin the real bytes.
 static bool run_full_format(FakeSd& disk) {
-    uint32_t p1_sectors = MSC_MAX;
-    uint32_t p2_sectors = (disk.num_sectors() > p1_sectors + 2048)
-                          ? disk.num_sectors() - p1_sectors : 0;
-    if (p2_sectors == 0) return false;
-
-    disk.register_raw(PDRV_RAW);
-
-    LBA_t plist[] = {(LBA_t)p1_sectors, (LBA_t)p2_sectors, 0, 0};
-    void* work = malloc(4096);
-    if (!work) { FakeSd::unregister(PDRV_RAW); return false; }
-
-    bool ok = false;
-
-    // Step 1: create partition table
-    FRESULT fr = f_fdisk(PDRV_RAW, plist, work);
-    if (fr != FR_OK) { free(work); FakeSd::unregister(PDRV_RAW); return false; }
-
-    // Step 2: read back MBR to get actual LBA starts + fix types to 0x0C
-    uint8_t mbr[512];
-    disk.read_sector(0, mbr);
-    uint32_t p1_start = le32(mbr + 0x1BE + 8);
-    uint32_t p2_start = le32(mbr + 0x1CE + 8);
-    uint32_t p2_size  = le32(mbr + 0x1CE + 12);
-    mbr[0x1BE + 4] = 0x0C;
-    if (p2_size > 0) mbr[0x1CE + 4] = 0x0C;
-    disk.write(mbr, 0, 1);
-
-    // Step 3: format P1 via offset diskio + FM_SFD
-    MKFS_PARM opt = { .fmt = (BYTE)(FM_FAT32 | FM_SFD), .n_fat = 2, .au_size = 4096 };
-    disk.register_offset(PDRV_P1, p1_start, p1_sectors);
-    fr = f_mkfs("2:", &opt, work, 4096);
-    FakeSd::unregister(PDRV_P1);
-    if (fr != FR_OK) { free(work); FakeSd::unregister(PDRV_RAW); return false; }
-
-    // Step 4: format P2 via offset diskio + FM_SFD
-    disk.register_offset(PDRV_P2, p2_start, p2_size);
-    fr = f_mkfs("1:", &opt, work, 4096);
-    if (fr != FR_OK) { free(work); FakeSd::unregister(PDRV_P2); FakeSd::unregister(PDRV_RAW); return false; }
-
-    ok = true;
-    free(work);
-    FakeSd::unregister(PDRV_RAW);
-    return ok;
+    static BYTE work[4096];
+    SdDiskOps ops = fakeSdOps(disk);
+    SdFormatResult r = sdFormatDual(ops, disk.num_sectors(), MSC_MAX, 4096, work, sizeof(work));
+    return r.ok;
 }
 
 // ── SD corruption helpers ────────────────────────────────────────────────────
