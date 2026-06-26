@@ -391,10 +391,18 @@ esp32/
 ```
 lambda/presign.py                # S3 pre-signed URLs, fw version check, DSU cookie, OTA URL, log append
 scripts/
-├── e2e_unified.sh               # Unified E2E suite (~15 tests; consolidated lifecycle + manifest +
+├── e2e_lib.sh                   # Shared E2E harness library (config + helper defs: start/stop/power_cut,
+│                                #   marker, wait_for_* state-triggered waits, get_manifest_hwm, write_dsu_file,
+│                                #   seed_manifest*, cleanup_*). Sourced by e2e_unified.sh + flight_cycle_test.sh.
+├── e2e_unified.sh               # Unified E2E suite (~25 tests; consolidated lifecycle + manifest +
 │                                #   power-cut tests; state-triggered waits). --target emulator | device.
 │                                #   Device runs the SAME consolidated tests via persistent CDC + a
 │                                #   serial-log tap (/tmp/dev_e2e.log) + host_dsu.py (see docs/testing.md).
+├── flight_cycle_test.sh         # Emulator soak test: repeated flight cycles over a scripted cellular
+│                                #   profile (full→weak→off→flaky→full), measuring cycles-to-catch-up of a
+│                                #   DSU backlog (S3 manifest hwm == latest flight). Cellular is scripted via
+│                                #   EMU_CELL_FILE (emu/main.cpp applyCellState + sim_modem setFlaky/flakyDropsFrame:
+│                                #   PPP_IP-only loss). Params: --backlog/--cycles/--ratio/--flaky/--cruise-kb/--ground-kb.
 ├── host_dsu.py                  # Cookie-aware host-side DSU sim (port of sim_dsu.h): mounts the ESP32
 │                                #   USB volume, reads dsuCookie.easdf, emits only un-sent flights. Backs
 │                                #   write_dsu_file on --target device. Modes: emit/slice/plant-cookie/
