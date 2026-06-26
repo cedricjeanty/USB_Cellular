@@ -545,7 +545,9 @@ int main(int argc, char* argv[]) {
     // already in ./emu_sdcard[_internal] are imported so the drop-files workflow
     // still seeds the card.
     if (getenv("EMU_SD_BLOCK")) {
-        s_blockFs = new FatFsFilesys(4194304, SD_ROOT, SD_INTERNAL);  // 2 GB sparse
+        // 16 GB card, 8 GB P1 (matches the device); FakeSd is sparse so memory
+        // tracks only written sectors. Dual-partition FAT32 via sdFormatDual.
+        s_blockFs = new FatFsFilesys(31116288, 16777216, SD_ROOT, SD_INTERNAL);
         if (s_blockFs->format()) {
             int n1 = s_blockFs->importHostTree(SD_ROOT, SD_ROOT);
             int n2 = s_blockFs->importHostTree(SD_INTERNAL, SD_INTERNAL);
@@ -1244,7 +1246,8 @@ int main(int argc, char* argv[]) {
         // (re-seeded from the host dirs = the DSU re-sending via the cookie).
         // Thresholds are compressed (degrade@2s, reformat@5s) for a watchable demo.
         if (s_sdBlockMode && s_blockFs) {
-            static uint32_t healthStart = 0, lastHealth = 0, fails = 0;
+            static uint32_t healthStart = 0, lastHealth = 0;
+            static SdHealthState health;   // SAME state machine the firmware runs
             static bool degraded = false, autoCorrupted = false;
             if (healthStart == 0) healthStart = now;
             const char* afterMs = getenv("EMU_SD_CORRUPT_AFTER_MS");
@@ -1260,16 +1263,13 @@ int main(int argc, char* argv[]) {
             if (now - lastHealth >= 1000) {
                 lastHealth = now;
                 bool ok = s_blockFs->probeOk();
-                if (ok) {
-                    fails = 0;
-                    if (degraded) { degraded = false; ds.sdError = false; ds.sdReformatting = false; }
-                } else {
-                    fails++;
-                }
-                SdRecoveryAction act = sdRecoveryAction(fails, 2, 5);
+                if (ok && degraded) { degraded = false; ds.sdError = false; ds.sdReformatting = false; }
+                // Compressed thresholds (degrade@2, reformat@5) for a watchable demo.
+                SdRecoveryAction act = sdHealthUpdate(health, ok, 2, 5);
                 if (act == SD_RECOVERY_DEGRADE && !degraded) {
                     degraded = true; ds.sdError = true; ds.sdReformatting = false;
-                    airbridge_log("SD: runtime failure (n=%u) — degraded; SD ERROR on OLED, logging via cellular", (unsigned)fails);
+                    airbridge_log("SD: runtime failure (n=%u) — degraded; SD ERROR on OLED, logging via cellular",
+                                  (unsigned)health.consecutiveFailures);
                     printf("[SD] degraded — SD ERROR shown on OLED\n");
                 } else if (act == SD_RECOVERY_REFORMAT) {
                     ds.sdError = true; ds.sdReformatting = true;
@@ -1279,7 +1279,7 @@ int main(int argc, char* argv[]) {
                     s_blockFs->format();
                     s_blockFs->importHostTree(SD_ROOT, SD_ROOT);
                     s_blockFs->importHostTree(SD_INTERNAL, SD_INTERNAL);
-                    fails = 0; degraded = false; ds.sdError = false; ds.sdReformatting = false;
+                    health = SdHealthState{}; degraded = false; ds.sdError = false; ds.sdReformatting = false;
                     airbridge_log("SD: reformatted + reseeded — recovered");
                     printf("[SD] recovered\n");
                 }

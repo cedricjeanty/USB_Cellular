@@ -411,8 +411,7 @@ static uint32_t msc_visible_sectors() {
 static bool     g_dual_partition   = false;
 static bool     g_p2_needs_format  = false; // deferred: format P2 only in upload task
 static bool     g_needs_full_format = false; // deferred: full repartition in upload task
-// Runtime SD-health recovery (see sdRecoveryAction in airbridge_runtime.h)
-static uint32_t g_sd_fail_count    = 0;     // consecutive failed SD probes/remounts
+// Runtime SD-health recovery (see sdHealthUpdate/sdRecoveryAction in airbridge_runtime.h)
 static volatile bool g_sd_degraded = false; // card declared unusable at runtime (drives OLED + cellular log egress)
 static volatile bool g_sd_reformatting = false; // destructive reformat scheduled (OLED)
 static uint32_t g_p2_start_sector  = 0;  // partition 2 LBA start
@@ -3763,11 +3762,6 @@ static void watchdog_task(void* param) {
 #define SD_DEGRADE_AFTER  5    // consecutive failed probes (~10s at 2s cadence)
 #define SD_REFORMAT_AFTER 20   // persistent failure (~40s) → destructive last resort
 
-static void note_sd_result(bool ok) {
-    if (ok) g_sd_fail_count = 0;
-    else if (g_sd_fail_count < 0xFFFFu) g_sd_fail_count++;
-}
-
 // Record the reformat in NVS (survives the reboot, reported on next boot),
 // give the cellular log-egress a brief window, then reboot into the boot-time
 // reformat path. Does not return.
@@ -3812,35 +3806,36 @@ static void sd_health_check() {
     if (g_harvesting) return;
     if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return; // contended → skip, no count
 
+    bool ok;
     if (g_fatfs_mounted) {
         FILINFO fno;
         FRESULT fr = f_stat(g_dual_partition ? "1:/logs" : "0:/logs", &fno);
         // FR_OK or FR_NO_FILE both mean the filesystem responded; a bus/card
         // failure surfaces as FR_DISK_ERR / FR_NOT_READY / FR_INT_ERR.
-        bool ok = (fr == FR_OK || fr == FR_NO_FILE);
-        note_sd_result(ok);
+        ok = (fr == FR_OK || fr == FR_NO_FILE);
     } else {
         // Degraded/unmounted: try to bring the card back (a transient flake
         // recovers here, with no data loss and no reformat).
-        bool ok = sd_mount_fatfs();
-        note_sd_result(ok);
+        ok = sd_mount_fatfs();
         if (ok) {
-            g_sd_degraded = false; g_sd_error[0] = '\0'; g_sd_fail_count = 0;
+            g_sd_degraded = false; g_sd_error[0] = '\0';
             airbridge_log("SD: remounted — recovered from runtime failure");
         }
     }
     xSemaphoreGive(g_sd_mutex);
 
-    SdRecoveryAction act = sdRecoveryAction(g_sd_fail_count, SD_DEGRADE_AFTER, SD_REFORMAT_AFTER);
+    // Shared health state machine (also run by the emulator).
+    static SdHealthState health;
+    SdRecoveryAction act = sdHealthUpdate(health, ok, SD_DEGRADE_AFTER, SD_REFORMAT_AFTER);
     if (act == SD_RECOVERY_REFORMAT) {
         request_reformat_and_reboot("runtime SD failure");   // does not return
     } else if (act == SD_RECOVERY_DEGRADE && !g_sd_degraded) {
         g_sd_degraded   = true;
         g_fatfs_mounted = false;   // stop touching the card; log egress falls back to cellular (RAM buffer)
         snprintf(g_sd_error, sizeof(g_sd_error), "runtime SD failure (n=%lu)",
-                 (unsigned long)g_sd_fail_count);
+                 (unsigned long)health.consecutiveFailures);
         airbridge_log("SD: runtime failure (n=%lu) — degraded; logging via cellular, retrying remount",
-                      (unsigned long)g_sd_fail_count);
+                      (unsigned long)health.consecutiveFailures);
     }
 }
 

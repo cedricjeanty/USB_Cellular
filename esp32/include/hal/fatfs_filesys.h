@@ -1,21 +1,20 @@
 #pragma once
 // FatFsFilesys — an IFilesys backed by REAL FatFs running on an in-memory
-// FakeSd block device. This is the emulator's "SD through FakeSd": file/dir
-// operations execute the same FatFs code (f_open/f_read/f_mkdir/f_mkfs/…) the
-// device runs, so a corrupt FAT can be injected at the sector level and the
-// firmware's degrade→reformat recovery exercised end-to-end (not just in unit
-// tests).
+// FakeSd block device, in the SAME dual-partition layout the device uses. This
+// is the emulator's "SD through FakeSd": file/dir operations execute the real
+// FatFs code, and the card is partitioned + formatted by the shared
+// airbridge_sd.h::sdFormatDual — the exact sequence the firmware's FmtTask runs.
 //
-// Layout: a single FAT32 volume (drive "0:") on the FakeSd. The two logical
-// partitions the firmware uses — P1 (DSU-facing) and P2 (internal) — are mapped
-// to subdirectories "0:/p1" and "0:/p2" by HAL path prefix, which is enough to
-// run the harvest/upload/log pipeline and the corruption/reformat lifecycle.
+// Layout (mirrors the hardware): one FakeSd card split into
+//   P1 (DSU-facing)  -> FatFs drive "2:", HAL prefix p1Prefix (./emu_sdcard)
+//   P2 (internal)    -> FatFs drive "1:", HAL prefix p2Prefix (./emu_sdcard_internal)
+// HAL paths are mapped to the right drive by prefix.
 //
-// Corruption model: corruptFat() zeroes the VBR+FAT head (real sectors) and
-// drops the mount, so subsequent ops fail and a remount fails — exactly a
-// card whose filesystem is unreadable. reformat() re-runs f_mkfs, which rewrites
-// the VBR/FAT and recovers a mountable, writable volume (data lost — the DSU
-// re-sends via the cookie), mirroring the device's reformat path.
+// Corruption model: corruptFat() zeroes P2's VBR+FAT head (real sectors) and
+// drops the mount, so subsequent ops fail and a remount fails — exactly a card
+// whose filesystem is unreadable. format() re-runs sdFormatDual, which rewrites
+// the partition table + VBRs and recovers a mountable, writable card (data lost —
+// the DSU re-sends via the cookie), mirroring the device's reformat path.
 //
 // Single-threaded use assumed (the emulator serializes SD access under the HAL
 // lock), matching FatFs's static-LFN-buffer config.
@@ -23,75 +22,67 @@
 #include "hal/filesys.h"
 #include "hal/fake_sd.h"
 #include "ff.h"
+#include "airbridge_sd.h"   // shared dual-partition format sequence
 
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
 #include <string>
-#include <vector>
 #include <dirent.h>
 #include <sys/stat.h>
 
 class FatFsFilesys : public IFilesys {
 public:
-    FatFsFilesys(uint32_t cardSectors, const char* p1Prefix, const char* p2Prefix)
-        : p1_(p1Prefix), p2_(p2Prefix) {
+    // cardSectors: whole-card size; p1Sectors: size of P1 (P2 takes the rest).
+    FatFsFilesys(uint32_t cardSectors, uint32_t p1Sectors,
+                 const char* p1Prefix, const char* p2Prefix)
+        : cardSectors_(cardSectors), p1Sectors_(p1Sectors), p1_(p1Prefix), p2_(p2Prefix) {
         disk_ = new FakeSd(cardSectors);
     }
-    ~FatFsFilesys() { if (mounted_) f_mount(nullptr, "0:", 0); FakeSd::unregister(0); delete disk_; }
+    ~FatFsFilesys() { unmountAll(); FakeSd::unregister(SD_PDRV_RAW); delete disk_; }
 
     bool mounted() const { return mounted_; }
 
-    // (Re)create the filesystem: mkfs the whole card as one FAT32 volume, mount,
-    // and create the p1/p2 base dirs. Returns true on success.
+    // (Re)partition + format the card via the shared sequence, then mount both
+    // partitions. Returns true on success.
     bool format() {
-        if (mounted_) { f_mount(nullptr, "0:", 0); mounted_ = false; }
-        FakeSd::unregister(0);
-        disk_->register_raw(0);
+        unmountAll();
+        FakeSd::unregister(SD_PDRV_RAW);
+        FakeSd::unregister(SD_PDRV_P1);
+        FakeSd::unregister(SD_PDRV_P2);
         static BYTE work[4096];
-        // FM_ANY lets FatFs pick FAT12/16/32 + cluster size for the (emulator-
-        // sized) card; FM_SFD = no partition table, mkfs writes the VBR at LBA 0.
-        MKFS_PARM opt = { (BYTE)(FM_ANY | FM_SFD), 1, 0, 0, 0 };
-        if (f_mkfs("0:", &opt, work, sizeof(work)) != FR_OK) return false;
-        if (f_mount(&fs_, "0:", 1) != FR_OK) return false;
-        mounted_ = true;
-        f_mkdir("0:/p1");
-        f_mkdir("0:/p2");
-        return true;
+        SdDiskOps ops = makeOps();
+        SdFormatResult r = sdFormatDual(ops, cardSectors_, p1Sectors_, 4096, work, sizeof(work));
+        if (!r.ok) return false;
+        p1Start_ = r.p1Start; p2Start_ = r.p2Start; p2Size_ = r.p2Size;
+        return mountBoth();
     }
 
-    // Attempt to (re)mount an existing volume — used by the health/recovery loop.
+    // Attempt to (re)mount both partitions — used by the health/recovery loop.
     bool remount() {
         if (mounted_) return true;
-        FakeSd::unregister(0);
-        disk_->register_raw(0);
-        if (f_mount(&fs_, "0:", 1) != FR_OK) return false;
-        mounted_ = true;
-        return true;
+        return mountBoth();
     }
 
-    // Inject real FAT corruption: zero the VBR + FAT head and drop the mount.
-    // Subsequent ops fail and remount() fails until reformat().
+    // Inject real FAT corruption: zero P2's VBR + FAT head and drop the mount.
+    // Subsequent ops fail and remount() fails until format().
     void corruptFat() {
         uint8_t zero[512] = {0};
-        for (uint32_t s = 0; s < 64; s++) disk_->write(zero, s, 1);
-        if (mounted_) { f_mount(nullptr, "0:", 0); mounted_ = false; }
+        for (uint32_t s = 0; s < 64; s++) disk_->write(zero, p2Start_ + s, 1);
+        unmountAll();
     }
 
-    // Light health probe (mirrors sd_health_check's f_stat): true if the FS
-    // responds. When unmounted, tries a remount first.
+    // Light health probe (mirrors sd_health_check's f_stat on P2): true if the
+    // P2 filesystem responds. When unmounted, tries a remount first.
     bool probeOk() {
         if (!mounted_ && !remount()) return false;
         FILINFO fno;
-        FRESULT fr = f_stat("0:/p2", &fno);
-        // FR_OK / FR_NO_FILE = filesystem responded; a dead FS surfaces as
-        // FR_DISK_ERR / FR_NO_FILESYSTEM / FR_INT_ERR.
+        FRESULT fr = f_stat("1:/logs", &fno);
         return (fr == FR_OK || fr == FR_NO_FILE);
     }
 
-    // Copy a host directory tree into the FAT volume under the given HAL prefix,
-    // so the emulator's "drop files into ./emu_sdcard" workflow still seeds the
-    // in-memory card at boot. Recursive; best-effort; returns the file count.
+    // Copy a host directory tree into the card under the given HAL prefix, so the
+    // emulator's "drop files into ./emu_sdcard" workflow still seeds the card.
     int importHostTree(const char* hostDir, const char* halPrefix) {
         if (!mounted_) return 0;
         return importRec(hostDir, halPrefix);
@@ -151,8 +142,7 @@ public:
     }
     bool mkdir(const char* path) override {
         if (!mounted_) return false;
-        std::string p = mapPath(path);
-        FRESULT fr = f_mkdir(p.c_str());
+        FRESULT fr = f_mkdir(mapPath(path).c_str());
         return fr == FR_OK || fr == FR_EXIST;
     }
     bool rmdir(const char* path) override {
@@ -170,6 +160,35 @@ public:
     }
 
 private:
+    // FakeSd-backed SdDiskOps (same hooks the firmware backs with sdmmc).
+    SdDiskOps makeOps() {
+        SdDiskOps ops = {};
+        ops.registerRaw    = [](void* c){ ((FakeSd*)c)->register_raw(SD_PDRV_RAW); };
+        ops.registerOffset = [](int pdrv, uint32_t s, uint32_t n, void* c){
+            ((FakeSd*)c)->register_offset((BYTE)pdrv, s, n); };
+        ops.unregister     = [](int pdrv, void* /*c*/){ FakeSd::unregister((BYTE)pdrv); };
+        ops.readMbr        = [](uint8_t* b, void* c){ ((FakeSd*)c)->read_sector(0, b); return true; };
+        ops.writeMbr       = [](const uint8_t* b, void* c){ ((FakeSd*)c)->write(b, 0, 1); return true; };
+        ops.ctx            = disk_;
+        return ops;
+    }
+
+    bool mountBoth() {
+        disk_->register_offset(SD_PDRV_P1, p1Start_, p1Sectors_);
+        disk_->register_offset(SD_PDRV_P2, p2Start_, p2Size_);
+        if (f_mount(&fsP1_, "2:", 1) != FR_OK) { mounted_ = false; return false; }
+        if (f_mount(&fsP2_, "1:", 1) != FR_OK) { f_mount(nullptr, "2:", 0); mounted_ = false; return false; }
+        mounted_ = true;
+        f_mkdir("1:/upload");
+        f_mkdir("1:/logs");
+        return true;
+    }
+
+    void unmountAll() {
+        if (mounted_) { f_mount(nullptr, "2:", 0); f_mount(nullptr, "1:", 0); }
+        mounted_ = false;
+    }
+
     static BYTE parseMode(const char* mode) {
         if (!mode || !mode[0]) return 0;
         bool plus = strchr(mode, '+') != nullptr;
@@ -183,17 +202,16 @@ private:
         }
     }
 
-    // Map a HAL path ("./emu_sdcard[_internal]/x") to a FatFs path
-    // ("0:/p1/x" or "0:/p2/x"). p2's prefix is a superstring of p1's, so match
-    // the longer (p2) first.
+    // Map a HAL path to a FatFs path. P2's prefix is a superstring of P1's
+    // (./emu_sdcard_internal vs ./emu_sdcard), so match the longer (P2) first.
     std::string mapPath(const char* path) {
         std::string s(path ? path : "");
-        std::string rel; const char* vol = "0:/p1";
-        if (startsWith(s, p2_))      { vol = "0:/p2"; rel = s.substr(p2_.size()); }
-        else if (startsWith(s, p1_)) { vol = "0:/p1"; rel = s.substr(p1_.size()); }
-        else                         { rel = s; if (!rel.empty() && rel[0] != '/') rel = "/" + rel; vol = "0:"; }
+        const char* vol; std::string rel;
+        if (startsWith(s, p2_))      { vol = "1:"; rel = s.substr(p2_.size()); }  // P2 = internal
+        else if (startsWith(s, p1_)) { vol = "2:"; rel = s.substr(p1_.size()); }  // P1 = DSU-facing
+        else                         { vol = "1:"; rel = s; if (!rel.empty() && rel[0] != '/') rel = "/" + rel; }
         std::string out = vol;
-        if (!rel.empty() && rel[0] != '/') out += "/";
+        if (rel.empty() || rel[0] != '/') out += "/";
         out += rel;
         return out;
     }
@@ -201,7 +219,7 @@ private:
         return !p.empty() && s.compare(0, p.size(), p) == 0;
     }
 
-    // Recursively copy hostDir → halPrefix (a HAL path) into the FAT volume.
+    // Recursively copy hostDir -> halPrefix (a HAL path) into the card.
     int importRec(const std::string& hostDir, const std::string& halPrefix) {
         DIR* d = ::opendir(hostDir.c_str());
         if (!d) return 0;
@@ -233,8 +251,10 @@ private:
         return count;
     }
 
-    FakeSd* disk_ = nullptr;
-    FATFS   fs_;
-    bool    mounted_ = false;
+    FakeSd*  disk_ = nullptr;
+    FATFS    fsP1_, fsP2_;
+    uint32_t cardSectors_ = 0, p1Sectors_ = 0;
+    uint32_t p1Start_ = 0, p2Start_ = 0, p2Size_ = 0;
+    bool     mounted_ = false;
     std::string p1_, p2_;
 };

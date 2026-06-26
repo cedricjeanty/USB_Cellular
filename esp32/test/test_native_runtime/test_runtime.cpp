@@ -274,6 +274,25 @@ void test_sd_recovery_disabled_tiers(void) {
     TEST_ASSERT_EQUAL_INT(SD_RECOVERY_REFORMAT, sdRecoveryAction(20, 0, 20));
 }
 
+void test_sd_health_update_resets_on_ok(void) {
+    SdHealthState st;
+    sdHealthUpdate(st, false, 2, 5);
+    sdHealthUpdate(st, false, 2, 5);
+    TEST_ASSERT_EQUAL_UINT(2, st.consecutiveFailures);
+    SdRecoveryAction a = sdHealthUpdate(st, true, 2, 5);  // ok → reset
+    TEST_ASSERT_EQUAL_INT(SD_RECOVERY_NONE, a);
+    TEST_ASSERT_EQUAL_UINT(0, st.consecutiveFailures);
+}
+
+void test_sd_health_update_escalates(void) {
+    SdHealthState st;
+    TEST_ASSERT_EQUAL_INT(SD_RECOVERY_NONE,     sdHealthUpdate(st, false, 2, 5)); // 1
+    TEST_ASSERT_EQUAL_INT(SD_RECOVERY_DEGRADE,  sdHealthUpdate(st, false, 2, 5)); // 2
+    TEST_ASSERT_EQUAL_INT(SD_RECOVERY_DEGRADE,  sdHealthUpdate(st, false, 2, 5)); // 3
+    sdHealthUpdate(st, false, 2, 5);                                              // 4
+    TEST_ASSERT_EQUAL_INT(SD_RECOVERY_REFORMAT, sdHealthUpdate(st, false, 2, 5)); // 5
+}
+
 // ── Test runner ─────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -315,6 +334,8 @@ int main(int argc, char** argv) {
     RUN_TEST(test_sd_recovery_degrade_band);
     RUN_TEST(test_sd_recovery_reformat);
     RUN_TEST(test_sd_recovery_disabled_tiers);
+    RUN_TEST(test_sd_health_update_resets_on_ok);
+    RUN_TEST(test_sd_health_update_escalates);
 
     return UNITY_END();
 }

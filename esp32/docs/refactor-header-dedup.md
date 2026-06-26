@@ -39,12 +39,17 @@ codebase.
   diskio registration, sector-0 IO) are injected via `SdDiskOps`. The firmware's
   `FmtTask` and the block test's `run_full_format` now both call it, so
   `test_native_sd_block` exercises the exact bytes the device writes.
-- **1b — Mount + health probe + recovery.** Extract `sd_init`'s mount path and
-  `sd_health_check`'s probe into shared helpers over `SdDiskOps` + the existing
-  `sdRecoveryAction`. The firmware backs them with sdmmc; the emulator with
-  `FakeSd`. Goal: `sd_health_check` becomes one shared function both platforms
-  call, and the emulator's `FatFsFilesys` moves from a single-volume FAT to the
-  real dual-partition layout via `sdFormatDual`.
+- **1b — Health state machine + emulator on the real layout — DONE.** The
+  emulator's `FatFsFilesys` now formats via `sdFormatDual` and mounts the real
+  **dual-partition** layout (P1→`2:`, P2→`1:`) instead of a single-volume FAT, so
+  it boots the device's actual partition scheme. The health *state machine*
+  (consecutive-failure counter → escalation) is extracted to
+  `airbridge_runtime.h::sdHealthUpdate(SdHealthState&, probeOk, …)`; the firmware's
+  `sd_health_check` and the emulator's health loop now run that ONE function —
+  only the platform-specific degrade/reformat *actions* (firmware: mark unmounted
+  + reboot-to-reformat; emulator: set OLED flag + reformat-in-place) stay in glue.
+  (Still per-platform: the *mount* call itself — the firmware uses `esp_vfs_fat`
+  for its POSIX layer, the emulator raw `f_mount` — a candidate for a later pass.)
 - **1c — MBR / partition detection.** Fold `sd_init`'s case analysis (valid MBR /
   add-P2 migration / no-MBR → reformat) into shared byte-level helpers
   (`test_native_sd_format` already covers the MBR math).

@@ -62,6 +62,20 @@ inline SdRecoveryAction sdRecoveryAction(uint32_t consecutiveFailures,
     return SD_RECOVERY_NONE;
 }
 
+// The full health state machine: tracks consecutive probe failures and returns
+// the escalation. Shared by the firmware's sd_health_check and the emulator's
+// health loop so both run ONE state machine — only the platform-specific
+// degrade/reformat *actions* stay in glue. Call once per probe with its result.
+struct SdHealthState {
+    uint32_t consecutiveFailures = 0;
+};
+inline SdRecoveryAction sdHealthUpdate(SdHealthState& st, bool probeOk,
+                                       uint32_t degradeAfter, uint32_t reformatAfter) {
+    if (probeOk) { st.consecutiveFailures = 0; return SD_RECOVERY_NONE; }
+    if (st.consecutiveFailures < 0xFFFFFFFFu) st.consecutiveFailures++;
+    return sdRecoveryAction(st.consecutiveFailures, degradeAfter, reformatAfter);
+}
+
 // Check for OTA firmware update via the S3 API.
 // Does NOT download or flash — just checks version and gets URL.
 inline OtaCheckResult halOtaCheck(const char* currentVersion) {

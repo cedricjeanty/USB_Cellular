@@ -22,7 +22,9 @@ void setUp(void) {}
 void tearDown(void) {}
 
 static FatFsFilesys* freshFormatted() {
-    auto* fs = new FatFsFilesys(65536, P1, P2);  // 32 MB card
+    // 16 GB card, 8 GB P1 (matches the firmware) — big enough for dual FAT32.
+    // FakeSd is sparse, so only the written sectors cost memory.
+    auto* fs = new FatFsFilesys(31116288, 16777216, P1, P2);
     TEST_ASSERT_TRUE_MESSAGE(fs->format(), "format must succeed");
     TEST_ASSERT_TRUE(fs->mounted());
     return fs;
