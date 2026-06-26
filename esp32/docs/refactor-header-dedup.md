@@ -7,6 +7,52 @@ reimplementation in `emu/main.cpp` that has to be hand-synced (the tell-tale
 firmware's sd_health_check` comments). Every hand-synced copy is a place the
 emulator can silently drift from the device.
 
+---
+
+## ⏭️ NEXT OPPORTUNITY — route `uploadTask` through the shared upload
+
+This is the single biggest remaining drift: the firmware uploads via its own
+`s3UploadFileEx` (direct esp_tls, main.cpp), while the emulator + tests use the
+shared `halS3UploadEaofh`/`halS3UploadFile` (`airbridge_s3.h`). Unifying them
+removes the last large `// like uploadTask does` reimplementation and lets the
+emulator exercise the real upload duty cycle.
+
+**The blocker is already cleared:** the shared multipart path now brackets its
+part PUTs with `INetwork::setUploadSession()` (commit `9b1c0bd`), so the firmware
+can suppress the modem `+++` escape across parts.
+
+**The one real gotcha — TWO delta implementations.** Do not "swap the call."
+`uploadTask` fetches the aircraft manifest and computes the high-water-mark
+**delta offset** *around* `s3UploadFileEx(relPath, key, startOffset)`.
+`halS3UploadEaofh` does manifest + hwm + delta **internally**. Routing means
+*replacing* the firmware's manifest/delta block with `halS3UploadEaofh`, not
+nesting one inside the other — otherwise the delta is double-applied (skips real
+data) or a partial upload is stranded. Map carefully:
+- `.eaofh` flight files → `halS3UploadEaofh` (it owns the manifest/hwm/delta).
+- other files (logs, etc.) → `halS3UploadFile`.
+- the `dsuCookie` one-shot's `s3KeyOverride` → `halS3UploadFile(..., keyOverride)`.
+
+**Steps:**
+1. `Esp32Network::setUploadSession(bool)` → set a session-wide `+++` -suppression
+   flag; the modem-watchdog / escape check ORs it with `g_tlsActive`.
+2. Switch `uploadTask`'s upload block to the shared functions **behind
+   `-DSHARED_UPLOAD`** (default OFF → field firmware byte-for-byte unchanged;
+   instant A/B revert).
+3. Share the no-progress / modem watchdog so the **emulator runs it** — then,
+   since `sim_modem` already models `+++`→PPP-break, add the +++/multipart
+   regression test (large upload + watchdog tick → assert no session break).
+4. Flip the default once validated.
+
+**Validation:** native (`test_native_s3`) + the emulator e2e (which uploads over
+a real `pppd` PPP link to **real S3**) cover the logic; a hardware multipart
+upload on a marginal cellular link is the final pre-deploy gate (esp_tls/lwIP
+transport + cellular perf are the only deltas the emulator can't see).
+
+**Files:** `src/main.cpp` (`uploadTask` ~3126, `Esp32Network`, the watchdog),
+`include/airbridge_s3.h` (already session-bracketed), `emu/main.cpp` (drop the
+`uploadThread` reimpl once shared). After this: Phase 2's duty-cycle is shared
+and Phase 3 (task/timer shim) is unblocked.
+
 ## Principle: push the platform boundary *down*
 
 ```
