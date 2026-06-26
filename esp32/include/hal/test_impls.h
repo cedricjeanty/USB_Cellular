@@ -295,16 +295,28 @@ public:
     std::string last_request;
     std::vector<std::string> requests;        // every request body, in order
     bool fail_connect = false;
+    // Upload-session bracket tracking (INetwork::setUploadSession).
+    int  session_depth = 0;                   // current bracket depth (0/1)
+    int  session_begins = 0;                  // times a session opened
+    bool connect_outside_session = false;     // a connect happened after the 1st begin while depth==0
 
     void reset() {
         next_response.clear(); response_queue.clear(); queue_pos = 0;
         connect_count = 0; last_host.clear(); last_request.clear();
         requests.clear(); fail_connect = false;
+        session_depth = 0; session_begins = 0; connect_outside_session = false;
+    }
+    void setUploadSession(bool active) override {
+        if (active) { session_depth++; session_begins++; }
+        else        { session_depth--; }
     }
     void push_response(const std::string& r) { response_queue.push_back(r); }
 
     TlsHandle connect(const char* host) override {
         if (fail_connect) return nullptr;
+        // Once a multipart session has opened, every connect must be inside it
+        // (depth>0) — that's the +++ -suppression invariant the test checks.
+        if (session_begins > 0 && session_depth == 0) connect_outside_session = true;
         last_host = host;
         connect_count++;
         std::string resp = (queue_pos < response_queue.size())

@@ -423,6 +423,14 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
         return res;
     }
 
+    // Bracket the whole multipart session (across all part PUTs + completion) so
+    // the firmware suppresses the modem `+++` escape in the gaps between parts.
+    // RAII → every return path below clears it. See INetwork::setUploadSession.
+    struct UploadSessionGuard {
+        UploadSessionGuard()  { if (g_hal && g_hal->network) g_hal->network->setUploadSession(true); }
+        ~UploadSessionGuard() { if (g_hal && g_hal->network) g_hal->network->setUploadSession(false); }
+    } _uploadSession;
+
     // Check for NVS resume session
     MultipartSession session = loadMultipartSession(filename);
     uint32_t startPart = 1;

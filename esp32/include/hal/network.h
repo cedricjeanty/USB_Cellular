@@ -26,4 +26,14 @@ public:
 
     // Bandwidth limit in bytes/sec (0 = unlimited). Used by halStreamFile for throttling.
     virtual int getMaxBytesPerSec() { return 0; }
+
+    // Marks a multi-connection upload SESSION active across its part PUTs. A
+    // multipart upload tears down and reopens TLS between parts, so per-connect
+    // state isn't enough: on the firmware the modem watchdog must NOT fire the
+    // `+++` escape during the gaps between parts (escaping to AT mode stalls the
+    // PPP data session — the bug class that "broke uploads before"). The shared
+    // upload brackets the whole multipart loop with this; the firmware maps it to
+    // its session-wide `+++` suppression, the emulator records it (testable), and
+    // mocks/default no-op. Calls are not nested.
+    virtual void setUploadSession(bool /*active*/) {}
 };

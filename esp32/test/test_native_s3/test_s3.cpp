@@ -287,6 +287,10 @@ void test_upload_success(void) {
 
     UploadResult r = halS3UploadFile("/sd/upload/0001/test.txt", "0001/test.txt");
     (void)r;  // Result varies with mock — real upload tested in emulator
+    // A small file is a SINGLE PUT (one connection) — no inter-part gap, so no
+    // upload session is opened (only multipart needs the +++ bracket).
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, s_net.session_begins,
+        "single-PUT upload must not open a multipart session");
 }
 
 void test_upload_connect_fails(void) {
@@ -429,6 +433,12 @@ void test_multipart_part_put_retry_recovers(void) {
     TEST_ASSERT_TRUE(r.success);
     // 8 connections = the scripted sequence incl. the one retry.
     TEST_ASSERT_EQUAL_INT(8, s_net.connect_count);
+    // +++ suppression: the multipart session brackets the WHOLE loop — opened
+    // once, cleanly closed (RAII), and every part connect happened inside it.
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, s_net.session_begins, "one upload session opened");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, s_net.session_depth, "session cleanly closed (balanced)");
+    TEST_ASSERT_FALSE_MESSAGE(s_net.connect_outside_session,
+        "no part connect outside the session (no +++ gap between parts)");
 }
 
 // All retries of a part fail → upload aborts cleanly (no false success), and the

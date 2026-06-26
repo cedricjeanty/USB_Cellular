@@ -263,6 +263,17 @@ public:
 
     int getMaxBytesPerSec() override { return maxBytesPerSec; }
 
+    // Observable in the emulator: true while a multipart upload session is
+    // bracketed. On the firmware this maps to session-wide +++ suppression; here
+    // it lets a test/harness confirm the bracket spans the part PUTs (and, once
+    // the modem watchdog is shared, that no +++ fires during it).
+    bool uploadSessionActive = false;
+    int  uploadSessionBegins = 0;
+    void setUploadSession(bool active) override {
+        uploadSessionActive = active;
+        if (active) uploadSessionBegins++;
+    }
+
 private:
     SSL_CTX* ctx_ = nullptr;
 };

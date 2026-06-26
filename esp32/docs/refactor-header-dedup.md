@@ -78,11 +78,21 @@ FreeRTOS tasks and the emulator's threads invoke.
   reproduce this — there is no real modem watchdog racing `+++` — so native +
   emulator green would be a false guarantee.
 
-  To land safely: add session-scoped `+++` suppression to the shared path (e.g. a
-  HAL "upload session begin/end" hook), keep `s3UploadFileEx` behind a build flag
-  for instant A/B revert, and gate merge on a hardware multipart-upload test on a
-  marginal link. Until that hardware loop exists, the firmware keeps its proven
-  esp_tls upload.
+  **Blocker resolved (the +++ gap).** The shared upload now brackets the whole
+  multipart loop with `INetwork::setUploadSession(true/false)` (RAII guard in
+  `halS3UploadFile`), so a router can map it to session-wide `+++` suppression.
+  `MockNetwork` records the bracket and `test_native_s3` asserts it spans every
+  part connect (and that single-PUT opens none); the emulator's `OpenSSLNetwork`
+  exposes it. And because `sim_modem` already models `+++` → PPP-break, once the
+  modem watchdog is shared (so the emulator runs it), the +++/multipart race
+  becomes an emulator regression test — not a hardware-only check.
+
+  **Remaining to route the firmware:** make `Esp32Network::setUploadSession` drive
+  a session-wide `+++` -suppression flag (the watchdog/escape check ORs it),
+  switch `uploadTask` from `s3UploadFileEx` to `halS3UploadEaofh`/`halS3UploadFile`
+  behind a build flag for instant A/B revert, and share the modem watchdog so the
+  emulator exercises the suppression. A hardware multipart-upload smoke test stays
+  as final confidence but is no longer the only signal.
 
 The remaining `// mirrors …` orchestration (the upload/harvest/log sequencing in
 `main_loop`) rides on the upload routing, so it is gated the same way.
