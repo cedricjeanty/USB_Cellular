@@ -94,6 +94,16 @@ static void sigusr1_handler(int) { s_cellularToggle = 1; }
 // existing tests are unaffected. See applyCellState() + scripts/flight_cycle_test.sh.
 static std::string s_cellFilePath;
 static time_t      s_cellFileMtime = 0;
+
+// Emulator uplink throttle (bytes/sec) for the upload path. Default 100 KB/s
+// (historical). EMU_UPLINK_KBPS overrides — e.g. 167 to match the real PCB's
+// sustained 3 Mbaud + HW-FC cellular rate, so soak-test cycle counts reflect
+// real throughput.
+static int emuUplinkBytesPerSec() {
+    const char* e = getenv("EMU_UPLINK_KBPS");
+    int kbps = (e && atoi(e) > 0) ? atoi(e) : 100;
+    return kbps * 1024;
+}
 static const char* SD_ROOT = "./emu_sdcard";           // Partition 1 (DSU-facing)
 static const char* SD_INTERNAL = "./emu_sdcard_internal"; // Partition 2 (firmware internal)
 // EMU_SD_BLOCK=1: route the SD through real FatFs on an in-memory FakeSd block
@@ -280,7 +290,7 @@ static void modemInitThread(DisplayState* ds) {
                     int rc = system(cmd);
 
                     (void)rc;
-                    s_net.maxBytesPerSec = 100 * 1024;  // 100 KB/s matching real cellular
+                    s_net.maxBytesPerSec = emuUplinkBytesPerSec();  // EMU_UPLINK_KBPS or 100 KB/s default
 
                     // Wait briefly for SimModem TUN to be ready (IPCP triggers openTun)
                     for (int t = 0; t < 20 && s_modem && !s_modem->tunReady(); t++)
@@ -300,7 +310,7 @@ static void modemInitThread(DisplayState* ds) {
             if (!ds->pppConnected) {
                 printf("[Modem] PPP interface didn't come up — falling back to direct\n");
                 ds->pppConnected = true;
-                s_net.maxBytesPerSec = 100 * 1024;  // 100 KB/s
+                s_net.maxBytesPerSec = emuUplinkBytesPerSec();
             }
         }
     }
