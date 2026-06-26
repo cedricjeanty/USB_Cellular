@@ -54,11 +54,38 @@ codebase.
   add-P2 migration / no-MBR → reformat) into shared byte-level helpers
   (`test_native_sd_format` already covers the MBR math).
 
-### Phase 2 — Shared duty-cycle / orchestration
-Extract the task *bodies* into HAL-backed step functions — `uploadStep()`,
-`harvestStep()`, `modemPump()`, `logFlushStep()` — that both the firmware's
-FreeRTOS tasks and the emulator's threads invoke. The `// mirrors …` comments in
-`emu/main.cpp` disappear because there is nothing left to mirror.
+### Phase 2 — Shared duty-cycle / orchestration  *(partially done; upload routing HARDWARE-GATED)*
+Extract the task *bodies* into HAL-backed step functions that both the firmware's
+FreeRTOS tasks and the emulator's threads invoke.
+
+- **Modem reconnect escalation — DONE.** `modemReconnectPlan(failures)` (shared,
+  unit-tested) replaces the inline soft/CFUN/backoff decision in `modemTask`. The
+  AT sequence was already shared (`modemReconnect`), and the PTY + `sim_modem` +
+  `pppd` harness exercises it through real code, so this is validated.
+
+- **Upload routing — DEFERRED, hardware-gated.** Routing the firmware's
+  `s3UploadFileEx` (direct esp_tls) through the shared `airbridge_s3.h`
+  (`halS3UploadFile`) is feasible (the firmware already has `Esp32Network`/
+  `Esp32Filesys`, and `halS3UploadFile` has the `keyOverride` parity) BUT carries
+  a concrete, emulator-invisible regression risk:
+
+  The firmware holds `g_tlsActive = true` for the **entire multipart session**
+  (main.cpp:1920) to suppress the modem watchdog's `+++` escape *between* part
+  PUTs. `airbridge_s3.h` has no concept of `g_tlsActive` — `Esp32Network` toggles
+  it per-TLS-connect, so a shared-path multipart would leave gaps between parts
+  where the watchdog could fire `+++` and stall the PPP data session (the bug
+  class CLAUDE.md notes "broke uploads before"). The PTY/pppd emulator cannot
+  reproduce this — there is no real modem watchdog racing `+++` — so native +
+  emulator green would be a false guarantee.
+
+  To land safely: add session-scoped `+++` suppression to the shared path (e.g. a
+  HAL "upload session begin/end" hook), keep `s3UploadFileEx` behind a build flag
+  for instant A/B revert, and gate merge on a hardware multipart-upload test on a
+  marginal link. Until that hardware loop exists, the firmware keeps its proven
+  esp_tls upload.
+
+The remaining `// mirrors …` orchestration (the upload/harvest/log sequencing in
+`main_loop`) rides on the upload routing, so it is gated the same way.
 
 ### Phase 3 — Thin task/timer shim
 A minimal abstraction so the emulator spawns host threads running the *same*
