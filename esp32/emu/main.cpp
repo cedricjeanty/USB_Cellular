@@ -16,7 +16,14 @@
 //   +/-     Adjust display upload speed
 //   S       Step upload progress (+5 MB display counter)
 //   R       Reset display state
+//   B       Break (corrupt) the SD FAT — only with EMU_SD_BLOCK=1; drives the
+//           degrade→reformat→recover demo (real FatFs on an in-memory FakeSd)
 //   Q/Esc   Quit
+//
+// EMU_SD_BLOCK=1 backs the SD with a real FAT image on an in-memory FakeSd block
+// device (vs the default host dirs), so corruption/reformat is genuine. Headless:
+// EMU_SD_CORRUPT_AFTER_MS=N auto-corrupts; SIGUSR2 corrupts on demand. See
+// scripts/test_emu_sd_block.sh.
 
 #define FW_VERSION "20260412160000"
 
@@ -34,6 +41,7 @@
 #include "hal/hal.h"
 #include "hal/native_impls.h"
 #include "hal/uart_pty.h"
+#include "hal/fatfs_filesys.h"   // EMU_SD_BLOCK=1: SD via real FatFs on FakeSd
 #include "sim_modem.h"
 #include "airbridge_display.h"
 #include "airbridge_harvest.h"
@@ -81,6 +89,14 @@ static volatile sig_atomic_t s_cellularToggle = 0;
 static void sigusr1_handler(int) { s_cellularToggle = 1; }
 static const char* SD_ROOT = "./emu_sdcard";           // Partition 1 (DSU-facing)
 static const char* SD_INTERNAL = "./emu_sdcard_internal"; // Partition 2 (firmware internal)
+// EMU_SD_BLOCK=1: route the SD through real FatFs on an in-memory FakeSd block
+// device (vs the default host-directory backend), so FAT corruption can be
+// injected ('B' keypress / SIGUSR2 / EMU_SD_CORRUPT_AFTER_MS) and the firmware's
+// degrade→reformat recovery exercised end-to-end with the OLED showing SD ERROR.
+static FatFsFilesys* s_blockFs = nullptr;
+static bool s_sdBlockMode = false;
+static volatile sig_atomic_t s_sdCorrupt = 0;
+static void sigusr2_handler(int) { s_sdCorrupt = 1; }
 static SpeedTracker s_usbSpeed = {};
 static SpeedTracker s_uploadSpeed = {};
 static LogBuffer s_log;
@@ -394,6 +410,7 @@ int main(int argc, char* argv[]) {
     signal(SIGTERM, sigHandler);
     signal(SIGINT, sigHandler);
     signal(SIGUSR1, sigusr1_handler);  // test suite sends SIGUSR1 to toggle cellular
+    signal(SIGUSR2, sigusr2_handler);  // test suite sends SIGUSR2 to corrupt the SD (block mode)
     s_display.init();
 
     // Create log PTY for external tools (cat, test scripts)
@@ -520,6 +537,27 @@ int main(int argc, char* argv[]) {
 
     ::mkdir(SD_ROOT, 0755);
     ::mkdir(SD_INTERNAL, 0755);
+
+    // ── Optional: SD via real FatFs on an in-memory FakeSd block device ──────
+    // The default backend is host directories (NativeFilesys). With EMU_SD_BLOCK=1
+    // the SD is a genuine FAT image, so the harvest/upload pipeline runs through
+    // real FatFs and the corruption→degrade→reformat lifecycle is real. Host files
+    // already in ./emu_sdcard[_internal] are imported so the drop-files workflow
+    // still seeds the card.
+    if (getenv("EMU_SD_BLOCK")) {
+        s_blockFs = new FatFsFilesys(4194304, SD_ROOT, SD_INTERNAL);  // 2 GB sparse
+        if (s_blockFs->format()) {
+            int n1 = s_blockFs->importHostTree(SD_ROOT, SD_ROOT);
+            int n2 = s_blockFs->importHostTree(SD_INTERNAL, SD_INTERNAL);
+            s_hal.filesys = s_blockFs;
+            s_sdBlockMode = true;
+            airbridge_log("SD: FakeSd block mode (FatFs on in-memory card) — imported %d+%d host files", n1, n2);
+            printf("SD block mode: ON (real FatFs on FakeSd; 'B'/SIGUSR2 corrupts the FAT)\n");
+        } else {
+            delete s_blockFs; s_blockFs = nullptr;
+            printf("SD block mode: f_mkfs FAILED — staying on host-directory backend\n");
+        }
+    }
 
     s_modem = new SimModem("./emu_modem.dat");
     s_modem->operatorName = "SimCellular";
@@ -701,6 +739,10 @@ int main(int argc, char* argv[]) {
                     ds.hostWrittenMb += 10.0f;
                     ds.usbWriteKBps = 5000.0f;
                     printf("USB write: +10MB\n");
+                    break;
+                case SDLK_b:  // "break" the SD: corrupt the FAT (block mode) — drives the recovery demo
+                    if (s_sdBlockMode) s_sdCorrupt = 1;
+                    else printf("[SD] block mode off — run with EMU_SD_BLOCK=1\n");
                     break;
                 case SDLK_EQUALS:
                 case SDLK_PLUS:
@@ -1193,6 +1235,55 @@ int main(int argc, char* argv[]) {
             ds.pppConnected = !ds.pppConnected;
             if (ds.pppConnected) { ds.modemRssi = 22; ds.modemReady = true; }
             printf("Cellular (SIGUSR1): %s\n", ds.pppConnected ? "ON" : "OFF");
+        }
+
+        // ── SD health (block mode): probe → degrade → reformat ──────────────
+        // Mirrors the firmware's sd_health_check/sdRecoveryAction on the FakeSd-
+        // backed card: a corrupt FAT is detected, the OLED shows SD ERROR, and a
+        // persistent failure triggers a real reformat that recovers the card
+        // (re-seeded from the host dirs = the DSU re-sending via the cookie).
+        // Thresholds are compressed (degrade@2s, reformat@5s) for a watchable demo.
+        if (s_sdBlockMode && s_blockFs) {
+            static uint32_t healthStart = 0, lastHealth = 0, fails = 0;
+            static bool degraded = false, autoCorrupted = false;
+            if (healthStart == 0) healthStart = now;
+            const char* afterMs = getenv("EMU_SD_CORRUPT_AFTER_MS");
+            if (afterMs && !autoCorrupted && (now - healthStart) >= (uint32_t)atoi(afterMs)) {
+                autoCorrupted = true; s_sdCorrupt = 1;
+            }
+            if (s_sdCorrupt) {
+                s_sdCorrupt = 0;
+                airbridge_log("SD: TEST corruption injected (FakeSd FAT zeroed)");
+                printf("[SD] FAT corruption injected\n");
+                s_blockFs->corruptFat();
+            }
+            if (now - lastHealth >= 1000) {
+                lastHealth = now;
+                bool ok = s_blockFs->probeOk();
+                if (ok) {
+                    fails = 0;
+                    if (degraded) { degraded = false; ds.sdError = false; ds.sdReformatting = false; }
+                } else {
+                    fails++;
+                }
+                SdRecoveryAction act = sdRecoveryAction(fails, 2, 5);
+                if (act == SD_RECOVERY_DEGRADE && !degraded) {
+                    degraded = true; ds.sdError = true; ds.sdReformatting = false;
+                    airbridge_log("SD: runtime failure (n=%u) — degraded; SD ERROR on OLED, logging via cellular", (unsigned)fails);
+                    printf("[SD] degraded — SD ERROR shown on OLED\n");
+                } else if (act == SD_RECOVERY_REFORMAT) {
+                    ds.sdError = true; ds.sdReformatting = true;
+                    updateDisplay(ds); renderFramebuffer(renderer);
+                    airbridge_log("SD: unrecoverable — reformatting (data re-sent by DSU via cookie)");
+                    printf("[SD] reformatting...\n");
+                    s_blockFs->format();
+                    s_blockFs->importHostTree(SD_ROOT, SD_ROOT);
+                    s_blockFs->importHostTree(SD_INTERNAL, SD_INTERNAL);
+                    fails = 0; degraded = false; ds.sdError = false; ds.sdReformatting = false;
+                    airbridge_log("SD: reformatted + reseeded — recovered");
+                    printf("[SD] recovered\n");
+                }
+            }
         }
 
         updateDisplay(ds);
