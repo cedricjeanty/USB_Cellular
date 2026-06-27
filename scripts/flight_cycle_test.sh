@@ -65,6 +65,7 @@ while [ $# -gt 0 ]; do
         --usb-kbps)    USB_KBPS="$2"; shift 2 ;;
         --cruise-kb)   CRUISE_KB="$2"; shift 2 ;;
         --ground-kb)   GROUND_KB="$2"; shift 2 ;;
+        --compress)    export EMU_COMPRESS=1; shift ;;  # gzip .eaofh at harvest (~3x fewer bytes uploaded)
         --fast)        FAST=1; shift ;;   # compressed durations + fast links, for validation
         *) echo "unknown arg: $1"; exit 1 ;;
     esac

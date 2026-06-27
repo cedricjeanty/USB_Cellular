@@ -215,6 +215,57 @@ void test_harvest_root_subdirectory_files(void) {
     TEST_ASSERT_TRUE(s_fs.has_file("/sd/metrics/dsuUsage.eacuf"));
 }
 
+// ── Compression (opt-in gzip into the upload queue) ──────────────────────────
+#ifdef AIRBRIDGE_COMPRESS
+void test_harvest_compress_eaofh(void) {
+    s_fs.add_dir("/sd");
+    // Compressible filler (no 0xEA) + a 0x4C footer for flight 1500.
+    std::string body(8192, 'A');
+    body += makeEaofh("EA500.000243", 1500);
+    s_fs.add_file("/sd/log_01500.eaofh", body.data(), body.size());
+
+    HarvestResult r = harvestFiles("/sd", "/sd/upload", 1, /*compress=*/true);
+    TEST_ASSERT_EQUAL_UINT16(1, r.count);
+    // Flight metadata comes from scanning the UNcompressed source — must be correct
+    // even though the stored file is now gzip.
+    TEST_ASSERT_EQUAL_UINT32(1500, r.maxFlight);
+    TEST_ASSERT_EQUAL_STRING("EA500.000243", r.dsuSerial);
+    TEST_ASSERT_TRUE(s_fs.has_file("/sd/upload/0001/log_01500.eaofh"));
+    TEST_ASSERT_TRUE(s_fs.has_file("/sd/upload/0001/log_01500.eaofh.meta"));
+    TEST_ASSERT_FALSE(s_fs.has_file("/sd/log_01500.eaofh"));  // source moved
+
+    // Stored file must be gzip (magic 1f 8b) and smaller than the source.
+    void* fh = g_hal->filesys->open("/sd/upload/0001/log_01500.eaofh", "rb");
+    TEST_ASSERT_NOT_NULL(fh);
+    uint8_t magic[2] = {0, 0};
+    g_hal->filesys->read(fh, magic, 2);
+    g_hal->filesys->close(fh);
+    TEST_ASSERT_EQUAL_HEX8(0x1f, magic[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x8b, magic[1]);
+    uint32_t sz = 0; bool isDir = false;
+    g_hal->filesys->stat("/sd/upload/0001/log_01500.eaofh", &sz, &isDir);
+    TEST_ASSERT_TRUE(sz < body.size());
+}
+
+// compress=false (or non-.eaofh) stores verbatim — no gzip wrapper.
+void test_harvest_no_compress_verbatim(void) {
+    s_fs.add_dir("/sd");
+    std::string body(2048, 'A');
+    body += makeEaofh("EA500.000243", 1501);
+    s_fs.add_file("/sd/log_01501.eaofh", body.data(), body.size());
+
+    HarvestResult r = harvestFiles("/sd", "/sd/upload", 1, /*compress=*/false);
+    TEST_ASSERT_EQUAL_UINT16(1, r.count);
+    TEST_ASSERT_EQUAL_UINT32(1501, r.maxFlight);
+    void* fh = g_hal->filesys->open("/sd/upload/0001/log_01501.eaofh", "rb");
+    TEST_ASSERT_NOT_NULL(fh);
+    uint8_t magic[2] = {0, 0};
+    g_hal->filesys->read(fh, magic, 2);
+    g_hal->filesys->close(fh);
+    TEST_ASSERT_EQUAL_HEX8(0x41, magic[0]);   // 'A' — verbatim, not gzip
+}
+#endif
+
 // ── Test runner ─────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -234,6 +285,10 @@ int main(int argc, char** argv) {
     RUN_TEST(test_harvest_root_clean_after);
     RUN_TEST(test_harvest_with_preexisting_queued_files);
     RUN_TEST(test_harvest_root_subdirectory_files);
+#ifdef AIRBRIDGE_COMPRESS
+    RUN_TEST(test_harvest_compress_eaofh);
+    RUN_TEST(test_harvest_no_compress_verbatim);
+#endif
 
     return UNITY_END();
 }

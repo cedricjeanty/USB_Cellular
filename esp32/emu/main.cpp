@@ -104,6 +104,10 @@ static time_t      s_cellFileMtime = 0;
 // device can upload it. See dsuTransferThread() + scripts/flight_cycle_test.sh.
 static std::atomic<bool> s_dsuStop{false};
 
+// EMU_COMPRESS=1: gzip .eaofh files into the upload queue at harvest (~3x fewer
+// bytes on the cellular PUT). Mirrors the firmware's opt-in compression.
+static bool s_compress = false;
+
 // Emulator uplink throttle (bytes/sec) for the upload path. Default 100 KB/s
 // (historical). EMU_UPLINK_KBPS overrides — e.g. 167 to match the real PCB's
 // sustained 3 Mbaud + HW-FC cellular rate, so soak-test cycle counts reflect
@@ -597,6 +601,10 @@ int main(int argc, char* argv[]) {
         printf("Cellular profile: scripted via %s\n", s_cellFilePath.c_str());
     }
     if (const char* e = getenv("EMU_CELL_SEED"); e && e[0]) srand((unsigned)atoi(e));
+    if (const char* e = getenv("EMU_COMPRESS"); e && e[0] == '1') {
+        s_compress = true;
+        printf("Harvest compression: ON (gzip .eaofh into upload queue)\n");
+    }
 
     // EMU_DSU_INTERNAL: backlog-in-the-DSU transfer thread (see dsuTransferThread).
     std::thread dsuThread;
@@ -837,7 +845,7 @@ int main(int argc, char* argv[]) {
                     g_hal->nvs->get_u32("harvest", "count", &hnum);
                     hnum++;
                     g_hal->nvs->set_u32("harvest", "count", hnum);
-                    HarvestResult r = harvestFiles(SD_ROOT, destDir, (uint16_t)hnum);
+                    HarvestResult r = harvestFiles(SD_ROOT, destDir, (uint16_t)hnum, s_compress);
                     printf("Harvested: %u file(s), %.1f MB → %s\n", r.count, r.usedMb, r.folder);
                     ds.mbQueued += r.usedMb;
                     break;
@@ -1270,7 +1278,7 @@ int main(int argc, char* argv[]) {
             g_hal->nvs->get_u32("harvest", "count", &hnum);
             hnum++;
             g_hal->nvs->set_u32("harvest", "count", hnum);
-            HarvestResult r = harvestFiles(SD_ROOT, destDir, (uint16_t)hnum);
+            HarvestResult r = harvestFiles(SD_ROOT, destDir, (uint16_t)hnum, s_compress);
             printf("[Harvest] Done: %u file(s), %.1f MB → %s\n", r.count, r.usedMb, r.folder);
             ds.mbQueued += r.usedMb;
 

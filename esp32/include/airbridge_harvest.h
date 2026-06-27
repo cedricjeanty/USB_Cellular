@@ -8,6 +8,20 @@
 #include <cstdio>
 #include <cstring>
 
+// Opt-in on-device gzip of .eaofh files into the upload queue (~3x fewer bytes on
+// the cellular PUT). Gated by -DAIRBRIDGE_COMPRESS so contexts that don't link zlib
+// (e.g. a firmware build before zlib is wired) are unaffected; the `compress` arg
+// is simply ignored when the macro is off.
+#ifdef AIRBRIDGE_COMPRESS
+#include "airbridge_compress.h"
+inline size_t cz_hal_read(void* ctx, void* buf, size_t n) {
+    return g_hal->filesys->read(ctx, buf, n);
+}
+inline size_t cz_hal_write(void* ctx, const void* buf, size_t n) {
+    return g_hal->filesys->write(ctx, (void*)buf, n);
+}
+#endif
+
 struct HarvestResult {
     uint16_t count;
     float    usedMb;
@@ -71,7 +85,7 @@ inline bool hasUnharvestedFiles(const char* srcDir) {
 // Files are copied then deleted from source (move across mount points).
 // harvestNum: caller-provided sequential counter (read+increment NVS).
 inline HarvestResult harvestFiles(const char* srcDir, const char* destBase,
-                                   uint16_t harvestNum) {
+                                   uint16_t harvestNum, bool compress = false) {
     HarvestResult result = {};
     if (!g_hal || !g_hal->filesys) return result;
 
@@ -135,41 +149,58 @@ inline HarvestResult harvestFiles(const char* srcDir, const char* destBase,
         char dstName[128];
         flattenPath(stack[depth].prefix, ent.name, dstName, sizeof(dstName));
 
-        char dst[256];
+        char dst[300];
         snprintf(dst, sizeof(dst), "%s/%s", destDir, dstName);
 
-        // Copy file to destination
+        const char* ext = strrchr(ent.name, '.');
+        bool isEaofh = ext && strcmp(ext, ".eaofh") == 0;
+        // gzip .eaofh files in place (same .eaofh name, gzip content) when compress
+        // is on: the upload streams ~3x fewer bytes, derives last_flight from the
+        // filename + first_flight from the .meta written below (from the UNcompressed
+        // source), and only ever scans content for split-delta — which never fires
+        // for single-flight files (first==last). Non-.eaofh + non-compress copy verbatim.
+        bool doGz = false;
+#ifdef AIRBRIDGE_COMPRESS
+        doGz = compress && isEaofh;
+#else
+        (void)compress;
+#endif
+
         void* sf = g_hal->filesys->open(fullpath, "rb");
         void* df = g_hal->filesys->open(dst, "wb");
         bool copied = false;
+        uint64_t storedBytes = 0;
         if (sf && df) {
-            uint8_t cpbuf[4096];
-            uint32_t rem = ent.size;
-            copied = true;
-            while (rem > 0) {
-                size_t toRead = (rem < sizeof(cpbuf)) ? rem : sizeof(cpbuf);
-                size_t n = g_hal->filesys->read(sf, cpbuf, toRead);
-                if (n == 0 || g_hal->filesys->write(df, cpbuf, n) != n) { copied = false; break; }
-                rem -= n;
+#ifdef AIRBRIDGE_COMPRESS
+            if (doGz) {
+                GzipResult gr = gzipStream(cz_hal_read, sf, cz_hal_write, df);
+                copied = gr.ok;
+                storedBytes = gr.outBytes;
+            } else
+#endif
+            {
+                uint8_t cpbuf[4096];
+                uint32_t rem = ent.size;
+                copied = true;
+                while (rem > 0) {
+                    size_t toRead = (rem < sizeof(cpbuf)) ? rem : sizeof(cpbuf);
+                    size_t n = g_hal->filesys->read(sf, cpbuf, toRead);
+                    if (n == 0 || g_hal->filesys->write(df, cpbuf, n) != n) { copied = false; break; }
+                    rem -= n;
+                }
+                storedBytes = ent.size;
             }
         }
         if (sf) g_hal->filesys->close(sf);
         if (df) g_hal->filesys->close(df);
 
         if (copied) {
-            // Delete source (move = copy + delete)
-            g_hal->filesys->remove(fullpath);
-
-            float fileMb = (float)ent.size / 1e6f;
-            result.usedMb += fileMb;
-            result.count++;
-
-            // Track DSU flight numbers from .eaofh files via content scan.
-            // Backward-scan for last_flight; forward-scan for first_flight.
-            // Write a .meta sidecar "{first}:{last}\n" for split-offset use at upload.
-            const char* ext = strrchr(ent.name, '.');
-            if (ext && strcmp(ext, ".eaofh") == 0) {
-                void* fh = g_hal->filesys->open(dst, "rb");
+            // Track DSU flight numbers from .eaofh files by scanning the SOURCE
+            // (uncompressed) before deletion — so the cookie/manifest + .meta are
+            // correct even when dst holds gzip content. Backward-scan last_flight;
+            // forward-scan first_flight; write a "{first}:{last}\n" .meta sidecar.
+            if (isEaofh) {
+                void* fh = g_hal->filesys->open(fullpath, "rb");
                 if (fh) {
                     HalLogReader rdr = { fh };
                     char serial[13] = {0};
@@ -182,7 +213,6 @@ inline HarvestResult harvestFiles(const char* srcDir, const char* destBase,
                         if (serial[0] && !result.dsuSerial[0])
                             strlcpy(result.dsuSerial, serial, sizeof(result.dsuSerial));
                     }
-                    // Forward-scan for first_flight (typically fast — within first few KB)
                     if (firstRecordFromLog(hal_read_at, &rdr, ent.size,
                                            &firstFlight, serialFirst, sizeof(serialFirst))) {
                         if (result.minFlight == 0 || firstFlight < result.minFlight)
@@ -190,9 +220,8 @@ inline HarvestResult harvestFiles(const char* srcDir, const char* destBase,
                     }
                     g_hal->filesys->close(fh);
 
-                    // Write .meta sidecar alongside the .eaofh
                     if (firstFlight > 0 && lastFlight > 0) {
-                        char metaDst[288];
+                        char metaDst[320];
                         snprintf(metaDst, sizeof(metaDst), "%s.meta", dst);
                         void* mf = g_hal->filesys->open(metaDst, "wb");
                         if (mf) {
@@ -207,6 +236,11 @@ inline HarvestResult harvestFiles(const char* srcDir, const char* destBase,
                     }
                 }
             }
+
+            // Delete source (move = copy + delete)
+            g_hal->filesys->remove(fullpath);
+            result.usedMb += (float)storedBytes / 1e6f;
+            result.count++;
         } else {
             g_hal->filesys->remove(dst);
         }
