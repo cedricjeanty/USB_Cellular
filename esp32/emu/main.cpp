@@ -300,6 +300,7 @@ static void modemInitThread(DisplayState* ds) {
                         // Route uploads through PPP → SimModem → TUN → internet
                         strlcpy(s_net.bindAddr, "10.64.64.2", sizeof(s_net.bindAddr));
                         printf("[Modem] PPP up — uploads route through SimModem TUN\n");
+                        if (getenv("EMU_PROF")) printf("[PROF] ppp_up t=%ums\n", SDL_GetTicks());
                     } else {
                         printf("[Modem] PPP up — TUN not available, uploads via direct internet\n");
                     }
@@ -898,6 +899,7 @@ int main(int argc, char* argv[]) {
 
         if (!otaChecked && otaReadyToRun) {
             otaChecked = true;
+            if (getenv("EMU_PROF")) printf("[PROF] ota_check_start t=%ums\n", SDL_GetTicks());
             printf("[OTA] Checking for firmware update (current=%s)...\n", FW_VERSION);
 
             OtaCheckResult ota = halOtaCheck(FW_VERSION);
@@ -933,6 +935,7 @@ int main(int argc, char* argv[]) {
             }
             ds.otaActive = false;
 
+            if (getenv("EMU_PROF")) printf("[PROF] cookie_start t=%ums\n", SDL_GetTicks());
             // Fetch S3 DSU cookie (same as firmware uploadTask)
             {
                 char apiHost[128] = "", apiKey[64] = "";
@@ -1055,6 +1058,7 @@ int main(int argc, char* argv[]) {
                 if (!cookieSerial[0])
                     g_hal->nvs->get_str("mfst", "serial", cookieSerial, sizeof(cookieSerial));
 
+                if (getenv("EMU_PROF")) printf("[PROF] manifest_start t=%ums\n", SDL_GetTicks());
                 if (cookieSerial[0]) {
                     uint32_t s3Hwm = halFetchManifest(cookieSerial);
                     printf("[Boot] Manifest sync: %s local=%lu S3=%lu\n",
@@ -1079,6 +1083,7 @@ int main(int argc, char* argv[]) {
         static bool bootUploadChecked = false;
         if (!bootUploadChecked && s_modemInitDone && ds.pppConnected && ds.mbQueued > 0.0f && !s_uploading) {
             bootUploadChecked = true;
+            if (getenv("EMU_PROF")) printf("[PROF] upload_start t=%ums\n", SDL_GetTicks());
             printf("[Boot] Starting upload of pending files (%.1f MB)\n", ds.mbQueued);
             s_uploading = true;
             std::thread(uploadThread, &ds).detach();

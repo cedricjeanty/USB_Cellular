@@ -39,6 +39,11 @@ GROUND_KB="${GROUND_KB:-300}"        # mean quick-ground flight size
 T_PRETAKEOFF="${T_PRETAKEOFF:-180}"; T_TAKEOFF="${T_TAKEOFF:-45}"
 T_CRUISE="${T_CRUISE:-300}";         T_APPROACH="${T_APPROACH:-240}"
 T_TAXI="${T_TAXI:-180}";             T_GROUND="${T_GROUND:-240}"
+# USB-presentation / DSU-connect delay: the aircraft DSU only writes the new
+# flight to the device ~90s after power-on (the firmware holds D+ low until then).
+# The backlog already on the device drains from boot; only the NEW flight per
+# cycle is gated by this. For a short ground cycle this eats much of the window.
+USB_PRESENT="${USB_PRESENT:-90}"
 FAST=0
 
 while [ $# -gt 0 ]; do
@@ -58,6 +63,7 @@ done
 if [ "$FAST" = 1 ]; then
     T_PRETAKEOFF=6; T_TAKEOFF=2; T_CRUISE=5; T_APPROACH=8; T_TAXI=8; T_GROUND=8
     UPLINK_KBPS="${UPLINK_KBPS_FAST:-4000}"
+    USB_PRESENT="${USB_PRESENT_FAST:-4}"
 fi
 
 EMU_CELL_FILE="$FW_DIR/emu_cell.ctl"; export EMU_CELL_FILE
@@ -115,22 +121,33 @@ seed_backlog() {
     log "Seeded backlog: $BACKLOG_FLIGHTS flights ≈ $((total_kb/1024))MB (target ${BACKLOG_MB}MB), S3 hwm=0"
 }
 
-# Durations for the current cycle are pre-computed into D_* globals in the loop
-# (so RANDOM advances in the parent → reproducible). These just consume them.
+# Each cycle the DSU reconnects ~USB_PRESENT(90s) in and transfers the flight
+# recorded LAST cycle ($1=flight number, $2=size), which the device then harvests
+# + uploads alongside the backlog. The CURRENT cycle's flight is recorded now but
+# is NOT transferred/uploadable until the NEXT power cycle (real DSU behavior).
+# Durations come from the D_* globals (pre-computed in the loop for reproducibility).
 run_cruise_cycle() {
-    local flight="$1" newkb="$2"
+    local avail="$1" avail_kb="$2"
+    local pre=$(( USB_PRESENT < D_PRE ? USB_PRESENT : D_PRE ))
+    local rem=$(( D_PRE - pre )); [ "$rem" -lt 1 ] && rem=1
     cell_set full; start_device
-    cell_set full;  sleep "$D_PRE"
+    cell_set full;  sleep "$pre"
+    [ -n "$avail" ] && write_flight "$avail" "$avail_kb"    # DSU transfers last cycle's flight
+    sleep "$rem"
     cell_set weak;  sleep "$D_TKO"
-    cell_set off;   write_flight "$flight" "$newkb"; sleep "$D_CRZ"
+    cell_set off;   sleep "$D_CRZ"                          # in flight: no cell, flight being recorded
     cell_set flaky "$FLAKY_PCT"; sleep "$D_APP"
     cell_set full;  sleep "$D_TAXI"
     stop_device
 }
 run_ground_cycle() {
-    local flight="$1" newkb="$2"
+    local avail="$1" avail_kb="$2"
+    local pre=$(( USB_PRESENT < D_GND ? USB_PRESENT : D_GND ))
+    local rem=$(( D_GND - pre )); [ "$rem" -lt 1 ] && rem=1
     cell_set full; start_device
-    write_flight "$flight" "$newkb"; sleep "$D_GND"
+    sleep "$pre"
+    [ -n "$avail" ] && write_flight "$avail" "$avail_kb"    # DSU transfers last cycle's flight
+    sleep "$rem"
     stop_device
 }
 
@@ -156,19 +173,28 @@ seed_backlog
 echo "cycle,type,latest,hwm,backlog_flights,backlog_mb" > "$CSV"
 echo "0,seed,$LATEST,0,$LATEST,$(backlog_mb_above 0)" >> "$CSV"
 
+# PENDING = the flight recorded last cycle, transferred (written) THIS cycle when
+# the DSU reconnects. Empty for cycle 1 (only the seeded backlog is available).
+# LATEST = highest flight AVAILABLE to upload (excludes the in-flight current one).
 auc_flights=0; auc_mb=0; catchup=-1; cycle=0
+PENDING_FLIGHT=""; PENDING_KB=0
 while [ "$cycle" -lt "$CYCLES" ]; do
-    cycle=$((cycle+1)); LATEST=$((LATEST+1))
+    cycle=$((cycle+1))
     # Compute this cycle's scenario from the seeded parent RANDOM (order matters
-    # for reproducibility): type, new-flight size, then the phase durations.
+    # for reproducibility): type, this-cycle's-flight size, then phase durations.
     if [ $((RANDOM % 100)) -lt "$CRUISE_PROB" ]; then typ=C; jit "$CRUISE_KB" 20; else typ=G; jit "$GROUND_KB" 30; fi
     newkb=$JIT
     jit "$T_PRETAKEOFF" 20; D_PRE=$JIT;  jit "$T_TAKEOFF" 20; D_TKO=$JIT
     jit "$T_CRUISE" 20;     D_CRZ=$JIT;  jit "$T_APPROACH" 20; D_APP=$JIT
     jit "$T_TAXI" 20;       D_TAXI=$JIT; jit "$T_GROUND" 20;   D_GND=$JIT
     log ""
-    log "── cycle $cycle ($([ "$typ" = C ] && echo cruise || echo ground), +flight $LATEST @${newkb}KB) ──"
-    if [ "$typ" = C ]; then run_cruise_cycle "$LATEST" "$newkb"; else run_ground_cycle "$LATEST" "$newkb"; fi
+    log "── cycle $cycle ($([ "$typ" = C ] && echo cruise || echo ground)); DSU transfers prev flight ${PENDING_FLIGHT:-none} ──"
+    # Run the cycle: it writes the PREVIOUS cycle's flight (now transferred) at ~90s.
+    if [ "$typ" = C ]; then run_cruise_cycle "$PENDING_FLIGHT" "$PENDING_KB"; else run_ground_cycle "$PENDING_FLIGHT" "$PENDING_KB"; fi
+    # That flight is now available to upload.
+    [ -n "$PENDING_FLIGHT" ] && LATEST="$PENDING_FLIGHT"
+    # This cycle's flight is recorded now → transferred NEXT cycle (held pending).
+    PENDING_FLIGHT=$((LATEST + 1)); PENDING_KB=$newkb; FSIZE[$PENDING_FLIGHT]=$newkb
     hwm=$(get_manifest_hwm "$SERIAL"); hwm=${hwm:-0}
     bf=$((LATEST - hwm)); bmb=$(backlog_mb_above "$hwm")
     auc_flights=$((auc_flights + bf)); auc_mb=$((auc_mb + bmb))
