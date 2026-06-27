@@ -70,7 +70,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 if [ "$FAST" = 1 ]; then
-    T_PRETAKEOFF=6; T_TAKEOFF=2; T_CRUISE=5; T_APPROACH=8; T_TAXI=8; T_GROUND=8
+    # Phase durations compressed, BUT the 15s harvest quiet-window (QUIET_WINDOW_MS)
+    # is a firmware constant the emulator does NOT compress — so a cycle must exceed
+    # boot+connect (~10s) + quiet (15s) to harvest+upload anything. Ground cycles get
+    # 30s for that reason (an 8s ground cycle uploads nothing and the backlog stalls).
+    T_PRETAKEOFF=10; T_TAKEOFF=2; T_CRUISE=5; T_APPROACH=10; T_TAXI=12; T_GROUND=30
     UPLINK_KBPS="${UPLINK_KBPS_FAST:-4000}"
     USB_KBPS="${USB_KBPS_FAST:-8000}"     # fast USB so small flights transfer in <1s
     USB_PRESENT="${USB_PRESENT_FAST:-4}"
@@ -106,15 +110,21 @@ cell_set() {
     mv -f "$tmp" "$EMU_CELL_FILE"; log "    cell → $word${arg:+ $arg}"
 }
 
-# Append one flight to the DSU internal memory: <size_kb> of filler (zeros — no
-# stray 0xEA so buildFlightIndex sees exactly one boundary per flight) followed by
-# a 0x4C footer carrying the flight number. The block buildFlightIndex assigns to
-# flight N is [prev footer end, this footer end) = its filler + footer, so the
-# slice the DSU transfers contains a valid last-record (lastRecordFromLog → N).
+# Realistic ~3x-compressible, 0xEA-free filler: map random bytes onto a 5-symbol
+# alphabet (A-E). gzip ratio ≈ 3.0x — matches real .eaofh logs (measured 2.95x on
+# the 22MB fixture, 4.12x on the 1.49GB one) so the compression benchmark reflects
+# the true on-the-wire saving. 0xEA never appears (A-E = 0x41-0x45) ⇒ buildFlightIndex
+# sees exactly one boundary (the footer) per flight.
+COMPRESS_SET="$(printf 'ABCDE%.0s' $(seq 52) | head -c 256)"
+
+# Append one flight to the DSU internal memory: <size_kb> of compressible filler
+# followed by a 0x4C footer carrying the flight number. The block buildFlightIndex
+# assigns to flight N is [prev footer end, this footer end) = its filler + footer,
+# so the slice the DSU transfers contains a valid last-record (lastRecordFromLog → N).
 append_flight() {
     local flight="$1" size_kb="$2"; local fill=$size_kb
     [ "$fill" -lt 1 ] && fill=1
-    dd if=/dev/zero bs=1024 count="$fill" >> "$INTERNAL" 2>/dev/null
+    head -c $((fill*1024)) /dev/urandom | tr '\000-\377' "$COMPRESS_SET" >> "$INTERNAL"
     append_eaofh_trailer "$INTERNAL" "$SERIAL" "$flight"
     FSIZE[$flight]=$size_kb
 }
