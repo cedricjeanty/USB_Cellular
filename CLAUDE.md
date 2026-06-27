@@ -106,6 +106,7 @@ lives in `esp32/include/airbridge_commands.h` (unit-tested in `test/test_native_
 | `wifi <ssid> <pass>` | Save a WiFi network (NVS) | runtime-safe |
 | `s3 <api_host> <api_key>` | Save S3 creds (NVS) | runtime-safe |
 | `survey` | Antenna signal-survey mode (see below) | boot-only |
+| `compress [on\|off]` | gzip `.eaofh` into the upload queue at harvest (~3x fewer bytes over cellular; ROM miniz `tdefl` in PSRAM). Default OFF — the S3 consumer must `gunzip` the objects | runtime-safe (next harvest) |
 
 The file is processed at **boot** (`check_p1_magic()` for P1, the P2 magic block) **and during
 the 15s-quiet harvest cycle** (`doHarvest()`, after the P1 fresh-mount). Runtime-safe directives
@@ -353,7 +354,9 @@ esp32/
 ├── include/                     # ── Shared, hardware-independent logic (firmware + emulator + tests) ──
 │   ├── DSU protocol & data
 │   │   ├── airbridge_proto.h    #   DSU cookie builder, CRC-16, filename parser, chunked decode
-│   │   └── airbridge_harvest.h  #   Recursive dir walk, file move to /harvested/NNNN/, skip list
+│   │   ├── airbridge_harvest.h  #   Recursive dir walk, file move to /harvested/NNNN/, skip list;
+│   │   │                        #   opt-in gzip of .eaofh into the queue (compress arg, -DAIRBRIDGE_COMPRESS)
+│   │   └── airbridge_compress.h  #   Streaming gzip (zlib) for flight logs — ~3x fewer upload bytes
 │   ├── Cellular
 │   │   ├── airbridge_modem.h    #   modemAtSync/modemRunInit/modemReconnect (CEREG/CGACT sequence)
 │   │   └── ppp_proto.h          #   Minimal PPP (HDLC/LCP/IPCP) — used by the modem simulator

@@ -582,6 +582,12 @@ static volatile uint32_t g_mainLoopHeartbeat = 0;
 // PPP), so AT polling never collides with an upload. Read live over CDC serial.
 static volatile bool     g_surveyMode = false;
 static volatile int      g_surveyBand = 0;   // 0=no change, -1=restore auto, >0=lock LTE band N
+
+// Gzip .eaofh files into the upload queue at harvest (~3x fewer bytes over cellular).
+// Set by the `compress` airbridge.cmd directive. Default OFF: the S3 consumer must
+// gunzip the .eaofh objects, so this is enabled per-deployment once that's in place.
+// The ROM miniz tdefl compressor (airbridge_compress.h) does the work in PSRAM.
+static volatile bool     g_compress = false;
 #define SURVEY_INTERVAL_MS 2000
 
 // ── CDC CLI ─────────────────────────────────────────────────────────────────
@@ -1118,6 +1124,13 @@ static CmdRunResult run_command_file(const char* cmdPath, const char* diagDir,
             }
             case CMD_WIFI: { CliResult r = cliSetWifi(c.args); airbridge_log("CMD: %s", r.output); break; }
             case CMD_S3:   { CliResult r = cliSetS3(c.args);   airbridge_log("CMD: %s", r.output); break; }
+            case CMD_COMPRESS: {
+                // "compress" / "compress on" → enable; "compress off" → disable.
+                g_compress = (strstr(c.args, "off") == nullptr);
+                airbridge_log("CMD: compress %s (gzip .eaofh into upload queue)",
+                              g_compress ? "ON" : "OFF");
+                break;
+            }
             default:       airbridge_log("CMD: unknown directive '%s'", c.verb); break;
         }
         if (c.once) anyConsumed = true;
@@ -3629,7 +3642,7 @@ static void doHarvest() {
     g_hal->nvs->get_u32("harvest", "count", &harvestNum);
     harvestNum++;
     g_hal->nvs->set_u32("harvest", "count", harvestNum);
-    HarvestResult hr = harvestFiles(harvestSrc, harvDir, (uint16_t)harvestNum);
+    HarvestResult hr = harvestFiles(harvestSrc, harvDir, (uint16_t)harvestNum, g_compress);
     uint16_t count = hr.count;
     float usedMb = hr.usedMb;
 

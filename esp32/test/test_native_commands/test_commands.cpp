@@ -74,6 +74,16 @@ void test_parse_survey(void) {
     TEST_ASSERT_FALSE(c.runtimeSafe);  // changes the whole boot duty cycle → boot-only
 }
 
+void test_parse_compress(void) {
+    Command c;
+    TEST_ASSERT_TRUE(cmdParseLine("compress", &c));
+    TEST_ASSERT_EQUAL(CMD_COMPRESS, c.type);
+    TEST_ASSERT_TRUE(c.runtimeSafe);   // takes effect at the next harvest, no reboot
+    TEST_ASSERT_TRUE(cmdParseLine("compress off", &c));
+    TEST_ASSERT_EQUAL(CMD_COMPRESS, c.type);
+    TEST_ASSERT_EQUAL_STRING("off", c.args);
+}
+
 void test_parse_unknown_verb(void) {
     Command c;
     TEST_ASSERT_TRUE(cmdParseLine("frobnicate now", &c));
@@ -214,6 +224,7 @@ int main(int, char**) {
     RUN_TEST(test_parse_args_preserved);
     RUN_TEST(test_parse_args_with_once);
     RUN_TEST(test_parse_survey);
+    RUN_TEST(test_parse_compress);
     RUN_TEST(test_parse_unknown_verb);
     RUN_TEST(test_parse_once_not_mistaken_in_args);
     RUN_TEST(test_parse_multiline);

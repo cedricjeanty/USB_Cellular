@@ -40,6 +40,7 @@ enum CmdType {
     CMD_WIFI,        // args: <ssid> <pass>                     — runtime-safe (NVS)
     CMD_S3,          // args: <api_host> <api_key>              — runtime-safe (NVS)
     CMD_SURVEY,      // antenna signal-survey mode (no PPP)     — boot-only (changes duty cycle)
+    CMD_COMPRESS,    // gzip .eaofh into the upload queue        — runtime-safe (takes effect next harvest)
 };
 
 struct Command {
@@ -61,6 +62,7 @@ inline CmdType cmdVerbType(const char* verb, bool* runtimeSafe) {
         { "wifi",      CMD_WIFI,      true  },
         { "s3",        CMD_S3,        true  },
         { "survey",    CMD_SURVEY,    false },
+        { "compress",  CMD_COMPRESS,  true  },
     };
     for (auto& e : table) {
         if (strcmp(verb, e.v) == 0) { if (runtimeSafe) *runtimeSafe = e.rt; return e.t; }
