@@ -13,3 +13,4 @@ emu_cell.ctl
 s3_flights/
 dsuCookie*.easdf
 esp32/emu_log.pty
+esp32/dsu_memory.eaofh

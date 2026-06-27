@@ -32,6 +32,7 @@
 #include <cstring>
 #include <string>
 #include <sys/stat.h>   // stat() for the EMU_CELL_FILE mtime poll
+#include <dirent.h>     // opendir/readdir for the DSU transfer cursor
 #include <vector>
 #include <thread>
 #include <atomic>
@@ -94,6 +95,14 @@ static void sigusr1_handler(int) { s_cellularToggle = 1; }
 // existing tests are unaffected. See applyCellState() + scripts/flight_cycle_test.sh.
 static std::string s_cellFilePath;
 static time_t      s_cellFileMtime = 0;
+
+// EMU_DSU_INTERNAL: path to a synthetic "aircraft internal memory" .eaofh holding
+// the DSU's backlog. When set, a transfer thread streams un-sent flights into
+// flightHistory/ rate-limited (SimDSU's ~500 KB/s USB rate) starting
+// EMU_DSU_DELAY_MS after boot (the 90s USB-present moment). Models a NEW aircraft
+// whose full log backlog lives in the DSU and must transfer over USB before the
+// device can upload it. See dsuTransferThread() + scripts/flight_cycle_test.sh.
+static std::atomic<bool> s_dsuStop{false};
 
 // Emulator uplink throttle (bytes/sec) for the upload path. Default 100 KB/s
 // (historical). EMU_UPLINK_KBPS overrides — e.g. 167 to match the real PCB's
@@ -455,6 +464,74 @@ static bool applyCellState(const char* word, DisplayState& ds, SimModem* m) {
     return true;
 }
 
+// Highest flight number already present as a file in flightHistory/. Filenames
+// are "<serial>_<NNNNN>_<date>.eaofh"; the serial has no '_', so the first '_'
+// is followed by the flight number. Used (with the cookie) as the DSU transfer
+// resume point so flights already on the device aren't re-sent over USB.
+static uint32_t highestFlightInFlightHistory(const char* root) {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "%s/flightHistory", root);
+    DIR* d = opendir(dir);
+    if (!d) return 0;
+    uint32_t hi = 0;
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        if (e->d_name[0] == '.') continue;        // skip ".", "..", ".*.part"
+        const char* us = strchr(e->d_name, '_');
+        if (!us) continue;
+        uint32_t f = (uint32_t)atoi(us + 1);
+        if (f > hi) hi = f;
+    }
+    closedir(d);
+    return hi;
+}
+
+// DSU transfer thread: models the aircraft DSU connecting over USB ~90s after
+// power-on and streaming its un-sent flight backlog onto the device, rate-limited
+// at SimDSU's writeSpeedKBps (~500 KB/s real USB rate). One file per flight,
+// atomically (a kill at power-off leaves the already-transferred flights intact —
+// incremental progress that the next boot resumes via the cookie). Runs once per
+// emulator process (one cycle); the test appends the just-flown flight to the
+// internal memory after the cycle so it transfers on the *next* power-on.
+static void dsuTransferThread(std::string internalPath, uint32_t delayMs, std::string sdRoot) {
+    // Wait out the USB-present delay (scaled by the test for --fast), but stay
+    // responsive to an early power-off.
+    uint32_t waited = 0;
+    while (waited < delayMs && !s_dsuStop) {
+        uint32_t step = (delayMs - waited > 50) ? 50 : (delayMs - waited);
+        usleep(step * 1000);
+        waited += step;
+    }
+    if (s_dsuStop) return;
+
+    SimDSU dsu;
+    dsu.sdRoot = sdRoot.c_str();
+    dsu.internalMemoryPath = internalPath.c_str();
+    if (const char* m = getenv("EMU_DSU_KBPS"); m && atoi(m) > 0) dsu.writeSpeedKBps = atoi(m);
+
+    uint32_t cookie = dsu.readCookie();
+    uint32_t inFh   = highestFlightInFlightHistory(sdRoot.c_str());
+    uint32_t resume = cookie > inFh ? cookie : inFh;
+
+    const auto& idx = dsu.flightIndex();   // builds once
+    printf("[DSU] Transfer thread: %zu flight(s) in memory, resume after %u "
+           "(cookie=%u fh=%u) @%dKB/s\n",
+           idx.size(), resume, cookie, inFh, dsu.writeSpeedKBps);
+
+    uint32_t sent = 0;
+    for (const auto& e : idx) {
+        if (s_dsuStop) break;
+        if (e.flight <= resume) continue;
+        SimDSU::SessionResult r = dsu.transferFlight(e.flight);
+        if (r.success) {
+            sent++;
+            printf("[DSU] USB→device: flight %u (%u bytes)\n", e.flight, r.bytesWritten);
+        }
+    }
+    printf("[DSU] Transfer thread done: %u flight(s) this cycle%s\n",
+           sent, s_dsuStop ? " (interrupted by power-off)" : "");
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
@@ -520,6 +597,15 @@ int main(int argc, char* argv[]) {
         printf("Cellular profile: scripted via %s\n", s_cellFilePath.c_str());
     }
     if (const char* e = getenv("EMU_CELL_SEED"); e && e[0]) srand((unsigned)atoi(e));
+
+    // EMU_DSU_INTERNAL: backlog-in-the-DSU transfer thread (see dsuTransferThread).
+    std::thread dsuThread;
+    if (const char* e = getenv("EMU_DSU_INTERNAL"); e && e[0]) {
+        uint32_t delayMs = 90000;  // default: real 90s USB-present delay
+        if (const char* d = getenv("EMU_DSU_DELAY_MS"); d && d[0]) delayMs = (uint32_t)atol(d);
+        printf("DSU backlog: %s (USB-present transfer at +%ums)\n", e, delayMs);
+        dsuThread = std::thread(dsuTransferThread, std::string(e), delayMs, std::string(SD_ROOT));
+    }
 
     s_nvs.set_str("s3", "device_id", deviceId);
 
@@ -1380,6 +1466,8 @@ int main(int argc, char* argv[]) {
         g_simSdCard() = nullptr;
     }
     if (modemThread.joinable()) modemThread.join();
+    s_dsuStop = true;
+    if (dsuThread.joinable()) dsuThread.join();
     // Clean up pppd and routing
     if (s_clientPppd > 0) {
         system("sudo ip rule del from 10.64.64.2 table 100 2>/dev/null");

@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <string>
+#include <vector>
 #include "sim_dsu.h"
 #include "airbridge_proto.h"
 
@@ -446,6 +447,102 @@ void test_build_flight_index_full_fixture(void) {
 
 // ── Test runner ──────────────────────────────────────────────────────────────
 
+// ── Synthetic backlog + per-flight transfer (flight_cycle_test model) ────────
+// Mirror scripts/flight_cycle_test.sh append_flight: <size_kb> of zero filler
+// (no stray 0xEA) then a 0x4C footer carrying the flight number. The block
+// buildFlightIndex assigns to flight N = [prev footer end, this footer end), so
+// the transferred slice ends at footer N (lastRecordFromLog → N).
+static void appendSyntheticFlight(const char* path, uint32_t flight, uint32_t kb,
+                                  const char* sn = "EA500.000243") {
+    FILE* f = fopen(path, "ab");
+    std::vector<uint8_t> fill(kb * 1024, 0);
+    fwrite(fill.data(), 1, fill.size(), f);
+    uint8_t rec[28] = {0xEA, 0x4C, 0x00, 0x1C};
+    for (int i = 0; i < 12 && sn[i]; i++) rec[4 + 5 + i] = (uint8_t)sn[i];  // body[5:17]
+    rec[4 + 20] = (flight >> 8) & 0xFF;                                     // body[20:22]
+    rec[4 + 21] = flight & 0xFF;
+    fwrite(rec, 1, 28, f);
+    fclose(f);
+}
+
+void test_synthetic_memory_roundtrip(void) {
+    char mem[256];
+    snprintf(mem, sizeof(mem), "%s/internal.eaofh", TEST_SD);
+    ::remove(mem);
+    for (uint32_t i = 1; i <= 5; i++) appendSyntheticFlight(mem, i, 8);
+    auto idx = buildFlightIndex(mem);
+    TEST_ASSERT_EQUAL_UINT32(5, idx.size());
+    for (uint32_t i = 0; i < 5; i++)
+        TEST_ASSERT_EQUAL_UINT32(i + 1, idx[i].flight);
+    // Each block ≈ 8KB filler + 28B footer, contiguous & covering the file.
+    TEST_ASSERT_EQUAL_UINT64(0, idx.front().blockStart);
+    TEST_ASSERT_GREATER_THAN_UINT64(8 * 1024, idx[0].blockEnd - idx[0].blockStart);
+}
+
+void test_transfer_flight_atomic_and_content(void) {
+    char mem[256];
+    snprintf(mem, sizeof(mem), "%s/internal.eaofh", TEST_SD);
+    ::remove(mem);
+    for (uint32_t i = 1; i <= 3; i++) appendSyntheticFlight(mem, i, 16);
+
+    SimDSU dsu;
+    dsu.sdRoot = TEST_SD;
+    dsu.internalMemoryPath = mem;
+    dsu.writeSpeedKBps = 0;  // no throttle in the unit test
+
+    SimDSU::SessionResult r = dsu.transferFlight(2);
+    TEST_ASSERT_TRUE(r.success);
+    TEST_ASSERT_EQUAL_UINT32(2, r.flightNum);
+    TEST_ASSERT_GREATER_THAN_UINT32(15 * 1024, r.bytesWritten);
+
+    // The .part temp must be gone (atomic rename), and the real file present.
+    char fhDir[300];
+    snprintf(fhDir, sizeof(fhDir), "%s/flightHistory", TEST_SD);
+    char findPart[400];
+    snprintf(findPart, sizeof(findPart), "ls %s/.*.part >/dev/null 2>&1", fhDir);
+    TEST_ASSERT_NOT_EQUAL(0, system(findPart));  // no leftover .part
+
+    // The transferred slice must contain flight 2 as its last record.
+    char fpath[420];
+    snprintf(fpath, sizeof(fpath), "%s/flightHistory/%s", TEST_SD, r.filename);
+    FILE* f = fopen(fpath, "rb");
+    TEST_ASSERT_NOT_NULL(f);
+    fseek(f, 0, SEEK_END); uint64_t sz = (uint64_t)ftell(f);
+    uint32_t lastFlight = 0; char serial[13] = {0};
+    bool ok = lastRecordFromLog(stdio_read_at, f, sz, &lastFlight, serial, sizeof(serial));
+    fclose(f);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_EQUAL_UINT32(2, lastFlight);
+}
+
+void test_transfer_flight_cursor_sequence(void) {
+    char mem[256];
+    snprintf(mem, sizeof(mem), "%s/internal.eaofh", TEST_SD);
+    ::remove(mem);
+    for (uint32_t i = 1; i <= 4; i++) appendSyntheticFlight(mem, i, 8);
+
+    SimDSU dsu;
+    dsu.sdRoot = TEST_SD;
+    dsu.internalMemoryPath = mem;
+    dsu.writeSpeedKBps = 0;
+
+    // Cursor-driven: transfer flights past a resume point of 2 (as the emu thread does).
+    const auto& idx = dsu.flightIndex();
+    int sent = 0;
+    for (const auto& e : idx)
+        if (e.flight > 2 && dsu.transferFlight(e.flight).success) sent++;
+    TEST_ASSERT_EQUAL_INT(2, sent);  // flights 3 and 4
+
+    char chk[400];
+    snprintf(chk, sizeof(chk), "ls %s/flightHistory/*_00003_*.eaofh >/dev/null 2>&1", TEST_SD);
+    TEST_ASSERT_EQUAL(0, system(chk));
+    snprintf(chk, sizeof(chk), "ls %s/flightHistory/*_00002_*.eaofh >/dev/null 2>&1", TEST_SD);
+    TEST_ASSERT_NOT_EQUAL(0, system(chk));  // flight 2 (<= resume) NOT transferred
+
+    // Unknown flight → no-op failure.
+    TEST_ASSERT_FALSE(dsu.transferFlight(99).success);
+}
+
 int main(int argc, char** argv) {
     UNITY_BEGIN();
 
@@ -468,6 +565,10 @@ int main(int argc, char** argv) {
 
     RUN_TEST(test_session_writes_metrics);
     RUN_TEST(test_session_writes_report);
+
+    RUN_TEST(test_synthetic_memory_roundtrip);
+    RUN_TEST(test_transfer_flight_atomic_and_content);
+    RUN_TEST(test_transfer_flight_cursor_sequence);
 
     RUN_TEST(test_build_flight_index_full_fixture);
 

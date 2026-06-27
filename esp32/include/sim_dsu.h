@@ -267,6 +267,55 @@ public:
         return r;
     }
 
+    // Transfer exactly ONE flight (by number) to flightHistory, independent of
+    // the cookie. The caller (emulator DSU thread) tracks its own forward cursor
+    // so a long backlog streams flight-by-flight, each its own file — a power-off
+    // mid-backlog leaves the already-transferred flights intact (incremental
+    // progress) instead of discarding a giant all-in-one slice. Atomic: writes a
+    // dot-prefixed ".part" temp (skipped by harvest) and renames on completion, so
+    // a kill mid-write never leaves a partial .eaofh the device would harvest.
+    // Rate-limited at writeSpeedKBps (models the real ~500 KB/s USB transfer).
+    // No metrics/report (lean — the soak metric comes from the flight files).
+    SessionResult transferFlight(uint32_t flightNum) {
+        SessionResult r = {};
+        if (!internalMemoryPath) return r;
+        loadIndex();
+        const FlightEntry* fe = nullptr;
+        for (const auto& e : s_index) if (e.flight == flightNum) { fe = &e; break; }
+        if (!fe) return r;
+
+        const char* usedSerial = (fe->serial[0] != '\0') ? fe->serial : serial;
+        time_t now = time(nullptr);
+        struct tm tm; localtime_r(&now, &tm);
+        char dateStr[16];
+        snprintf(dateStr, sizeof(dateStr), "%04d%02d%02d",
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+
+        char dir[256];
+        snprintf(dir, sizeof(dir), "%s/flightHistory", sdRoot);
+        ::mkdir(dir, 0755);
+
+        snprintf(r.filename, sizeof(r.filename), "%s_%05u_%s.eaofh",
+                 usedSerial, flightNum, dateStr);
+        char fhPath[384];
+        snprintf(fhPath, sizeof(fhPath), "%s/flightHistory/%s", sdRoot, r.filename);
+        char tmpPath[420];
+        snprintf(tmpPath, sizeof(tmpPath), "%s/flightHistory/.%s.part", sdRoot, r.filename);
+
+        r.bytesWritten = copyFileSlice(internalMemoryPath, tmpPath,
+                                       fe->blockStart, fe->blockEnd);
+        if (r.bytesWritten == 0) { ::remove(tmpPath); return r; }
+        if (::rename(tmpPath, fhPath) != 0) { ::remove(tmpPath); return r; }
+
+        r.firstFlight = flightNum;
+        r.flightNum = flightNum;
+        r.success = true;
+        return r;
+    }
+
+    // Expose the flight index (loads on first use) for cursor-driven transfer.
+    const std::vector<FlightEntry>& flightIndex() { loadIndex(); return s_index; }
+
 private:
     std::vector<FlightEntry> s_index;
     bool s_indexLoaded = false;

@@ -373,7 +373,9 @@ esp32/
 │
 ├── emu/main.cpp                 # SDL2 emulator (~1140 lines): wires headers to FakeSD/FileNvs + SimModem PTY
 ├── include/sim_modem.h          # SIM7600 simulator: AT commands + PPP bridge via pppd
-├── include/sim_dsu.h            # Aircraft DSU simulator: reads cookie, emits only un-sent flights
+├── include/sim_dsu.h            # Aircraft DSU simulator: reads cookie, emits only un-sent flights;
+│                                #   runSession (batched 'd' keypress) + transferFlight (per-flight, atomic
+│                                #   .part+rename, rate-limited — used by the emulator's DSU backlog thread)
 │
 ├── lib/fatfs_native/            # Standalone FatFs for native tests (no ESP-IDF/FreeRTOS)
 ├── test/test_native_*/          # 16 Unity test suites (proto, dsu, harvest, modem, modem_init, http,
@@ -398,11 +400,18 @@ scripts/
 │                                #   power-cut tests; state-triggered waits). --target emulator | device.
 │                                #   Device runs the SAME consolidated tests via persistent CDC + a
 │                                #   serial-log tap (/tmp/dev_e2e.log) + host_dsu.py (see docs/testing.md).
-├── flight_cycle_test.sh         # Emulator soak test: repeated flight cycles over a scripted cellular
-│                                #   profile (full→weak→off→flaky→full), measuring cycles-to-catch-up of a
-│                                #   DSU backlog (S3 manifest hwm == latest flight). Cellular is scripted via
-│                                #   EMU_CELL_FILE (emu/main.cpp applyCellState + sim_modem setFlaky/flakyDropsFrame:
-│                                #   PPP_IP-only loss). Params: --backlog/--cycles/--ratio/--flaky/--cruise-kb/--ground-kb.
+├── flight_cycle_test.sh         # Emulator soak test: NEW-aircraft backlog drain over repeated flight
+│                                #   cycles, measuring cycles-to-catch-up (S3 manifest hwm == DSU latest) +
+│                                #   backlog area-under-curve. Backlog lives in the DSU: a synthetic
+│                                #   "internal memory" .eaofh (EMU_DSU_INTERNAL); the emulator's DSU thread
+│                                #   streams un-sent flights over USB into flightHistory/ RATE-LIMITED at
+│                                #   ~500 KB/s (EMU_DSU_KBPS) starting EMU_DSU_DELAY_MS (90s USB-present) after
+│                                #   boot, one atomic file per flight, cursor/cookie-resumed across cycles —
+│                                #   the device starts EMPTY. Each cycle's flight is recorded after the cycle
+│                                #   ⇒ transferred on the NEXT power-on. Cellular scripted via EMU_CELL_FILE
+│                                #   (emu/main.cpp applyCellState + sim_modem setFlaky/flakyDropsFrame: PPP_IP-only
+│                                #   loss). Params: --backlog-mb/--cycles/--cruise-prob/--flaky/--uplink-kbps/
+│                                #   --usb-kbps/--cruise-kb/--ground-kb/--seed/--fast.
 ├── host_dsu.py                  # Cookie-aware host-side DSU sim (port of sim_dsu.h): mounts the ESP32
 │                                #   USB volume, reads dsuCookie.easdf, emits only un-sent flights. Backs
 │                                #   write_dsu_file on --target device. Modes: emit/slice/plant-cookie/
