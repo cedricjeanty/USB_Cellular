@@ -143,6 +143,13 @@ log "═════════════════════════
 stop_device 2>/dev/null || true
 rm -rf "$SD_EMU"/* "$SD_INT"/* "$FW_DIR/emu_nvs.dat" "$FW_DIR/emu_modem.dat" "$EMU_CELL_FILE" 2>/dev/null || true
 cleanup_s3; cleanup_aircraft_s3 "$SERIAL"
+# Reset OTA latest.json to the emulator's own FW version, else every boot sees a
+# newer target, downloads a doomed update (size-mismatch fail), and wastes
+# per-cycle time + bandwidth that should go to the backlog. (e2e_unified does the
+# same with src/main.cpp's version.)
+EMU_FW=$(grep 'define FW_VERSION' "$FW_DIR/emu/main.cpp" | grep -o '"[^"]*"' | tr -d '"')
+echo "{\"version\":\"$EMU_FW\",\"size\":0}" | aws s3 cp - "s3://$BUCKET/firmware/latest.json" --content-type application/json >/dev/null 2>&1
+log "OTA reset to v$EMU_FW (skip doomed per-boot OTA download)"
 cd "$FW_DIR" && ~/.local/bin/pio run -e emulator 2>&1 | tail -1
 
 seed_backlog
