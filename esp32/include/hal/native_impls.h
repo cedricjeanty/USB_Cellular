@@ -212,6 +212,17 @@ public:
         }
         freeaddrinfo(res);
 
+        // Model the firmware's bounded write/read (netWriteAll's 30s wall-clock
+        // timeout + esp_tls SO_SNDTIMEO): without this the blocking SSL_write wedges
+        // forever when the PPP link drops mid-upload (e.g. cell loss at takeoff),
+        // where real hardware fails the write in ~30s, errors the upload, and retries
+        // it next cycle. A healthy transfer's per-write() calls are far under 30s, so
+        // this only trips on a genuinely dead link. (Surfaced by gzip single-PUTs
+        // spanning a cell drop — multipart already recovered.)
+        struct timeval tv = {30, 0};
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
         SSL* ssl = SSL_new(ctx_);
         SSL_set_fd(ssl, fd);
         SSL_set_tlsext_host_name(ssl, host);
