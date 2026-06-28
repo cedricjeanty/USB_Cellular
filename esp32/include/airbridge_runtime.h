@@ -76,6 +76,30 @@ inline SdRecoveryAction sdHealthUpdate(SdHealthState& st, bool probeOk,
     return sdRecoveryAction(st.consecutiveFailures, degradeAfter, reformatAfter);
 }
 
+// ── Harvest-integrity guard ─────────────────────────────────────────────────
+// Defense against silently losing or corrupting a flight: the harvest fires
+// because the host (DSU) wrote files to the SD, but it must verify it actually
+// recovered roughly what was written. If it detected a substantial write but
+// harvested little or nothing — the data hasn't committed to the SD yet
+// (host-cache / flush lag after a USB write), or the file was truncated/unreadable
+// — the firmware must NOT silently move on. It treats the harvest as incomplete:
+// logs the anomaly (so it's visible on serial + over cellular) and retries on the
+// next quiet window instead of dropping the flight or uploading a stub.
+// (Surfaced on hardware: device counted a 4457 KB write but harvested 0 files /
+// a 28-byte truncated record.) Caller bounds retries so a genuinely empty write
+// doesn't loop forever.
+//   detectedWriteKB — bytes the host wrote since the last harvest (MSC/file-watch).
+//   harvestedCount  — files harvestFiles actually moved.
+//   harvestedKB     — bytes harvestFiles actually moved.
+//   minKB           — ignore writes below this (metadata churn, tiny touches).
+inline bool harvestLooksIncomplete(uint32_t detectedWriteKB, uint16_t harvestedCount,
+                                   uint32_t harvestedKB, uint32_t minKB = 64) {
+    if (detectedWriteKB < minKB) return false;          // nothing substantial written
+    if (harvestedCount == 0) return true;               // wrote a lot, moved nothing
+    if ((uint64_t)harvestedKB * 4 < detectedWriteKB) return true;  // recovered ≪ written (truncated)
+    return false;
+}
+
 // Check for OTA firmware update via the S3 API.
 // Does NOT download or flash — just checks version and gets URL.
 inline OtaCheckResult halOtaCheck(const char* currentVersion) {

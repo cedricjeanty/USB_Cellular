@@ -1280,6 +1280,26 @@ int main(int argc, char* argv[]) {
             g_hal->nvs->set_u32("harvest", "count", hnum);
             HarvestResult r = harvestFiles(SD_ROOT, destDir, (uint16_t)hnum, s_compress);
             printf("[Harvest] Done: %u file(s), %.1f MB → %s\n", r.count, r.usedMb, r.folder);
+
+            // Harvest-integrity guard: we fired because the host wrote ds.hostWrittenMb,
+            // so verify we recovered roughly that. If not (data not yet committed to the
+            // SD, or a truncated/unreadable file), don't silently drop it — retry the
+            // harvest a few times before giving up.
+            static int s_harvestRetries = 0;
+            uint32_t wroteKB = (uint32_t)(ds.hostWrittenMb * 1024.0f);
+            uint32_t gotKB   = (uint32_t)(r.usedMb * 1024.0f);
+            if (harvestLooksIncomplete(wroteKB, r.count, gotKB) && s_harvestRetries < 3) {
+                s_harvestRetries++;
+                printf("[Harvest] WARN: incomplete — wrote %uKB but harvested %u file(s)/%uKB; "
+                       "retry %d/3 (data may not have committed)\n", wroteKB, r.count, gotKB,
+                       s_harvestRetries);
+                airbridge_log("HARVEST: incomplete wrote=%uKB got=%u/%uKB retry=%d",
+                              wroteKB, r.count, gotKB, s_harvestRetries);
+                s_harvesting = false;  // leave s_writeDetected set → re-fires after the quiet window
+                s_lastWriteMs = now;   // re-arm the quiet window so the retry waits (commit time)
+                continue;
+            }
+            s_harvestRetries = 0;
             ds.mbQueued += r.usedMb;
 
             // Write DSU cookie if flight history files were harvested

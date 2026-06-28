@@ -295,6 +295,30 @@ void test_sd_health_update_escalates(void) {
 
 // ── Test runner ─────────────────────────────────────────────────────────────
 
+// ── Harvest-integrity guard ──────────────────────────────────────────────────
+void test_harvest_complete_ok(void) {
+    // Wrote 4 MB, harvested 1 file / ~4 MB → complete, no retry.
+    TEST_ASSERT_FALSE(harvestLooksIncomplete(4096, 1, 4096));
+}
+void test_harvest_zero_files_after_write(void) {
+    // Detected a 4 MB write but harvested 0 files → incomplete (the field "done 0 file(s)").
+    TEST_ASSERT_TRUE(harvestLooksIncomplete(4457, 0, 0));
+}
+void test_harvest_truncated_file(void) {
+    // Detected 4457 KB but harvested a 28-byte stub (~0 KB) → incomplete (the truncation case).
+    TEST_ASSERT_TRUE(harvestLooksIncomplete(4457, 1, 0));
+}
+void test_harvest_small_write_ignored(void) {
+    // A tiny write (metadata churn) with nothing harvested is not an anomaly.
+    TEST_ASSERT_FALSE(harvestLooksIncomplete(16, 0, 0));
+}
+void test_harvest_partial_acceptable(void) {
+    // Recovered most of what was written (e.g. one of two files still flushing) — tolerate.
+    TEST_ASSERT_FALSE(harvestLooksIncomplete(1000, 1, 800));
+    // But recovering <1/4 of a large write is suspicious.
+    TEST_ASSERT_TRUE(harvestLooksIncomplete(1000, 1, 100));
+}
+
 int main(int argc, char** argv) {
     UNITY_BEGIN();
 
@@ -336,6 +360,12 @@ int main(int argc, char** argv) {
     RUN_TEST(test_sd_recovery_disabled_tiers);
     RUN_TEST(test_sd_health_update_resets_on_ok);
     RUN_TEST(test_sd_health_update_escalates);
+
+    RUN_TEST(test_harvest_complete_ok);
+    RUN_TEST(test_harvest_zero_files_after_write);
+    RUN_TEST(test_harvest_truncated_file);
+    RUN_TEST(test_harvest_small_write_ignored);
+    RUN_TEST(test_harvest_partial_acceptable);
 
     return UNITY_END();
 }

@@ -3646,8 +3646,31 @@ static void doHarvest() {
     uint16_t count = hr.count;
     float usedMb = hr.usedMb;
 
+    // Harvest-integrity guard (airbridge_runtime.h harvestLooksIncomplete): we fired
+    // on a host write, so verify we recovered roughly what was written SINCE the last
+    // harvest (g_hostWrittenMb is a per-boot monotonic counter, so use the delta). If
+    // not (data not yet committed to the SD, or a truncated/unreadable file), don't
+    // write the cookie or clear the dirty state — log it and retry on the next quiet
+    // window rather than silently dropping the flight or advancing the cookie past it.
+    static int s_harvestRetries = 0;
+    static float s_lastHarvestWrittenMb = 0.0f;
+    float wroteDeltaMb = g_hostWrittenMb - s_lastHarvestWrittenMb;
+    if (wroteDeltaMb < 0) wroteDeltaMb = g_hostWrittenMb;   // counter reset (reboot) — use absolute
+    bool harvestIncomplete = false;
+    if (harvestLooksIncomplete((uint32_t)(wroteDeltaMb * 1024.0f), count,
+                               (uint32_t)(usedMb * 1024.0f)) && s_harvestRetries < 3) {
+        s_harvestRetries++;
+        harvestIncomplete = true;
+        log_write("HARVEST: incomplete wrote=%.0fKB got=%u/%.0fKB retry=%d/3 (data may not have committed)",
+                  wroteDeltaMb * 1024.0f, count, usedMb * 1024.0f, s_harvestRetries);
+        log_flush_to_sd();
+    } else {
+        s_harvestRetries = 0;
+        s_lastHarvestWrittenMb = g_hostWrittenMb;  // snapshot only on a completed harvest
+    }
+
     // Write DSU cookie to the partition the DSU reads from
-    if (count > 0 && !g_s3CookieActive && hr.maxFlight > 0 && hr.dsuSerial[0]) {
+    if (count > 0 && !harvestIncomplete && !g_s3CookieActive && hr.maxFlight > 0 && hr.dsuSerial[0]) {
         uint8_t cookie[78];
         buildDsuCookie(hr.dsuSerial, hr.maxFlight, cookie);
         if (g_dual_partition && dsu_mounted) {
@@ -3706,8 +3729,14 @@ static void doHarvest() {
     log_write("Harvest: %u file(s), %.1f MB", count, usedMb);
     log_flush_to_sd();
 
-    g_writeDetected = false; g_lastWriteMs = 0;
-    g_hostWasConnected = false; g_hostConnected = false;
+    if (harvestIncomplete) {
+        // Leave g_writeDetected set so shouldHarvest re-fires; re-arm the quiet
+        // window so the retry waits for the write to commit to the SD.
+        g_lastWriteMs = millis();
+    } else {
+        g_writeDetected = false; g_lastWriteMs = 0;
+        g_hostWasConnected = false; g_hostConnected = false;
+    }
 
     g_harvesting = false;
     g_msc_ejected = false;
