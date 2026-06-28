@@ -277,8 +277,14 @@ def write_metrics_and_report(mnt, filename, nbytes, metrics_src):
         f.write(f"Finished download FH to /mnt/memStick/flightHistory/{filename}\n")
 
 
+# Map random bytes onto a 5-symbol alphabet (A-E) → gzip ratio ~3.0x, matching real
+# .eaofh logs (and the emulator benchmark filler). 0xEA never appears (A-E=0x41-0x45)
+# so the firmware's record framing is undisturbed. Used by the on-device compression
+# hardware test so the measured ratio reflects real flight logs, not random data.
+_COMPRESSIBLE_TABLE = bytes(((i % 5) + 0x41) for i in range(256))
+
 def emit_synthetic(mnt, serial, max_flight, size_kb, first_flight, metrics_src, meta,
-                   ignore_cookie=False):
+                   ignore_cookie=False, compressible=False):
     """Cookie-aware synthesis: emit ${serial}_${max_flight} only if the device
     hasn't already harvested it. first_flight defaults to 1 (matches write_dsu_file:
     Lambda consecutive-hwm logic), or set explicitly for the delta test.
@@ -298,7 +304,10 @@ def emit_synthetic(mnt, serial, max_flight, size_kb, first_flight, metrics_src, 
         # then random body, then the last-flight (max_flight) record.
         f.write(make_record(serial, ff))
         f.write(b"\xEA")
-        f.write(os.urandom(size_kb * 1024))
+        body = os.urandom(size_kb * 1024)
+        if compressible:
+            body = body.translate(_COMPRESSIBLE_TABLE)  # ~3x-compressible, like real logs
+        f.write(body)
         f.write(make_record(serial, max_flight))
     nbytes = os.path.getsize(fpath)
     if meta:
@@ -390,6 +399,9 @@ def main():
                     help="force first_flight (emit/delta); default 1")
     ap.add_argument("--meta", action="store_true",
                     help="also write a {first}:{last} .meta sidecar (delta test)")
+    ap.add_argument("--compressible", action="store_true",
+                    help="write ~3x-compressible body (5-symbol alphabet) instead of random, "
+                         "so the on-device gzip ratio matches real flight logs")
     ap.add_argument("--ignore-cookie", action="store_true",
                     help="emit even if the cookie already covers --max-flight "
                          "(to exercise the firmware's manifest-skip path)")
@@ -433,7 +445,7 @@ def main():
         else:
             emit_synthetic(mnt, args.serial, args.max_flight, args.size_kb,
                            args.first_flight, args.metrics_src, args.meta,
-                           args.ignore_cookie)
+                           args.ignore_cookie, args.compressible)
     finally:
         if owns:
             unmount(mnt)
