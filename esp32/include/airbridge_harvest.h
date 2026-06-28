@@ -22,6 +22,18 @@ inline size_t cz_hal_write(void* ctx, const void* buf, size_t n) {
 }
 #endif
 
+// Opt-in harvest tracing (-DHARVEST_TRACE): logs every directory opened and every
+// entry the walk sees (name / is_dir / stat size / skip), so a serial capture shows
+// EXACTLY where a host-written file disappears (readdir miss vs subdir-not-entered
+// vs stat-size-0 — i.e. the MSC↔FATFS coherency question). Off by default so normal
+// builds + the native tests don't pull in airbridge_log or spam.
+#ifdef HARVEST_TRACE
+#include "airbridge_log.h"
+#define HTRACE(...) airbridge_log(__VA_ARGS__)
+#else
+#define HTRACE(...) ((void)0)
+#endif
+
 struct HarvestResult {
     uint16_t count;
     float    usedMb;
@@ -103,18 +115,20 @@ inline HarvestResult harvestFiles(const char* srcDir, const char* destBase,
     strlcpy(stack[0].dirpath, srcDir, sizeof(stack[0].dirpath));
     stack[0].dir = g_hal->filesys->opendir(stack[0].dirpath);
     stack[0].prefix[0] = '\0';
+    HTRACE("HARVEST: opendir %s -> %s", stack[0].dirpath, stack[0].dir ? "ok" : "FAIL");
 
     if (!stack[0].dir) return result;
 
     while (depth >= 0) {
         FsDirEntry ent;
         if (!g_hal->filesys->readdir(stack[depth].dir, &ent)) {
+            HTRACE("HARVEST: readdir(%s) end (depth=%d)", stack[depth].dirpath, depth);
             g_hal->filesys->closedir(stack[depth].dir);
             depth--;
             continue;
         }
 
-        if (isSkipped(ent.name)) continue;
+        if (isSkipped(ent.name)) { HTRACE("HARVEST: entry '%s' SKIPPED", ent.name); continue; }
 
         char fullpath[160];
         snprintf(fullpath, sizeof(fullpath), "%s/%s", stack[depth].dirpath, ent.name);
@@ -122,10 +136,13 @@ inline HarvestResult harvestFiles(const char* srcDir, const char* destBase,
         // readdir may not provide size/type — stat to get real values
         uint32_t statSize = 0;
         bool statIsDir = ent.is_dir;
-        if (g_hal->filesys->stat(fullpath, &statSize, &statIsDir)) {
+        bool statOk = g_hal->filesys->stat(fullpath, &statSize, &statIsDir);
+        if (statOk) {
             ent.size = statSize;
             ent.is_dir = statIsDir;
         }
+        HTRACE("HARVEST: entry '%s' dir=%d statOk=%d size=%u (depth=%d)",
+               ent.name, (int)ent.is_dir, (int)statOk, (unsigned)ent.size, depth);
 
         if (ent.is_dir) {
             if (depth < 3) {
@@ -133,6 +150,8 @@ inline HarvestResult harvestFiles(const char* srcDir, const char* destBase,
                 snprintf(stack[depth].dirpath, sizeof(stack[depth].dirpath),
                          "%s/%s", stack[depth-1].dirpath, ent.name);
                 stack[depth].dir = g_hal->filesys->opendir(stack[depth].dirpath);
+                HTRACE("HARVEST: descend %s -> %s", stack[depth].dirpath,
+                       stack[depth].dir ? "ok" : "FAIL");
                 if (!stack[depth].dir) { depth--; continue; }
                 if (stack[depth-1].prefix[0])
                     snprintf(stack[depth].prefix, sizeof(stack[depth].prefix),
@@ -170,26 +189,38 @@ inline HarvestResult harvestFiles(const char* srcDir, const char* destBase,
         void* df = g_hal->filesys->open(dst, "wb");
         bool copied = false;
         uint64_t storedBytes = 0;
-        if (sf && df) {
 #ifdef AIRBRIDGE_COMPRESS
-            if (doGz) {
-                GzipResult gr = gzipStream(cz_hal_read, sf, cz_hal_write, df);
-                copied = gr.ok;
-                storedBytes = gr.outBytes;
-            } else
-#endif
-            {
-                uint8_t cpbuf[4096];
-                uint32_t rem = ent.size;
+        if (sf && df && doGz) {
+            GzipResult gr = gzipStream(cz_hal_read, sf, cz_hal_write, df);
+            HTRACE("HARVEST: gzip '%s' ok=%d in=%lu out=%lu", ent.name, (int)gr.ok,
+                   (unsigned long)gr.inBytes, (unsigned long)gr.outBytes);
+            if (gr.ok) {
                 copied = true;
-                while (rem > 0) {
-                    size_t toRead = (rem < sizeof(cpbuf)) ? rem : sizeof(cpbuf);
-                    size_t n = g_hal->filesys->read(sf, cpbuf, toRead);
-                    if (n == 0 || g_hal->filesys->write(df, cpbuf, n) != n) { copied = false; break; }
-                    rem -= n;
-                }
-                storedBytes = ent.size;
+                storedBytes = gr.outBytes;
+            } else {
+                // Compression failed (e.g. the ~164KB ROM-tdefl deflate state won't
+                // allocate on a board with PSRAM disabled) — fall back to a verbatim
+                // copy so the flight is NEVER dropped. Reopen both: dst holds a partial
+                // .gz to overwrite, src must rewind.
+                HTRACE("HARVEST: gzip FAILED -> verbatim fallback '%s'", ent.name);
+                g_hal->filesys->close(sf); g_hal->filesys->close(df);
+                sf = g_hal->filesys->open(fullpath, "rb");
+                df = g_hal->filesys->open(dst, "wb");
+                doGz = false;  // fall through to verbatim below
             }
+        }
+#endif
+        if (sf && df && !copied) {  // verbatim: non-.eaofh, non-compress build, or gzip fallback
+            uint8_t cpbuf[4096];
+            uint32_t rem = ent.size;
+            copied = true;
+            while (rem > 0) {
+                size_t toRead = (rem < sizeof(cpbuf)) ? rem : sizeof(cpbuf);
+                size_t n = g_hal->filesys->read(sf, cpbuf, toRead);
+                if (n == 0 || g_hal->filesys->write(df, cpbuf, n) != n) { copied = false; break; }
+                rem -= n;
+            }
+            storedBytes = ent.size;
         }
         if (sf) g_hal->filesys->close(sf);
         if (df) g_hal->filesys->close(df);

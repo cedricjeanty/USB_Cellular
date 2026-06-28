@@ -43,6 +43,14 @@ struct GzipResult {
 #include "miniz.h"
 #include "esp_heap_caps.h"
 
+// Opt-in gzip-path tracing (-DHARVEST_TRACE) to pinpoint a firmware compress failure.
+#ifdef HARVEST_TRACE
+#include "airbridge_log.h"
+#define GZTRACE(...) airbridge_log(__VA_ARGS__)
+#else
+#define GZTRACE(...) ((void)0)
+#endif
+
 struct CzTdeflCtx { cz_write_fn wr; void* wctx; bool ok; uint64_t out; };
 inline mz_bool cz_tdefl_put(const void* buf, int len, void* user) {
     CzTdeflCtx* c = (CzTdeflCtx*)user;
@@ -57,17 +65,22 @@ inline GzipResult gzipStream(cz_read_fn rd, void* rctx, cz_write_fn wr, void* wc
     GzipResult r = {false, 0, 0};
     if (!rd || !wr) return r;
 
+    bool fromPsram = true;
     tdefl_compressor* d = (tdefl_compressor*)heap_caps_malloc(sizeof(tdefl_compressor), MALLOC_CAP_SPIRAM);
-    if (!d) d = (tdefl_compressor*)malloc(sizeof(tdefl_compressor));  // fall back to internal RAM
+    if (!d) { fromPsram = false; d = (tdefl_compressor*)malloc(sizeof(tdefl_compressor)); }  // fall back to internal RAM
+    GZTRACE("GZ: alloc tdefl size=%u psram=%d ptr=%p", (unsigned)sizeof(tdefl_compressor),
+            (int)fromPsram, (void*)d);
     if (!d) return r;
 
     CzTdeflCtx ctx = { wr, wctx, true, 0 };
     static const unsigned char gzhdr[10] = {0x1f,0x8b,0x08,0x00,0,0,0,0,0,0xff};
-    if (wr(wctx, gzhdr, 10) != 10) { free(d); return r; }
+    if (wr(wctx, gzhdr, 10) != 10) { GZTRACE("GZ: header write FAILED"); free(d); return r; }
     ctx.out += 10;
 
     int probes = (level <= 1) ? 1 : (level >= 9 ? 4095 : TDEFL_DEFAULT_MAX_PROBES);
-    if (tdefl_init(d, cz_tdefl_put, &ctx, probes) != TDEFL_STATUS_OKAY) { free(d); return r; }
+    tdefl_status initSt = tdefl_init(d, cz_tdefl_put, &ctx, probes);
+    GZTRACE("GZ: tdefl_init st=%d", (int)initSt);
+    if (initSt != TDEFL_STATUS_OKAY) { free(d); return r; }
 
     mz_ulong crc = mz_crc32(0, NULL, 0);
     uint64_t isize = 0;
@@ -80,9 +93,15 @@ inline GzipResult gzipStream(cz_read_fn rd, void* rctx, cz_write_fn wr, void* wc
         tdefl_flush flush = (got < sizeof(inbuf)) ? TDEFL_FINISH : TDEFL_NO_FLUSH;
         tdefl_status st = tdefl_compress_buffer(d, inbuf, got, flush);
         if (flush == TDEFL_FINISH) done = (st == TDEFL_STATUS_DONE);
-        if (st != TDEFL_STATUS_OKAY && st != TDEFL_STATUS_DONE) ctx.ok = false;
+        if (st != TDEFL_STATUS_OKAY && st != TDEFL_STATUS_DONE) {
+            GZTRACE("GZ: compress_buffer st=%d at in=%llu out=%llu writeOk=%d", (int)st,
+                    (unsigned long long)isize, (unsigned long long)ctx.out, (int)ctx.ok);
+            ctx.ok = false;
+        }
     }
     free(d);
+    GZTRACE("GZ: loop end ok=%d done=%d in=%llu out=%llu", (int)ctx.ok, (int)done,
+            (unsigned long long)isize, (unsigned long long)ctx.out);
     if (!ctx.ok || !done) return r;
 
     unsigned char tr[8];
