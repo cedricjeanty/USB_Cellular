@@ -23,6 +23,8 @@
 
 #include "hal/hal.h"
 #include "airbridge_utils.h"
+#include "airbridge_cli.h"   // cliSetWifi / cliSetS3 (executed by the shared runner)
+#include "airbridge_log.h"   // airbridge_log (shared telemetry)
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
@@ -283,4 +285,87 @@ inline bool cmdWriteFile(const char* path, const char* text) {
     bool ok = (len == 0) || (g_hal->filesys->write(f, text, len) == len);
     g_hal->filesys->close(f);
     return ok;
+}
+
+// ── shared command executor (used by BOTH the USB airbridge.cmd path and the S3 ──
+// command channel, on firmware AND the emulator — so a command behaves identically
+// regardless of delivery). HAL-safe directives (dump_logs/wifi/s3/compress) run here;
+// target-specific ones (cdc/reboot/format/survey) are returned as flags for the
+// caller's glue (esp_restart, NVS format flag, g_msc_only, the OLED) — keeping this
+// core build- and target-independent.
+
+// Compress flag is shared state (HAL-independent): toggled by the `compress` directive,
+// read by the harvest. Single writer (command path) / single reader (harvest task).
+inline bool g_compress = false;
+
+struct CmdRunResult {
+    bool ran;        // at least one directive executed
+    bool reboot;     // a reboot directive ran (caller esp_restart)
+    bool format;     // a format_sd directive ran (caller: NVS sys/format + esp_restart)
+    bool cdc;        // a cdc directive ran (caller: g_msc_only=false, gated ALLOW_CDC_PERSIST)
+    bool cdcOnce;    // the cdc directive was "cdc once" (vs persistent)
+    bool survey;     // a survey directive ran (caller: g_surveyMode=true)
+    int  surveyBand; // 0=none, -1=auto, >0=lock LTE band N
+    int  rewrite;    // 0=no change, 1=write *out, 2=delete file (once-stripping)
+};
+
+// Execute commands from an in-memory text buffer. `runtimeOnly` gates boot-only
+// directives (cdc/format_sd/survey skipped). diagDir/logsDir/uploadDir feed dump_logs.
+// If `out` is non-null and a `once` directive was consumed, the once-stripped text is
+// written to `out` and res.rewrite tells the caller to persist (1) or delete (2) the
+// source file; pass out=nullptr for the SD-independent S3 path (no rewrite needed —
+// the Lambda one-shot delete already gives run-once delivery).
+// allowSdOps=false (the remote/S3 path) skips SD-touching directives (dump_logs) so the
+// executor NEVER blocks on the SD mutex — keeping remote C2 alive even when the SD/harvest
+// is the wedged thing. The USB path leaves it true (default).
+inline CmdRunResult runCommandTextBuffer(const char* text, bool runtimeOnly,
+                                         const char* diagDir, const char* logsDir,
+                                         const char* uploadDir,
+                                         char* out = nullptr, size_t outSz = 0,
+                                         bool allowSdOps = true) {
+    CmdRunResult res = {};
+    Command cmds[16];
+    int n = parseCommands(text, cmds, 16);
+    bool anyConsumed = false;
+    for (int i = 0; i < n; i++) {
+        Command& c = cmds[i];
+        if (!cmdExecuted(c, runtimeOnly)) continue;  // boot-only skipped at runtime
+        res.ran = true;
+        switch (c.type) {
+            case CMD_CDC:
+                res.cdc = true; res.cdcOnce = c.once;   // caller applies g_msc_only + ifdef
+                break;
+            case CMD_DUMP_LOGS: {
+                if (!allowSdOps) {   // remote path: don't block on the SD mutex
+                    airbridge_log("CMD: dump_logs skipped (remote path is SD-independent)");
+                    break;
+                }
+                int copied = dumpLogs(logsDir, uploadDir, diagDir);
+                airbridge_log("CMD: dump_logs — copied %d log(s) to %s", copied, diagDir);
+                break;
+            }
+            case CMD_REBOOT:    res.reboot = true; break;
+            case CMD_FORMAT_SD: res.format = true; break;
+            case CMD_SURVEY: {
+                res.survey = true;
+                const char* b = strstr(c.args, "band=");
+                if (b) { b += 5; res.surveyBand = (strncmp(b, "auto", 4) == 0) ? -1 : atoi(b); }
+                airbridge_log("CMD: survey — signal-survey mode (no PPP), band=%d", res.surveyBand);
+                break;
+            }
+            case CMD_WIFI: { CliResult r = cliSetWifi(c.args); airbridge_log("CMD: %s", r.output); break; }
+            case CMD_S3:   { CliResult r = cliSetS3(c.args);   airbridge_log("CMD: %s", r.output); break; }
+            case CMD_COMPRESS:
+                g_compress = (strstr(c.args, "off") == nullptr);
+                airbridge_log("CMD: compress %s (gzip .eaofh into upload queue)",
+                              g_compress ? "ON" : "OFF");
+                break;
+            default: airbridge_log("CMD: unknown directive '%s'", c.verb); break;
+        }
+        if (c.once) anyConsumed = true;
+    }
+    if (anyConsumed && out && outSz) {
+        res.rewrite = emitPersistent(text, runtimeOnly, out, outSz) ? 1 : 2;
+    }
+    return res;
 }

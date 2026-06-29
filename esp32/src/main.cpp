@@ -586,8 +586,8 @@ static volatile int      g_surveyBand = 0;   // 0=no change, -1=restore auto, >0
 // Gzip .eaofh files into the upload queue at harvest (~3x fewer bytes over cellular).
 // Set by the `compress` airbridge.cmd directive. Default OFF: the S3 consumer must
 // gunzip the .eaofh objects, so this is enabled per-deployment once that's in place.
-// The ROM miniz tdefl compressor (airbridge_compress.h) does the work in PSRAM.
-static volatile bool     g_compress = false;
+// g_compress is now the shared inline global in airbridge_commands.h (toggled by the
+// `compress` directive on either the USB or S3 command path, read by the harvest).
 #define SURVEY_INTERVAL_MS 2000
 
 // ── CDC CLI ─────────────────────────────────────────────────────────────────
@@ -1064,86 +1064,51 @@ static bool sd_reinit_and_mount() {
 // running. Reboot/format are signalled back to the caller, which owns the SD
 // teardown. logsDir/uploadDir are always on P2 (where logs live); diagDir is the
 // USB-visible destination chosen by the caller.
-struct CmdRunResult { bool ran; bool reboot; bool format; };
-
+// Thin firmware wrapper over the SHARED runCommandTextBuffer (airbridge_commands.h).
+// The HAL-safe directives (dump_logs/wifi/s3/compress) run inside the shared core; this
+// wrapper applies the firmware-/target-specific bits the core returns as flags
+// (g_msc_only + the ALLOW_CDC_PERSIST gate, g_surveyMode/Band, the OLED) and persists the
+// once-stripped rewrite. The S3 command channel calls runCommandTextBuffer directly
+// (in-memory, SD-independent) so both delivery paths share identical execution.
 static CmdRunResult run_command_file(const char* cmdPath, const char* diagDir,
                                      bool runtimeOnly) {
-    // These buffers are STATIC, not on the stack: this runs in app_main on the
-    // small main task (CONFIG_ESP_MAIN_TASK_STACK_SIZE=3584) via check_p1_magic,
-    // and ~4.5KB of stack arrays here overflowed it and hung the boot. Safe as
-    // static — check_p1_magic finishes before any task starts, and the harvest
-    // task (the only other caller) never overlaps it.
+    // STATIC buffers, not stack: this runs in app_main on the small main task
+    // (CONFIG_ESP_MAIN_TASK_STACK_SIZE=3584) via check_p1_magic; ~4.5KB of stack arrays
+    // here overflowed it and hung the boot. Safe — check_p1_magic finishes before any
+    // task starts, and the harvest task (the only other caller) never overlaps it.
     static char text[2048];
-    static Command cmds[16];
+    static char out[2048];
     CmdRunResult res = {};
     if (!cmdReadFile(cmdPath, text, sizeof(text))) return res;
 
-    int n = parseCommands(text, cmds, 16);
-    bool anyConsumed = false;
-    for (int i = 0; i < n; i++) {
-        Command& c = cmds[i];
-        if (!cmdExecuted(c, runtimeOnly)) continue;  // boot-only skipped at harvest
-        res.ran = true;
-        switch (c.type) {
-            case CMD_CDC:
-                if (c.once) {
-                    g_msc_only = false;
-                    airbridge_log("CMD: cdc once — CDC+MSC this boot");
-                    disp("USB Mode", "CDC (cmd)");
-                } else {
+    res = runCommandTextBuffer(text, runtimeOnly, diagDir, "/sdcard/logs", "/sdcard/upload",
+                               out, sizeof(out));
+
+    // Target-specific glue the shared core deliberately leaves to firmware:
+    if (res.cdc) {
+        if (res.cdcOnce) {
+            g_msc_only = false;
+            airbridge_log("CMD: cdc once — CDC+MSC this boot");
+            disp("USB Mode", "CDC (cmd)");
+        } else {
 #ifdef ALLOW_CDC_PERSIST
-                    g_msc_only = false;
-                    airbridge_log("CMD: cdc — CDC+MSC (persistent)");
-                    disp("USB Mode", "CDC (persist)");
+            g_msc_only = false;
+            airbridge_log("CMD: cdc — CDC+MSC (persistent)");
+            disp("USB Mode", "CDC (persist)");
 #else
-                    airbridge_log("CMD: cdc (persistent) ignored in production build");
+            airbridge_log("CMD: cdc (persistent) ignored in production build");
 #endif
-                }
-                break;
-            case CMD_DUMP_LOGS: {
-                int copied = dumpLogs("/sdcard/logs", "/sdcard/upload", diagDir);
-                airbridge_log("CMD: dump_logs — copied %d log(s) to %s", copied, diagDir);
-                disp("Diag dump", "logs -> USB");
-                break;
-            }
-            case CMD_REBOOT:    res.reboot = true; break;
-            case CMD_FORMAT_SD: res.format = true; break;
-            case CMD_SURVEY: {
-                g_surveyMode = true;
-                // Optional "band=N" (lock LTE band N for apples-to-apples antenna
-                // tests) or "band=auto" (restore auto — band lock persists in modem
-                // NVS, so this MUST be run before returning the unit to service).
-                const char* b = strstr(c.args, "band=");
-                if (b) {
-                    b += 5;
-                    g_surveyBand = (strncmp(b, "auto", 4) == 0) ? -1 : atoi(b);
-                }
-                airbridge_log("CMD: survey — signal-survey mode (no PPP), band=%d", g_surveyBand);
-                disp("Survey mode", "measuring signal");
-                break;
-            }
-            case CMD_WIFI: { CliResult r = cliSetWifi(c.args); airbridge_log("CMD: %s", r.output); break; }
-            case CMD_S3:   { CliResult r = cliSetS3(c.args);   airbridge_log("CMD: %s", r.output); break; }
-            case CMD_COMPRESS: {
-                // "compress" / "compress on" → enable; "compress off" → disable.
-                g_compress = (strstr(c.args, "off") == nullptr);
-                airbridge_log("CMD: compress %s (gzip .eaofh into upload queue)",
-                              g_compress ? "ON" : "OFF");
-                break;
-            }
-            default:       airbridge_log("CMD: unknown directive '%s'", c.verb); break;
         }
-        if (c.once) anyConsumed = true;
+    }
+    if (res.survey) {
+        g_surveyMode = true;
+        g_surveyBand = res.surveyBand;   // 0=none, -1=auto, >0=lock LTE band N
+        disp("Survey mode", "measuring signal");
     }
 
-    // Strip executed `once` directives; delete the file if nothing remains.
-    if (anyConsumed) {
-        static char out[2048];   // static: keep off the small main-task stack
-        if (emitPersistent(text, runtimeOnly, out, sizeof(out)))
-            cmdWriteFile(cmdPath, out);
-        else if (g_hal && g_hal->filesys)
-            g_hal->filesys->remove(cmdPath);
-    }
+    // Persist the once-stripped rewrite (1=write remaining, 2=delete the empty file).
+    if (res.rewrite == 1)      cmdWriteFile(cmdPath, out);
+    else if (res.rewrite == 2 && g_hal && g_hal->filesys) g_hal->filesys->remove(cmdPath);
     return res;
 }
 
@@ -2983,6 +2948,56 @@ static void modemTask(void* param) {
         uint32_t logInterval = uploading ? 0 : 60000;  // skip during uploads
         uint32_t sinceConnect = pppConnectMs ? (millis() - pppConnectMs) : 0;
         bool firstUpload = (lastLogUploadMs == 0 && sinceConnect > 30000);
+
+        // ── Remote command channel — HIGHEST-priority C2 (survives a wedged unit) ──
+        // Fetch + run remote commands FIRST after PPP is up (before OTA/cookie/harvest),
+        // then every 5 min. Runs on the modem task (independent of the SD/harvest/upload
+        // paths that wedge) and executes IN-MEMORY with allowSdOps=false (never blocks on
+        // the SD mutex) — so a unit whose SD is the problem is still recoverable over
+        // cellular: format_sd → NVS sys/format flag + esp_restart (no SD/harvest needed).
+        // The acceptance ack is POSTed BEFORE any restart so a reboot can't swallow it.
+        {
+            static uint32_t lastCmdPollMs = 0;
+            static bool     cmdPolledThisConnect = false;
+            if (!g_pppConnected) cmdPolledThisConnect = false;
+            bool firstCmd = (g_pppConnected && !cmdPolledThisConnect && sinceConnect > 5000);
+            if (g_pppConnected && !g_surveyMode && g_deviceId[0] &&
+                (firstCmd || (millis() - lastCmdPollMs) > 300000)) {
+                lastCmdPollMs = millis();
+                cmdPolledThisConnect = true;
+                static char cmdText[1024];
+                if (halFetchCommands(g_deviceId, cmdText, sizeof(cmdText)) && cmdText[0]) {
+                    airbridge_log("CMD: remote command received (%u bytes)", (unsigned)strlen(cmdText));
+                    CmdRunResult cr = runCommandTextBuffer(
+                        cmdText, /*runtimeOnly=*/false, "/sdcard/diag", "/sdcard/logs",
+                        "/sdcard/upload", nullptr, 0, /*allowSdOps=*/false);
+                    // Acceptance confirmation — POST BEFORE any restart.
+                    char ack[320];
+                    snprintf(ack, sizeof(ack),
+                        "{\"fw\":\"%s\",\"ran\":%s,\"reboot\":%s,\"format\":%s,\"cdc\":%s,"
+                        "\"survey\":%s,\"compress\":%s,\"uptime_s\":%lu}",
+                        FW_VERSION, cr.ran?"true":"false", cr.reboot?"true":"false",
+                        cr.format?"true":"false", cr.cdc?"true":"false", cr.survey?"true":"false",
+                        g_compress?"true":"false", (unsigned long)(millis()/1000));
+                    halAckCommand(g_deviceId, ack);
+                    if (cr.cdc)     g_msc_only = false;                       // effective next boot
+                    if (cr.survey){ g_surveyMode = true; g_surveyBand = cr.surveyBand; }
+                    if (cr.format) {
+                        airbridge_log("CMD: format_sd — reformat on next boot (remote)");
+                        nvs_handle_t fh;
+                        if (nvs_open("sys", NVS_READWRITE, &fh) == ESP_OK) {
+                            nvs_set_u8(fh, "format", 1); nvs_commit(fh); nvs_close(fh);
+                        }
+                        if (!g_harvesting) sd_before_restart();  // skip teardown if SD busy (race)
+                        esp_restart();
+                    } else if (cr.reboot) {
+                        airbridge_log("CMD: reboot (remote)");
+                        if (!g_harvesting) sd_before_restart();
+                        esp_restart();
+                    }
+                }
+            }
+        }
 
         // Flush RAM log to SD file (every 30s, needs SD mutex)
         // Use 500ms timeout — 50ms was too tight when USB MSC held the SPI bus,

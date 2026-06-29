@@ -48,6 +48,7 @@
 #include "airbridge_display.h"
 #include "airbridge_harvest.h"
 #include "airbridge_s3.h"
+#include "airbridge_commands.h"   // runCommandTextBuffer + shared g_compress (remote cmd channel)
 #include "airbridge_modem.h"
 #include "sim_dsu.h"
 #include "airbridge_triggers.h"
@@ -1452,6 +1453,43 @@ int main(int argc, char* argv[]) {
                         applyCellState(line, ds, s_modem);
                     }
                     fclose(cf);
+                }
+            }
+        }
+
+        // ── Remote command channel (mirrors the firmware modem-task poll) ────
+        // Poll the real test Lambda/S3 every 5s when PPP is up; run the fetched
+        // airbridge.cmd text through the SAME shared executor (allowSdOps=false,
+        // SD-independent) → ack → apply. Proves the channel end-to-end, including
+        // remote format_sd recovery of a wedged SD.
+        {
+            static uint32_t lastCmdPoll = 0;
+            if (ds.pppConnected && deviceId[0] && (now - lastCmdPoll) > 5000) {
+                lastCmdPoll = now;
+                static char cmdText[1024];
+                if (halFetchCommands(deviceId, cmdText, sizeof(cmdText)) && cmdText[0]) {
+                    printf("[CMD] remote command received: %s\n", cmdText);
+                    airbridge_log("CMD: remote command received (%u bytes)", (unsigned)strlen(cmdText));
+                    // dirs unused (allowSdOps=false skips dump_logs) — pass empty.
+                    CmdRunResult cr = runCommandTextBuffer(
+                        cmdText, /*runtimeOnly=*/false, "", "", "",
+                        nullptr, 0, /*allowSdOps=*/false);
+                    char ack[256];
+                    snprintf(ack, sizeof(ack),
+                        "{\"fw\":\"%s\",\"ran\":%s,\"format\":%s,\"reboot\":%s,\"compress\":%s}",
+                        FW_VERSION, cr.ran?"true":"false", cr.format?"true":"false",
+                        cr.reboot?"true":"false", g_compress?"true":"false");
+                    halAckCommand(deviceId, ack);
+                    s_compress = g_compress;  // bridge shared flag → emulator harvest flag
+                    if (cr.format && s_blockFs) {
+                        printf("[CMD] format_sd — reformatting (remote recovery)\n");
+                        airbridge_log("CMD: format_sd — reformatting (remote)");
+                        s_blockFs->format();
+                        s_blockFs->importHostTree(SD_ROOT, SD_ROOT);
+                        s_blockFs->importHostTree(SD_INTERNAL, SD_INTERNAL);
+                        airbridge_log("SD: reformatted + reseeded — recovered (remote format_sd)");
+                        printf("[CMD] reformatted + recovered\n");
+                    }
                 }
             }
         }

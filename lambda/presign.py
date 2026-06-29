@@ -156,6 +156,55 @@ def handler(event, context):
                 return respond(404, {"error": "no cookie"})
             return respond(500, {"error": err})
 
+    elif path == "/command" and method == "GET":
+        # Remote command channel — one-shot fetch of an airbridge.cmd-syntax command,
+        # then delete (run-once delivery). The device executes it through the SAME
+        # command executor as a USB-delivered airbridge.cmd. Key: commands/{device}/airbridge.cmd
+        device = params.get("device", "")
+        if not device:
+            return respond(400, {"error": "device required"})
+        key = f"commands/{device}/airbridge.cmd"
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            data = obj["Body"].read()
+            s3.delete_object(Bucket=bucket, Key=key)          # one-shot
+            return respond(200, {"cmd": data.decode("utf-8", "replace"), "size": len(data)})
+        except Exception as e:
+            err = str(e)
+            if "NoSuchKey" in err or "404" in err or "AccessDenied" in err:
+                return respond(404, {"error": "no command"})
+            return respond(500, {"error": err})
+
+    elif path == "/command/ack" and method == "POST":
+        # Device confirms it executed a command. Body = result JSON (echoed cmd, per-
+        # directive result, fw, reset reason, ts). Stored at commands/{device}/ack.json.
+        device = params.get("device", "")
+        if not device:
+            return respond(400, {"error": "device required"})
+        body = event.get("body", "") or ""
+        key = f"commands/{device}/ack.json"
+        try:
+            s3.put_object(Bucket=bucket, Key=key,
+                          Body=body.encode("utf-8"), ContentType="application/json")
+            return respond(200, {"ok": True})
+        except Exception as e:
+            return respond(500, {"error": str(e)})
+
+    elif path == "/command/status" and method == "GET":
+        # Operator reads the last command ack (acceptance confirmation).
+        device = params.get("device", "")
+        if not device:
+            return respond(400, {"error": "device required"})
+        key = f"commands/{device}/ack.json"
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            return respond(200, json.loads(obj["Body"].read() or b"{}"))
+        except Exception as e:
+            err = str(e)
+            if "NoSuchKey" in err or "404" in err or "AccessDenied" in err:
+                return respond(404, {"error": "no ack"})
+            return respond(500, {"error": err})
+
     elif path == "/firmware/download" and method == "GET":
         # Return pre-signed GET URL for firmware binary
         try:
