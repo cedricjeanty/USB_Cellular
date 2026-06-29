@@ -4169,6 +4169,10 @@ extern "C" void app_main(void) {
             g_msc_only = (mode != 0);
             nvs_close(h);
         }
+#ifdef FORCE_CDC
+        g_msc_only = false;  // diagnostic build: force CDC console for a wedged unit
+                             // that can't present a writable SD to drop a cdc magic file
+#endif
         ESP_LOGI(TAG, "USB mode: %s", g_msc_only ? "MSC-only" : "CDC+MSC");
     }
 
