@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260629020000"
+#define FW_VERSION "20260629030000"
 
 #include <cstring>
 #include <ctime>
@@ -2911,15 +2911,22 @@ static void modemTask(void* param) {
                 esp_netif_action_connected(g_ppp_netif, nullptr, 0, nullptr);
             } else if (!rr.registered) {
                 s_reconnect_failures++;
-                cdc_printf("Modem: registration timeout — retry in 60s\r\n");
-                log_write("Modem: reconnect reg timeout");
-                vTaskDelay(pdMS_TO_TICKS(60000));
+                // Signal-gated retry: poll coverage every 10s and redial the MOMENT the
+                // network returns (instead of a blind 60s wait). Returns early when
+                // registered; caps at 60s so a CFUN-reset escalation can still kick in.
+                cdc_printf("Modem: not registered — polling coverage every 10s\r\n");
+                log_write("Modem: not registered — signal-gated retry");
+                ModemSignalWait sw = modemWaitForSignal(60000, 10000);
+                if (sw.registered && sw.rssi != 99) g_modemRssi = sw.rssi;
                 g_pppNeedsReconnect = true;
             } else {
                 s_reconnect_failures++;
-                log_write("Modem: reconnect failed — retry in 60s");
-                cdc_printf("Modem: reconnect failed, retry in 60s\r\n");
-                vTaskDelay(pdMS_TO_TICKS(60000));
+                log_write("Modem: redial failed — signal-gated retry");
+                cdc_printf("Modem: redial failed — polling coverage every 10s\r\n");
+                // Registered but redial failed → modemWaitForSignal returns ~immediately
+                // (already registered) → fast retry, no wasted minute.
+                ModemSignalWait sw = modemWaitForSignal(60000, 10000);
+                if (sw.registered && sw.rssi != 99) g_modemRssi = sw.rssi;
                 g_pppNeedsReconnect = true;
             }
         }

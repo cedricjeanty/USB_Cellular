@@ -48,11 +48,42 @@ struct ModemReconnectPlan {
 inline ModemReconnectPlan modemReconnectPlan(int failures) {
     ModemReconnectPlan p = {};
     p.radioReset = (failures >= 4 && (failures - 4) % 5 == 0);
-    if (p.radioReset && failures >= 9) {
-        uint32_t b = 30u * (uint32_t)((failures - 4) / 5);
-        p.backoffSeconds = (b < 300u) ? b : 300u;
-    }
+    // Only a short settle before a radio reset (CFUN=0/1 itself takes ~15s) — NO long
+    // backoff. The reconnect loop is signal-gated (modemWaitForSignal polls coverage
+    // every ~10s and retries the instant the network returns), so we never burn minutes
+    // idle: in good coverage the device reconnects within seconds of a drop.
+    p.backoffSeconds = p.radioReset ? 10u : 0u;
     return p;
+}
+
+// Poll LTE registration (AT+CEREG, with AT+CGREG fallback) every pollMs until the
+// network is available, up to maxWaitMs — then read RSSI (AT+CSQ). Safe to call while
+// disconnected (no PPP, so AT commands don't collide). This replaces fixed dead-waits
+// in the reconnect loop: a redial fires the MOMENT coverage returns, not after a timer.
+// Returns as soon as registered (registered=true) or when maxWaitMs elapses.
+struct ModemSignalWait { bool registered; int rssi; };  // rssi: CSQ 0-31, 99/NA unknown
+inline ModemSignalWait modemWaitForSignal(uint32_t maxWaitMs, uint32_t pollMs) {
+    ModemSignalWait r = { false, 99 };
+    char resp[256];
+    uint32_t waited = 0;
+    for (;;) {
+        if (modem_at_cmd("AT+CEREG?", resp, sizeof(resp), 2000) > 0 &&
+            (strstr(resp, ",1") || strstr(resp, ",5"))) r.registered = true;
+        else if (modem_at_cmd("AT+CGREG?", resp, sizeof(resp), 2000) > 0 &&
+                 (strstr(resp, ",1") || strstr(resp, ",5"))) r.registered = true;
+        if (r.registered) {
+            if (modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000) > 0) {
+                char* p = strstr(resp, "+CSQ:");
+                int rssi = 99;
+                if (p) sscanf(p, "+CSQ: %d", &rssi);
+                r.rssi = rssi;
+            }
+            return r;  // coverage is back — retry immediately
+        }
+        if (waited >= maxWaitMs) return r;
+        if (g_hal && g_hal->clock) g_hal->clock->delay_ms(pollMs);
+        waited += pollMs;
+    }
 }
 
 // Reconnect PPP after a connection drop.

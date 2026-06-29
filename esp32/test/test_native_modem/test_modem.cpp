@@ -225,7 +225,7 @@ void test_reconnect_plan_soft_first_four(void) {
 void test_reconnect_plan_first_cfun_at_five(void) {
     ModemReconnectPlan p = modemReconnectPlan(4);   // attempt 5
     TEST_ASSERT_TRUE(p.radioReset);
-    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, p.backoffSeconds, "first CFUN has no backoff yet");
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(10, p.backoffSeconds, "radio reset has a short 10s settle");
 }
 
 void test_reconnect_plan_soft_between_resets(void) {
@@ -233,19 +233,21 @@ void test_reconnect_plan_soft_between_resets(void) {
         TEST_ASSERT_FALSE(modemReconnectPlan(f).radioReset);
 }
 
-void test_reconnect_plan_backoff_after_second_reset(void) {
-    ModemReconnectPlan p9 = modemReconnectPlan(9);  // 2nd CFUN reset
-    TEST_ASSERT_TRUE(p9.radioReset);
-    TEST_ASSERT_EQUAL_UINT32(30, p9.backoffSeconds);
-    ModemReconnectPlan p14 = modemReconnectPlan(14); // 3rd reset
-    TEST_ASSERT_TRUE(p14.radioReset);
-    TEST_ASSERT_EQUAL_UINT32(60, p14.backoffSeconds);
-}
-
-void test_reconnect_plan_backoff_capped(void) {
-    // Very high failure counts cap the backoff at 300s.
-    TEST_ASSERT_EQUAL_UINT32(300, modemReconnectPlan(4 + 5 * 11).backoffSeconds);
-    TEST_ASSERT_LESS_OR_EQUAL_UINT32(300, modemReconnectPlan(1000).backoffSeconds);
+void test_reconnect_plan_backoff_is_flat_short(void) {
+    // No escalating/300s backoff anymore — a radio reset gets a flat 10s settle, soft
+    // attempts get 0; the reconnect loop is signal-gated (poll every ~10s), so we never
+    // burn minutes idle. Every radio-reset failure count → exactly 10s.
+    ModemReconnectPlan p9  = modemReconnectPlan(9);          // 2nd reset
+    ModemReconnectPlan p14 = modemReconnectPlan(14);         // 3rd reset
+    ModemReconnectPlan pHi = modemReconnectPlan(4 + 5 * 11); // very high
+    TEST_ASSERT_TRUE(p9.radioReset && p14.radioReset && pHi.radioReset);
+    TEST_ASSERT_EQUAL_UINT32(10, p9.backoffSeconds);
+    TEST_ASSERT_EQUAL_UINT32(10, p14.backoffSeconds);
+    TEST_ASSERT_EQUAL_UINT32(10, pHi.backoffSeconds);
+    // Soft attempts never wait, and nothing ever exceeds the 10s settle.
+    TEST_ASSERT_EQUAL_UINT32(0, modemReconnectPlan(1000).backoffSeconds);  // 1000: not a reset
+    for (int f = 0; f < 200; f++)
+        TEST_ASSERT_LESS_OR_EQUAL_UINT32(10, modemReconnectPlan(f).backoffSeconds);
 }
 
 // ── Flaky-link injection (marginal cellular) ────────────────────────────────
@@ -316,8 +318,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_reconnect_plan_soft_first_four);
     RUN_TEST(test_reconnect_plan_first_cfun_at_five);
     RUN_TEST(test_reconnect_plan_soft_between_resets);
-    RUN_TEST(test_reconnect_plan_backoff_after_second_reset);
-    RUN_TEST(test_reconnect_plan_backoff_capped);
+    RUN_TEST(test_reconnect_plan_backoff_is_flat_short);
 
     // Flaky-link injection
     RUN_TEST(test_flaky_never_drops_control_frames);

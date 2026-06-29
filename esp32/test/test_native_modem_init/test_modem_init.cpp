@@ -283,6 +283,29 @@ void test_reconnect_without_apn_fails(void) {
     TEST_ASSERT_TRUE(strstr(resp, "CONNECT") != nullptr);
 }
 
+// ── Signal-gated reconnect wait ──────────────────────────────────────────────
+
+void test_wait_for_signal_returns_when_registered(void) {
+    s_modem->regStat = 5;   // roaming = registered (LTE data)
+    s_modem->rssi = 18;
+    uint32_t t0 = s_clock.millis();
+    ModemSignalWait sw = modemWaitForSignal(5000, 500);
+    uint32_t dt = s_clock.millis() - t0;
+    TEST_ASSERT_TRUE_MESSAGE(sw.registered, "registered network → returns registered");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(18, sw.rssi, "reads RSSI when registered");
+    TEST_ASSERT_LESS_THAN_UINT32_MESSAGE(500, dt, "returns immediately (no wasted poll wait)");
+}
+
+void test_wait_for_signal_times_out_when_unregistered(void) {
+    s_modem->regStat = 2;   // searching, never registers
+    uint32_t t0 = s_clock.millis();
+    ModemSignalWait sw = modemWaitForSignal(300, 100);  // small for a fast test
+    uint32_t dt = s_clock.millis() - t0;
+    TEST_ASSERT_FALSE_MESSAGE(sw.registered, "no coverage → not registered");
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32_MESSAGE(300, dt, "polled up to maxWait");
+    TEST_ASSERT_LESS_THAN_UINT32_MESSAGE(2000, dt, "but capped — didn't hang");
+}
+
 // ── Test runner ─────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -306,6 +329,8 @@ int main(int argc, char** argv) {
     // Reconnect
     RUN_TEST(test_reconnect_sets_apn);
     RUN_TEST(test_reconnect_without_apn_fails);
+    RUN_TEST(test_wait_for_signal_returns_when_registered);
+    RUN_TEST(test_wait_for_signal_times_out_when_unregistered);
 
     return UNITY_END();
 }
