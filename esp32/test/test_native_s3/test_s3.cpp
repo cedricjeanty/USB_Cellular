@@ -305,6 +305,71 @@ void test_upload_connect_fails(void) {
     TEST_ASSERT_FALSE(r.success);
 }
 
+// A single PUT must be CONFIRMED by a 200 + ETag before it counts as success —
+// otherwise a PUT cut short mid-stream advances the manifest over a truncated S3
+// object (silent data loss, observed on the 200MB hardware soak).
+static const char* SINGLE_PRESIGN =
+    "HTTP/1.1 200 OK\r\n\r\n"
+    "{\"url\":\"https://s3.aws.com/bucket/D1/0001/test.txt?sig=abc\",\"key\":\"D1/0001/test.txt\",\"parts\":1}";
+
+void test_upload_confirmed_etag_succeeds(void) {
+    s_nvs.set_str("s3", "api_host", "api.ex.com");
+    s_nvs.set_str("s3", "api_key", "key");
+    s_nvs.set_str("s3", "device_id", "D1");
+    s_fs.add_dir("/sd/upload"); s_fs.add_dir("/sd/upload/0001");
+    s_fs.add_file_str("/sd/upload/0001/test.txt", "hello world");
+    s_net.push_response(SINGLE_PRESIGN);                                    // presign GET
+    s_net.push_response("HTTP/1.1 200 OK\r\nETag: \"abc123\"\r\n\r\n");     // PUT → 200 + ETag
+    UploadResult r = halS3UploadFile("/sd/upload/0001/test.txt", "0001/test.txt");
+    TEST_ASSERT_TRUE_MESSAGE(r.success, "confirmed 200+ETag PUT must succeed");
+}
+
+void test_upload_truncated_put_fails(void) {
+    s_nvs.set_str("s3", "api_host", "api.ex.com");
+    s_nvs.set_str("s3", "api_key", "key");
+    s_nvs.set_str("s3", "device_id", "D1");
+    s_fs.add_dir("/sd/upload"); s_fs.add_dir("/sd/upload/0001");
+    s_fs.add_file_str("/sd/upload/0001/test.txt", "hello world");
+    s_net.push_response(SINGLE_PRESIGN);   // presign GET
+    s_net.push_response("");               // PUT response empty (connection cut) → no 200, no ETag
+    UploadResult r = halS3UploadFile("/sd/upload/0001/test.txt", "0001/test.txt");
+    TEST_ASSERT_FALSE_MESSAGE(r.success, "a cut PUT (no 200/ETag) must NOT count as success");
+}
+
+void test_upload_non200_put_fails(void) {
+    s_nvs.set_str("s3", "api_host", "api.ex.com");
+    s_nvs.set_str("s3", "api_key", "key");
+    s_nvs.set_str("s3", "device_id", "D1");
+    s_fs.add_dir("/sd/upload"); s_fs.add_dir("/sd/upload/0001");
+    s_fs.add_file_str("/sd/upload/0001/test.txt", "hello world");
+    s_net.push_response(SINGLE_PRESIGN);                                  // presign GET
+    s_net.push_response("HTTP/1.1 403 Forbidden\r\n\r\nAccessDenied");    // PUT rejected
+    UploadResult r = halS3UploadFile("/sd/upload/0001/test.txt", "0001/test.txt");
+    TEST_ASSERT_FALSE_MESSAGE(r.success, "a non-200 PUT must NOT count as success");
+}
+
+// The presign GET must feed the link-quality hook so the OLED bars stay live during
+// uploads (the per-file presign is the always-on latency sample). Regression for the
+// "no connection bars during upload" report.
+static int s_apiRttCalls = 0;
+static void captureApiRtt(uint32_t) { s_apiRttCalls++; }
+
+void test_presign_feeds_link_rtt(void) {
+    s_nvs.set_str("s3", "api_host", "api.ex.com");
+    s_nvs.set_str("s3", "api_key", "key");
+    s_nvs.set_str("s3", "device_id", "D1");
+    s_fs.add_dir("/sd/upload"); s_fs.add_dir("/sd/upload/0001");
+    s_fs.add_file_str("/sd/upload/0001/test.txt", "hello world");
+    s_apiRttCalls = 0;
+    g_noteApiRttMs = captureApiRtt;
+    s_net.push_response(SINGLE_PRESIGN);
+    s_net.push_response("HTTP/1.1 200 OK\r\nETag: \"abc123\"\r\n\r\n");
+    halS3UploadFile("/sd/upload/0001/test.txt", "0001/test.txt");
+    g_noteApiRttMs = nullptr;
+    TEST_ASSERT_GREATER_THAN_MESSAGE(0, s_apiRttCalls,
+        "presign GET must report its RTT to keep the connection bars live");
+}
+
 // ── findNextUploadFile tests ────────────────────────────────────────────────
 
 void test_find_next_empty(void) {
@@ -502,6 +567,10 @@ int main(int argc, char** argv) {
     RUN_TEST(test_upload_presign_fails);
     RUN_TEST(test_upload_success);
     RUN_TEST(test_upload_connect_fails);
+    RUN_TEST(test_upload_confirmed_etag_succeeds);
+    RUN_TEST(test_upload_truncated_put_fails);
+    RUN_TEST(test_upload_non200_put_fails);
+    RUN_TEST(test_presign_feeds_link_rtt);
     RUN_TEST(test_upload_skip_if_exists);
 
     // Multipart part-PUT retry

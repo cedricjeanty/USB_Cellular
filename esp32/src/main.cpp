@@ -4056,6 +4056,11 @@ extern "C" void app_main(void) {
     g_hal = &s_hal;
     // uart is nullptr — mdm_* helpers fall back to raw ESP-IDF uart_* calls
 
+    // Feed the OLED connection-quality bars from the upload path's presign RTT too —
+    // not just the 60s log-append probe, which starves during a long upload and let the
+    // bars drop to 0 mid-transfer. Now every per-file presign refreshes the sample.
+    g_noteApiRttMs = noteLinkLatency;
+
     g_sd_mutex = xSemaphoreCreateMutex();
 
     // ── Session counter (always increments) + crash-loop detection ──────

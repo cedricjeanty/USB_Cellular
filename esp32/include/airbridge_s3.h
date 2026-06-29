@@ -400,13 +400,20 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
 
         bool ok = halStreamFile(tls, f, fileSize, progress);
         g_hal->filesys->close(f);
-        std::string putResp = halHttpReadResponse(tls);
+        char etag[64] = "";
+        int status = 0;
+        std::string putResp = halHttpReadResponse(tls, etag, sizeof(etag), &status);
         g_hal->network->destroy(tls);
 
         if (!ok) { strlcpy(res.error, "Stream failed", sizeof(res.error)); return res; }
-        // Check for S3 error in response
-        if (putResp.find("Error") != std::string::npos || putResp.find("error") != std::string::npos) {
-            snprintf(res.error, sizeof(res.error), "S3 error: %.100s", putResp.c_str());
+        // VERIFY the PUT actually succeeded before declaring victory. A PUT cut short
+        // (link drop / shutdown mid-upload) yields an empty/partial response — status 0,
+        // no ETag — which previously slipped through as success and advanced the manifest
+        // over a TRUNCATED S3 object (silent data loss). S3 returns 200 + an ETag on a
+        // complete PUT; require both. Anything else fails → the upload task retries.
+        if (status != 200 || !etag[0]) {
+            snprintf(res.error, sizeof(res.error), "PUT not confirmed (HTTP %d, etag=%d)",
+                     status, (int)(etag[0] != 0));
             return res;
         }
 
@@ -810,10 +817,17 @@ inline UploadResult halS3UploadEaofh(const char* harvestDir, const char* relPath
                 s3Path, s3Host, uploadSize);
             if (g_hal->network->write(tls, hdr, strlen(hdr)) &&
                 halStreamFile(tls, f, uploadSize, progress)) {
-                halHttpReadResponse(tls);
-                uint32_t elapsed = g_hal->clock->millis() - t0;
-                res.success = true;
-                res.kbps = elapsed > 0 ? uploadSize / 1024.0f / (elapsed / 1000.0f) : 0;
+                char etag[64] = ""; int status = 0;
+                halHttpReadResponse(tls, etag, sizeof(etag), &status);
+                if (status == 200 && etag[0]) {
+                    uint32_t elapsed = g_hal->clock->millis() - t0;
+                    res.success = true;
+                    res.kbps = elapsed > 0 ? uploadSize / 1024.0f / (elapsed / 1000.0f) : 0;
+                } else {
+                    // Same guard as the single-PUT path: only a confirmed 200+ETag counts,
+                    // else we'd advance the manifest over a truncated delta object.
+                    snprintf(res.error, sizeof(res.error), "delta PUT not confirmed (HTTP %d)", status);
+                }
             } else {
                 strlcpy(res.error, "stream failed", sizeof(res.error));
             }

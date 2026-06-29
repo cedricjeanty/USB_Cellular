@@ -11,7 +11,9 @@
 
 // Read an HTTP response from TLS connection: parse headers, extract body.
 // Handles chunked transfer encoding. Optionally captures ETag header.
-inline std::string halHttpReadResponse(TlsHandle tls, char* etag = nullptr, size_t etagSz = 0) {
+inline std::string halHttpReadResponse(TlsHandle tls, char* etag = nullptr, size_t etagSz = 0,
+                                       int* statusOut = nullptr) {
+    if (statusOut) *statusOut = 0;
     if (!g_hal || !g_hal->network) return "";
     bool chunked = false;
     char linebuf[512];
@@ -54,7 +56,7 @@ inline std::string halHttpReadResponse(TlsHandle tls, char* etag = nullptr, size
         if (pos <= 2 && (linebuf[0] == '\r' || linebuf[0] == '\n')) break;
     }
 done_headers:
-    (void)statusCode;
+    if (statusOut) *statusOut = statusCode;
 
     // Read body
     std::string raw;
@@ -158,16 +160,30 @@ inline std::string buildApiCompleteRequest(const char* host, const char* apiKey,
 }
 
 // Perform a full S3 API GET: connect, send request, read response, parse JSON.
+// Optional hook: called with the round-trip latency (ms) of each small API GET
+// (presign). The presign is a tiny request whose RTT is a clean link-quality sample —
+// and the upload path issues one per file, so feeding it here keeps the OLED's
+// connection bars alive DURING uploads, when the 60s log-append latency probe is
+// starved (bars previously dropped to 0 mid-upload). Firmware points this at
+// noteLinkLatency; the emulator updates its display state. Null ⇒ ignored.
+inline void (*g_noteApiRttMs)(uint32_t rttMs) = nullptr;
+
 inline std::string s3ApiGetViaHal(const char* host, const char* apiKey, const char* queryParams) {
     if (!g_hal || !g_hal->network) return "";
     TlsHandle tls = g_hal->network->connect(host);
     if (!tls) return "";
     std::string req = buildApiGetRequest(host, apiKey, queryParams);
+    uint32_t t0 = (g_hal->clock) ? g_hal->clock->millis() : 0;
     if (!g_hal->network->write(tls, req.c_str(), req.size())) {
         g_hal->network->destroy(tls);
         return "";
     }
     std::string resp = halHttpReadResponse(tls);
     g_hal->network->destroy(tls);
+    // A non-empty response means the request round-tripped — report its latency so the
+    // UI's link-quality sample stays fresh while a long upload is in flight.
+    if (!resp.empty() && g_noteApiRttMs && g_hal->clock) {
+        g_noteApiRttMs(g_hal->clock->millis() - t0);
+    }
     return resp;
 }
