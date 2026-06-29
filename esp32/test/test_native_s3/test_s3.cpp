@@ -354,6 +354,46 @@ void test_upload_non200_put_fails(void) {
 static int s_apiRttCalls = 0;
 static void captureApiRtt(uint32_t) { s_apiRttCalls++; }
 
+// A gzip-compressed .eaofh must be uploaded WHOLE — never byte-split by the delta
+// logic. A gzip stream is indivisible; the split scan looks for an 0xEA 0x4C record
+// marker, and gzip's ~random bytes contain coincidental markers, so without the guard
+// the upload sends only [offset..end] → a headless, corrupt object S3 can't gunzip.
+// (Root cause of truncated flights in the 200MB hardware soak under `compress on`.)
+void test_eaofh_gzip_uploaded_whole(void) {
+    s_nvs.set_str("s3", "api_host", "api.ex.com");
+    s_nvs.set_str("s3", "api_key", "key");
+    s_nvs.set_str("s3", "device_id", "D1");
+    s_fs.add_dir("/sd/upload"); s_fs.add_dir("/sd/upload/0001");
+
+    // 1000-byte "gzip" file: magic at [0:2] + a coincidental 0xEA4C record marker at
+    // offset 600 (= est split for first=1,last=5,hwm=3) carrying flight 5 (> hwm) at
+    // body[20:22]. Without the guard, halFindSplitOffset latches onto it → splits at 600.
+    std::string content(1000, 'x');
+    content[0] = (char)0x1f; content[1] = (char)0x8b;       // gzip magic
+    content[600] = (char)0xEA; content[601] = (char)0x4C;   // record marker
+    content[602] = (char)0x00; content[603] = (char)0x20;   // rlen = 32 (>= 28)
+    content[624] = (char)0x00; content[625] = (char)0x05;   // flight 5 at recAbs+4+20
+    const char* fp = "/sd/upload/0001/EA500.E2ETES_00005_20260628.eaofh";
+    s_fs.add_file(fp, content.data(), content.size());
+    s_fs.add_file_str("/sd/upload/0001/EA500.E2ETES_00005_20260628.eaofh.meta", "1:5");
+
+    s_net.push_response("HTTP/1.1 200 OK\r\n\r\n{\"high_water_mark\":3}");           // manifest
+    s_net.push_response("HTTP/1.1 200 OK\r\n\r\n{\"url\":\"https://s3/o?s=a\",\"key\":\"aircraft/EA500.E2ETES/EA500.E2ETES_00005_20260628.eaofh\",\"parts\":1}"); // eaofh presign
+    s_net.push_response("HTTP/1.1 200 OK\r\n\r\n{\"url\":\"https://s3/o?s=a\",\"key\":\"aircraft/EA500.E2ETES/EA500.E2ETES_00005_20260628.eaofh\",\"parts\":1}"); // full-upload presign
+    s_net.push_response("HTTP/1.1 200 OK\r\nETag: \"e\"\r\n\r\n");                    // PUT
+
+    UploadResult r = halS3UploadEaofh("/sd/upload", "0001/EA500.E2ETES_00005_20260628.eaofh");
+    // A presign must carry size=1000 (the WHOLE file). Without the guard it would split
+    // at 600 and presign size=400 (the corrupt tail).
+    bool wholeUpload = false, splitUpload = false;
+    for (auto& req : s_net.requests) {
+        if (req.find("size=1000") != std::string::npos) wholeUpload = true;
+        if (req.find("size=400")  != std::string::npos) splitUpload = true;
+    }
+    TEST_ASSERT_TRUE_MESSAGE(wholeUpload, "compressed eaofh must presign+upload the WHOLE gzip (size=1000)");
+    TEST_ASSERT_FALSE_MESSAGE(splitUpload, "compressed eaofh must NOT be byte-split (no size=400 tail)");
+}
+
 void test_presign_feeds_link_rtt(void) {
     s_nvs.set_str("s3", "api_host", "api.ex.com");
     s_nvs.set_str("s3", "api_key", "key");
@@ -571,6 +611,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_upload_truncated_put_fails);
     RUN_TEST(test_upload_non200_put_fails);
     RUN_TEST(test_presign_feeds_link_rtt);
+    RUN_TEST(test_eaofh_gzip_uploaded_whole);
     RUN_TEST(test_upload_skip_if_exists);
 
     // Multipart part-PUT retry

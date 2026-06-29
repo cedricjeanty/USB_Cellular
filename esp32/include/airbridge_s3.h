@@ -735,9 +735,26 @@ inline UploadResult halS3UploadEaofh(const char* harvestDir, const char* relPath
         firstFlight = halReadMetaFirstFlight(metaPath);
     }
 
-    // Find split offset if file has pre-hwm content
+    // Is the harvested file gzip-compressed? (compress directive). A gzip stream is an
+    // indivisible unit — you CANNOT byte-split it: the split-delta below scans for an
+    // .eaofh record boundary, but on gzip bytes it returns a garbage offset and uploading
+    // only [offset..end] yields a HEADLESS, corrupt object that won't gunzip (the cause of
+    // truncated/invalid flights in S3 under `compress on`). Detect the gzip magic and skip
+    // the delta entirely — a compressed file is always uploaded whole.
+    bool fileIsGzip = false;
+    {
+        void* gf = g_hal->filesys->open(fullpath, "rb");
+        if (gf) {
+            unsigned char magic[2] = {0, 0};
+            g_hal->filesys->read(gf, magic, 2);
+            g_hal->filesys->close(gf);
+            fileIsGzip = (magic[0] == 0x1f && magic[1] == 0x8b);
+        }
+    }
+
+    // Find split offset if file has pre-hwm content (uncompressed .eaofh only).
     uint64_t splitOffset = 0;
-    if (firstFlight > 0 && firstFlight <= s_cachedHwm) {
+    if (!fileIsGzip && firstFlight > 0 && firstFlight <= s_cachedHwm) {
         uint32_t totalSz = 0; bool isDir = false;
         g_hal->filesys->stat(fullpath, &totalSz, &isDir);
         if (totalSz > 0) {
@@ -749,6 +766,8 @@ inline UploadResult halS3UploadEaofh(const char* harvestDir, const char* relPath
             }
         }
         printf("[S3] Delta %s offset=%llu\n", bareName, (unsigned long long)splitOffset);
+    } else if (fileIsGzip) {
+        printf("[S3] %s is gzip — uploading whole (no delta split)\n", bareName);
     }
 
     // Build aircraft-namespaced S3 key
