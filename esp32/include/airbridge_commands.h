@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <cctype>
 #include <strings.h>
 
@@ -183,15 +184,21 @@ inline bool cmdCopyFile(const char* src, const char* dst) {
     if (!sf) return false;
     void* df = g_hal->filesys->open(dst, "wb");
     if (!df) { g_hal->filesys->close(sf); return false; }
-    // 1KB chunk (not 4KB): this can run in app_main on the small main task stack
-    // (CONFIG_ESP_MAIN_TASK_STACK_SIZE=3584) when dump_logs is processed at boot.
-    uint8_t cpbuf[1024];
+    // Copy buffer on the HEAP, not the stack: dump_logs runs in app_main on the small
+    // main task stack (CONFIG_ESP_MAIN_TASK_STACK_SIZE) at boot, where a stack buffer
+    // here — on top of dumpLogs's own path buffers + the check_p1_magic/app_main frames
+    // — overflowed the stack and bricked the device into a boot loop (the `once`
+    // directive can't self-clear because the crash precedes the rewrite).
+    const size_t CPN = 2048;
+    uint8_t* cpbuf = (uint8_t*)malloc(CPN);
+    if (!cpbuf) { g_hal->filesys->close(sf); g_hal->filesys->close(df); return false; }
     bool ok = true;
     for (;;) {
-        size_t r = g_hal->filesys->read(sf, cpbuf, sizeof(cpbuf));
+        size_t r = g_hal->filesys->read(sf, cpbuf, CPN);
         if (r == 0) break;
         if (g_hal->filesys->write(df, cpbuf, r) != r) { ok = false; break; }
     }
+    free(cpbuf);
     g_hal->filesys->close(sf);
     g_hal->filesys->close(df);
     return ok;
@@ -209,7 +216,14 @@ inline int dumpLogs(const char* logsDir, const char* uploadDir, const char* dest
     if (!g_hal || !g_hal->filesys) return 0;
     g_hal->filesys->mkdir(destDir);
     int copied = 0;
-    char src[416], dst[416];
+    // Path buffers on the HEAP, not the stack: dump_logs runs in app_main on the small
+    // main task stack at boot, where these (plus cmdCopyFile's copy buffer + the
+    // check_p1_magic/app_main frames) overflowed the stack and bricked the device into
+    // a boot loop. One block holds src + dst + subPath.
+    const size_t PN = 416;
+    char* heap = (char*)malloc(PN * 2 + 200);
+    if (!heap) return 0;
+    char* src = heap; char* dst = heap + PN; char* subPath = heap + PN * 2;
 
     // 1) logsDir/*.log
     void* d = g_hal->filesys->opendir(logsDir);
@@ -217,8 +231,8 @@ inline int dumpLogs(const char* logsDir, const char* uploadDir, const char* dest
         FsDirEntry e;
         while (g_hal->filesys->readdir(d, &e)) {
             if (e.name[0] == '.' || e.is_dir || !cmdEndsWithLog(e.name)) continue;
-            snprintf(src, sizeof(src), "%s/%s", logsDir, e.name);
-            snprintf(dst, sizeof(dst), "%s/%s", destDir, e.name);
+            snprintf(src, PN, "%s/%s", logsDir, e.name);
+            snprintf(dst, PN, "%s/%s", destDir, e.name);
             if (cmdCopyFile(src, dst)) copied++;
         }
         g_hal->filesys->closedir(d);
@@ -230,21 +244,21 @@ inline int dumpLogs(const char* logsDir, const char* uploadDir, const char* dest
         FsDirEntry sub;
         while (g_hal->filesys->readdir(ud, &sub)) {
             if (sub.name[0] == '.' || !sub.is_dir) continue;
-            char subPath[200];
-            snprintf(subPath, sizeof(subPath), "%s/%s", uploadDir, sub.name);
+            snprintf(subPath, 200, "%s/%s", uploadDir, sub.name);
             void* sd = g_hal->filesys->opendir(subPath);
             if (!sd) continue;
             FsDirEntry e;
             while (g_hal->filesys->readdir(sd, &e)) {
                 if (e.name[0] == '.' || e.is_dir || !cmdEndsWithLog(e.name)) continue;
-                snprintf(src, sizeof(src), "%s/%s", subPath, e.name);
-                snprintf(dst, sizeof(dst), "%s/up_%s_%s", destDir, sub.name, e.name);
+                snprintf(src, PN, "%s/%s", subPath, e.name);
+                snprintf(dst, PN, "%s/up_%s_%s", destDir, sub.name, e.name);
                 if (cmdCopyFile(src, dst)) copied++;
             }
             g_hal->filesys->closedir(sd);
         }
         g_hal->filesys->closedir(ud);
     }
+    free(heap);
     return copied;
 }
 
