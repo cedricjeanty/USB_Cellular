@@ -109,7 +109,10 @@ void test_gzip_real_fixture(void) {
     double ratio = (double)r.inBytes / (double)r.outBytes;
     printf("[test] real .eaofh ratio %.2fx (%llu -> %llu)\n", ratio,
            (unsigned long long)r.inBytes, (unsigned long long)r.outBytes);
-    TEST_ASSERT_TRUE_MESSAGE(ratio > 2.0, "real flight log should compress > 2x");
+    // CZ_LEVEL 1 (the production default — chosen so on-device gzip ~178 KB/s beats the
+    // cellular link; see airbridge_compress.h) trades ratio for speed: the real .eaofh
+    // compresses ~1.84x at level 1 vs ~2.2x at level 6. Still a meaningful byte/cost cut.
+    TEST_ASSERT_TRUE_MESSAGE(ratio > 1.7, "real flight log should compress > 1.7x at level 1");
 
     char cmd[1024];
     snprintf(cmd, sizeof(cmd), "gunzip -c '%s' > '%s' && cmp -s '%s' '%s'",

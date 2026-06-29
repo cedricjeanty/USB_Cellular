@@ -24,6 +24,16 @@ dependencies:
     - esp32p4
     - esp32h4
     version: 0.19.0~2
+  espressif/zlib:
+    component_hash: 64ea2fd6754c5a05951f1ddb312ac835cd782e68cb5bd9dfcd1c3a107c8fbfbc
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.3.2
   idf:
     source:
       type: idf
@@ -31,7 +41,8 @@ dependencies:
 direct_dependencies:
 - espressif/esp_modem
 - espressif/tinyusb
+- espressif/zlib
 - idf
-manifest_hash: 2b4ac1a92f66d83fad7953f90973ea30febc47365147c30115cfeff74e875ee8
+manifest_hash: 20d61ce359b7d0afd280d32fde13454ffb37068c8573136da5d8a2861d11d91c
 target: esp32s3
 version: 2.0.0

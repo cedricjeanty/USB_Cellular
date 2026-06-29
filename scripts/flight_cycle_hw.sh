@@ -65,7 +65,7 @@ find_usb_part() {
 write_cmd_and_cookie() {
     local directive="$1" cookie="${2:-}"
     local dev; dev=$(find_usb_part) || { log "  no USB partition to write cmd"; return 1; }
-    sudo mount -o noatime "$dev" /mnt 2>/dev/null || { log "  mount failed"; return 1; }
+    sudo mount -o noatime,uid=$(id -u),gid=$(id -g) "$dev" /mnt 2>/dev/null || { log "  mount failed"; return 1; }
     printf '%s\n' "$directive" | sudo tee /mnt/airbridge.cmd >/dev/null
     [ -n "$cookie" ] && $HOSTDSU --mount /mnt --serial "$SERIAL" --plant-cookie "$cookie" >/dev/null
     sync; sudo umount /mnt 2>/dev/null
@@ -76,7 +76,7 @@ write_cmd_and_cookie() {
 # cookie of 0. host_dsu --mount avoids a per-flight remount.
 seed_backlog_hw() {
     local dev; dev=$(find_usb_part) || { fail "no USB partition to seed"; return 1; }
-    sudo mount -o noatime "$dev" /mnt 2>/dev/null || { fail "seed mount failed"; return 1; }
+    sudo mount -o noatime,uid=$(id -u),gid=$(id -g) "$dev" /mnt 2>/dev/null || { fail "seed mount failed"; return 1; }
     $HOSTDSU --mount /mnt --serial "$SERIAL" --plant-cookie 0 >/dev/null
     local f
     for f in $(seq 1 "$NFLIGHTS"); do

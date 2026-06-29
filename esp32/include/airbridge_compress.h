@@ -27,12 +27,27 @@
 #include <cstdio>
 #include <cstdlib>
 
-// Deflate config — shared by firmware + host so ratios + output match. windowBits
-// 13 (+16 for gzip framing) and memLevel 6 ⇒ deflate state ~64 KB (fits the ESP32-S3
-// internal heap with PSRAM disabled). Larger windows give marginally better ratios
-// but won't allocate on the PSRAM-less PCB.
+// Deflate config — shared by firmware + host so ratios + output + speed match.
+// windowBits 13 (+16 for gzip framing) and memLevel 6 ⇒ deflate state ~64 KB (fits
+// the ESP32-S3 internal heap with PSRAM disabled).
+// CZ_LEVEL 1 (fastest): on the ESP32-S3 the deflate CPU — not the SD — is the
+// bottleneck. MEASURED ON HARDWARE (8.39 MB flight, -DHARVEST_TRACE GZ:enter→GZ:ok):
+//   level 6 → ~53 KB/s (SLOWER than the ~167 KB/s cellular link ⇒ compression a net
+//             time LOSS: gzip runs serial before the PUT, so a sub-link gzip rate makes
+//             the end-to-end slower even though it sends fewer bytes), and
+//   level 1 → ~178 KB/s (47 s for 8,388,665 B) ⇒ ~3.4x faster, now ABOVE the link, so
+//             compression is a time win again AND still ~2.7x fewer bytes (1.84x on the
+//             higher-entropy real .eaofh). The 3.4x device speedup far exceeds the host's
+//             1.9x because level 6's deep hash-chain search thrashes the ESP32's small
+//             cache much harder than a desktop's. The emulator models ~178 KB/s (CZ_LEVEL).
+// memLevel 6 + windowBits 13 ⇒ ~64 KB deflate state; with 4 KB I/O buffers the harvest-time
+// allocation (~72 KB) fits the free heap (16 KB buffers needed ~96 KB and FAILED to alloc
+// mid-harvest — heap was only ~53 KB free during gzip — silently falling back to verbatim).
 #define CZ_WINDOW_BITS 13
 #define CZ_MEM_LEVEL   6
+#define CZ_LEVEL       1
+// Modeled on-device level-1 gzip throughput (bytes/s), for the emulator to match hardware.
+#define CZ_DEVICE_GZIP_BPS 178000
 
 // Read up to `n` bytes into buf; return bytes read (0 = EOF). Must fill until EOF
 // (short read ⇒ EOF), as stdio fread and FatFs f_read both do.
@@ -56,17 +71,22 @@ struct GzipResult {
 #endif
 
 // Stream-gzip from a read source to a write sink. Bounded memory: zlib's deflate
-// state (~64 KB heap at the config above) + two 16 KB stack buffers. Chunked, so
-// safe for arbitrarily large files. level 1..9 (6 = default; 1 is markedly faster
+// state (~64 KB heap at the config above) + two 4 KB heap buffers (kept small so the
+// total harvest-time allocation fits free heap). Chunked, so safe for arbitrarily
+// large files. level 1..9 (CZ_LEVEL=1 default — fastest; on the ESP32 ~3.4x quicker
+// than level 6 so on-device gzip beats the cellular link; 1 is markedly faster
 // for ~5% worse ratio).
 inline GzipResult gzipStream(cz_read_fn rd, void* rctx, cz_write_fn wr, void* wctx,
-                             int level = 6) {
+                             int level = CZ_LEVEL) {
     GzipResult r = {false, 0, 0};
     if (!rd || !wr) return r;
     GZTRACE("GZ: enter");
 
-    // Buffers on the HEAP, not the stack — 16 KB (×2) stack buffers overflowed the
-    // firmware's harvest task stack and crash-looped the device before any code ran.
+    // Buffers on the HEAP, not the stack (16 KB stack buffers overflowed the harvest
+    // task stack and crash-looped the device). 4 KB chunks: larger buffers + the ~64 KB
+    // deflate state exhausted the free heap at harvest time (gzip failed → verbatim
+    // fallback → uncompressed upload), and the deflate CPU — not SD-op overhead — is the
+    // throughput bottleneck, so bigger buffers wouldn't help anyway.
     const size_t BUF = 4096;
     unsigned char* inbuf  = (unsigned char*)malloc(BUF);
     unsigned char* outbuf = (unsigned char*)malloc(BUF);
@@ -118,7 +138,7 @@ inline size_t cz_stdio_write(void* ctx, const void* buf, size_t n) {
 // Convenience: gzip one stdio path to another. Returns the result (ok=false on any
 // open/deflate error). The HAL-backed equivalent used at harvest lives next to the
 // harvest code so this header stays HAL-free.
-inline GzipResult gzipFileStdio(const char* srcPath, const char* dstPath, int level = 6) {
+inline GzipResult gzipFileStdio(const char* srcPath, const char* dstPath, int level = CZ_LEVEL) {
     GzipResult r = {false, 0, 0};
     FILE* sf = fopen(srcPath, "rb");
     if (!sf) return r;

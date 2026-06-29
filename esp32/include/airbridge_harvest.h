@@ -41,6 +41,8 @@ struct HarvestResult {
     uint32_t minFlight;   // first flight seen across all .eaofh files
     char     dsuSerial[44];
     char     folder[8];      // e.g. "0001"
+    uint64_t inBytes;     // total UNcompressed source bytes processed (gzip CPU time ∝ this;
+                          // the emulator models the device's on-device gzip throughput off it)
 };
 
 // HAL filesys adapter for lastRecordFromLog. Wraps a HAL file handle so the
@@ -271,6 +273,7 @@ inline HarvestResult harvestFiles(const char* srcDir, const char* destBase,
             // Delete source (move = copy + delete)
             g_hal->filesys->remove(fullpath);
             result.usedMb += (float)storedBytes / 1e6f;
+            result.inBytes += ent.size;   // uncompressed source bytes (gzip CPU time ∝ this)
             result.count++;
         } else {
             g_hal->filesys->remove(dst);

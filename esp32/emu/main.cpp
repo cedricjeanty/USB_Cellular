@@ -108,6 +108,25 @@ static std::atomic<bool> s_dsuStop{false};
 // bytes on the cellular PUT). Mirrors the firmware's opt-in compression.
 static bool s_compress = false;
 
+// Modeled on-device gzip throughput (bytes/sec). The emulator gzips on the host CPU
+// (effectively instant), which would OVERSTATE compression's benefit vs hardware where
+// the deflate runs ~178 KB/s (measured, level 1 — see CZ_DEVICE_GZIP_BPS). So after a
+// compressing harvest we sleep inBytes/rate to charge the device's serial gzip-before-
+// upload CPU time, making the catch-up A/B reflect reality. EMU_GZIP_KBPS overrides.
+#ifndef CZ_DEVICE_GZIP_BPS
+#define CZ_DEVICE_GZIP_BPS 178000
+#endif
+static uint32_t s_gzipBps = CZ_DEVICE_GZIP_BPS;
+
+// Charge the modeled on-device gzip CPU time for `inBytes` of uncompressed input.
+static void modelGzipTime(uint64_t inBytes) {
+    if (!s_compress || s_gzipBps == 0 || inBytes == 0) return;
+    uint32_t ms = (uint32_t)((inBytes * 1000ULL) / s_gzipBps);
+    printf("[Harvest] modeled on-device gzip: %llu bytes / %u Bps = %u ms\n",
+           (unsigned long long)inBytes, s_gzipBps, ms);
+    SDL_Delay(ms);
+}
+
 // Emulator uplink throttle (bytes/sec) for the upload path. Default 100 KB/s
 // (historical). EMU_UPLINK_KBPS overrides — e.g. 167 to match the real PCB's
 // sustained 3 Mbaud + HW-FC cellular rate, so soak-test cycle counts reflect
@@ -605,6 +624,10 @@ int main(int argc, char* argv[]) {
         s_compress = true;
         printf("Harvest compression: ON (gzip .eaofh into upload queue)\n");
     }
+    if (const char* e = getenv("EMU_GZIP_KBPS"); e && atoi(e) > 0) {
+        s_gzipBps = (uint32_t)atoi(e) * 1000u;
+        printf("Modeled on-device gzip rate: %u KB/s\n", (unsigned)(s_gzipBps / 1000u));
+    }
 
     // EMU_DSU_INTERNAL: backlog-in-the-DSU transfer thread (see dsuTransferThread).
     std::thread dsuThread;
@@ -847,6 +870,7 @@ int main(int argc, char* argv[]) {
                     g_hal->nvs->set_u32("harvest", "count", hnum);
                     HarvestResult r = harvestFiles(SD_ROOT, destDir, (uint16_t)hnum, s_compress);
                     printf("Harvested: %u file(s), %.1f MB → %s\n", r.count, r.usedMb, r.folder);
+                    modelGzipTime(r.inBytes);
                     ds.mbQueued += r.usedMb;
                     break;
                 }
@@ -1280,6 +1304,7 @@ int main(int argc, char* argv[]) {
             g_hal->nvs->set_u32("harvest", "count", hnum);
             HarvestResult r = harvestFiles(SD_ROOT, destDir, (uint16_t)hnum, s_compress);
             printf("[Harvest] Done: %u file(s), %.1f MB → %s\n", r.count, r.usedMb, r.folder);
+            modelGzipTime(r.inBytes);   // charge modeled on-device gzip CPU time
 
             // Harvest-integrity guard: we fired because the host wrote ds.hostWrittenMb,
             // so verify we recovered roughly that. If not (data not yet committed to the
