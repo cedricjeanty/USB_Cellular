@@ -51,6 +51,19 @@ void test_fetch_no_command_returns_false(void) {
     TEST_ASSERT_EQUAL_STRING("", buf);  // cleared on no-command
 }
 
+void test_fetch_unescapes_json_newlines(void) {
+    // The Lambda returns the command as a JSON string with newlines ESCAPED (\n).
+    // halFetchCommands must decode them to real newlines or single-token verbs like
+    // "format_sd" arrive as "format_sd\n" and never match. (Caught by the emulator e2e.)
+    s_net.next_response = "HTTP/1.1 200 OK\r\n\r\n{\"cmd\":\"cdc\\nformat_sd\",\"size\":13}";
+    char buf[128] = "";
+    TEST_ASSERT_TRUE(halFetchCommands("EMU_test", buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_STRING("cdc\nformat_sd", buf);   // real newline, not literal backslash-n
+    CmdRunResult r = runCommandTextBuffer(buf, false, "", "", "", nullptr, 0, false);
+    TEST_ASSERT_TRUE_MESSAGE(r.cdc, "first directive (cdc) parsed");
+    TEST_ASSERT_TRUE_MESSAGE(r.format, "second directive (format_sd) parsed after unescaped newline");
+}
+
 // ── runCommandTextBuffer (the SHARED executor — identical to USB) ─────────────
 
 void test_run_executes_compress_and_wifi(void) {
@@ -109,6 +122,7 @@ int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_fetch_returns_command_and_hits_right_path);
     RUN_TEST(test_fetch_no_command_returns_false);
+    RUN_TEST(test_fetch_unescapes_json_newlines);
     RUN_TEST(test_run_executes_compress_and_wifi);
     RUN_TEST(test_format_is_boot_only);
     RUN_TEST(test_once_directive_is_stripped);

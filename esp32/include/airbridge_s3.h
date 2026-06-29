@@ -603,8 +603,24 @@ inline bool halFetchCommands(const char* device, char* outText, size_t outSz) {
     std::string resp = s3ApiGetPathViaHal(creds.apiHost, creds.apiKey, path);
     std::string cmd = jsonStr(resp, "cmd");
     if (cmd.empty()) { outText[0] = '\0'; return false; }
-    snprintf(outText, outSz, "%s", cmd.c_str());
-    return true;
+    // JSON-unescape: the value arrives with \n (newlines between directives), \t, \"
+    // etc. ESCAPED — decode them so parseCommands sees real newlines and verbs match.
+    size_t o = 0;
+    for (size_t i = 0; i < cmd.size() && o + 1 < outSz; i++) {
+        char c = cmd[i];
+        if (c == '\\' && i + 1 < cmd.size()) {
+            char n = cmd[++i];
+            switch (n) {
+                case 'n': c = '\n'; break;  case 'r': c = '\r'; break;
+                case 't': c = '\t'; break;  case '"': c = '"';  break;
+                case '\\': c = '\\'; break; case '/': c = '/';  break;
+                default:   c = n;    break;
+            }
+        }
+        outText[o++] = c;
+    }
+    outText[o] = '\0';
+    return o > 0;
 }
 
 // POST the command execution result (acceptance confirmation) — the Lambda stores it at
