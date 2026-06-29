@@ -3,3 +3,7 @@
 dependencies:
   espressif/esp_modem:
     version: "^1.4.0"
+  # zlib for on-device gzip of flight logs (airbridge_compress.h). Small-window
+  # deflate (~64KB) — fits internal RAM since this board variant has PSRAM disabled.
+  espressif/zlib:
+    version: "^1.3.0"

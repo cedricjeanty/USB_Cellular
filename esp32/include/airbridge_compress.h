@@ -4,23 +4,35 @@
 // Real .eaofh logs compress ~2.95x (22 MB fixture) to ~4.12x (1.49 GB fixture),
 // so compressing on-device before the cellular PUT multiplies effective uplink
 // throughput ~3x — the single biggest catch-up-time lever on a link-bound device
-// (measured: large files already hit the ~167 KB/s link cap, so the win is fewer
-// bytes, not faster bytes). The device is link-bound, not CPU-bound, so it has the
-// cycles for deflate.
+// (large files already hit the ~167 KB/s link cap, so the win is fewer bytes, not
+// faster bytes). The device is link-bound, not CPU-bound, so it has the cycles.
 //
-// Standard gzip framing so the S3 consumer can plain `gunzip`. Two backends behind
-// ONE signature: on the host (native tests + SDL emulator) system zlib; on the
-// ESP32-S3 the ROM's miniz `tdefl` (exported from ROM — zero flash, zero fetch) with
-// the deflate state in PSRAM. Both emit standard deflate, so output is interchangeable.
-// I/O is abstracted behind read/write function pointers (mirroring airbridge_proto.h's
-// log_read_at_fn) so the same caller streams a HAL file (firmware/emulator) or a stdio
-// FILE (tests), with bounded memory regardless of file size.
+// ONE backend everywhere: zlib, so the firmware, the SDL emulator, and the unit
+// tests run the SAME compressor and produce matching output. The host links system
+// zlib; the ESP32-S3 firmware links the espressif/zlib managed component (see
+// src/idf_component.yml) — NOT the ROM miniz tdefl, whose ~164 KB compressor state
+// can't allocate on this PCB variant (PSRAM disabled — see project notes).
+//
+// SMALL WINDOW (CZ_WINDOW_BITS=13 ⇒ 8 KB) keeps the deflate state ~64 KB so it fits
+// the firmware's internal RAM (no PSRAM); zlib encodes the window size in the stream
+// so the output is still plain `gunzip`-able. I/O is abstracted behind read/write
+// function pointers (mirroring airbridge_proto.h's log_read_at_fn) so the same caller
+// streams a HAL file (firmware/emulator) or a stdio FILE (tests), bounded memory
+// regardless of file size.
 
+#include <zlib.h>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+
+// Deflate config — shared by firmware + host so ratios + output match. windowBits
+// 13 (+16 for gzip framing) and memLevel 6 ⇒ deflate state ~64 KB (fits the ESP32-S3
+// internal heap with PSRAM disabled). Larger windows give marginally better ratios
+// but won't allocate on the PSRAM-less PCB.
+#define CZ_WINDOW_BITS 13
+#define CZ_MEM_LEVEL   6
 
 // Read up to `n` bytes into buf; return bytes read (0 = EOF). Must fill until EOF
 // (short read ⇒ EOF), as stdio fread and FatFs f_read both do.
@@ -34,16 +46,8 @@ struct GzipResult {
     uint64_t outBytes;
 };
 
-#if defined(ESP_PLATFORM)
-// ── Firmware: ROM miniz tdefl + manual gzip framing ──────────────────────────
-// tdefl_* and mz_crc32 live in the ESP32-S3 ROM (esp32s3.rom.ld) — no flash cost,
-// no component fetch. The tdefl_compressor (~110 KB w/ ROM's TDEFL_LESS_MEMORY) is
-// allocated from PSRAM; input is a 4 KB stack buffer (harvest task stack is 16 KB)
-// and deflate output is pushed through tdefl's callback straight to the sink.
-#include "miniz.h"
-#include "esp_heap_caps.h"
-
-// Opt-in gzip-path tracing (-DHARVEST_TRACE) to pinpoint a firmware compress failure.
+// Opt-in gzip-path tracing (-DHARVEST_TRACE) to surface a firmware compress failure
+// (e.g. deflateInit2 Z_MEM_ERROR if the state won't allocate) on the serial log.
 #ifdef HARVEST_TRACE
 #include "airbridge_log.h"
 #define GZTRACE(...) airbridge_log(__VA_ARGS__)
@@ -51,92 +55,31 @@ struct GzipResult {
 #define GZTRACE(...) ((void)0)
 #endif
 
-struct CzTdeflCtx { cz_write_fn wr; void* wctx; bool ok; uint64_t out; };
-inline mz_bool cz_tdefl_put(const void* buf, int len, void* user) {
-    CzTdeflCtx* c = (CzTdeflCtx*)user;
-    if (!c->ok) return MZ_FALSE;
-    if (c->wr(c->wctx, buf, (size_t)len) != (size_t)len) { c->ok = false; return MZ_FALSE; }
-    c->out += (size_t)len;
-    return MZ_TRUE;
-}
-
-inline GzipResult gzipStream(cz_read_fn rd, void* rctx, cz_write_fn wr, void* wctx,
-                             int level = 6) {
-    GzipResult r = {false, 0, 0};
-    if (!rd || !wr) return r;
-
-    bool fromPsram = true;
-    tdefl_compressor* d = (tdefl_compressor*)heap_caps_malloc(sizeof(tdefl_compressor), MALLOC_CAP_SPIRAM);
-    if (!d) { fromPsram = false; d = (tdefl_compressor*)malloc(sizeof(tdefl_compressor)); }  // fall back to internal RAM
-    GZTRACE("GZ: alloc tdefl size=%u psram=%d ptr=%p", (unsigned)sizeof(tdefl_compressor),
-            (int)fromPsram, (void*)d);
-    if (!d) return r;
-
-    CzTdeflCtx ctx = { wr, wctx, true, 0 };
-    static const unsigned char gzhdr[10] = {0x1f,0x8b,0x08,0x00,0,0,0,0,0,0xff};
-    if (wr(wctx, gzhdr, 10) != 10) { GZTRACE("GZ: header write FAILED"); free(d); return r; }
-    ctx.out += 10;
-
-    int probes = (level <= 1) ? 1 : (level >= 9 ? 4095 : TDEFL_DEFAULT_MAX_PROBES);
-    tdefl_status initSt = tdefl_init(d, cz_tdefl_put, &ctx, probes);
-    GZTRACE("GZ: tdefl_init st=%d", (int)initSt);
-    if (initSt != TDEFL_STATUS_OKAY) { free(d); return r; }
-
-    mz_ulong crc = mz_crc32(0, NULL, 0);
-    uint64_t isize = 0;
-    uint8_t inbuf[4096];
-    bool done = false;
-    while (!done && ctx.ok) {
-        size_t got = rd(rctx, inbuf, sizeof(inbuf));
-        isize += got;
-        crc = mz_crc32(crc, inbuf, got);
-        tdefl_flush flush = (got < sizeof(inbuf)) ? TDEFL_FINISH : TDEFL_NO_FLUSH;
-        tdefl_status st = tdefl_compress_buffer(d, inbuf, got, flush);
-        if (flush == TDEFL_FINISH) done = (st == TDEFL_STATUS_DONE);
-        if (st != TDEFL_STATUS_OKAY && st != TDEFL_STATUS_DONE) {
-            GZTRACE("GZ: compress_buffer st=%d at in=%llu out=%llu writeOk=%d", (int)st,
-                    (unsigned long long)isize, (unsigned long long)ctx.out, (int)ctx.ok);
-            ctx.ok = false;
-        }
-    }
-    free(d);
-    GZTRACE("GZ: loop end ok=%d done=%d in=%llu out=%llu", (int)ctx.ok, (int)done,
-            (unsigned long long)isize, (unsigned long long)ctx.out);
-    if (!ctx.ok || !done) return r;
-
-    unsigned char tr[8];
-    uint32_t c32 = (uint32_t)crc, isz = (uint32_t)isize;  // gzip trailer: CRC32 + ISIZE, both LE
-    tr[0]=c32&0xff; tr[1]=(c32>>8)&0xff; tr[2]=(c32>>16)&0xff; tr[3]=(c32>>24)&0xff;
-    tr[4]=isz&0xff; tr[5]=(isz>>8)&0xff; tr[6]=(isz>>16)&0xff; tr[7]=(isz>>24)&0xff;
-    if (wr(wctx, tr, 8) != 8) return r;
-    ctx.out += 8;
-
-    r.inBytes = isize; r.outBytes = ctx.out; r.ok = true;
-    return r;
-}
-
-#else
-// ── Host (native tests + emulator): system zlib ──────────────────────────────
-#include <zlib.h>
-
 // Stream-gzip from a read source to a write sink. Bounded memory: zlib's deflate
-// state (heap) + two 16 KB stack buffers. Chunked, so safe for arbitrarily large
-// files. level 1..9 (6 = default; 1 is markedly faster for ~5% worse ratio).
+// state (~64 KB heap at the config above) + two 16 KB stack buffers. Chunked, so
+// safe for arbitrarily large files. level 1..9 (6 = default; 1 is markedly faster
+// for ~5% worse ratio).
 inline GzipResult gzipStream(cz_read_fn rd, void* rctx, cz_write_fn wr, void* wctx,
                              int level = 6) {
     GzipResult r = {false, 0, 0};
     if (!rd || !wr) return r;
+    GZTRACE("GZ: enter");
+
+    // Buffers on the HEAP, not the stack — 16 KB (×2) stack buffers overflowed the
+    // firmware's harvest task stack and crash-looped the device before any code ran.
+    const size_t BUF = 4096;
+    unsigned char* inbuf  = (unsigned char*)malloc(BUF);
+    unsigned char* outbuf = (unsigned char*)malloc(BUF);
+    if (!inbuf || !outbuf) { GZTRACE("GZ: buf alloc fail"); free(inbuf); free(outbuf); return r; }
 
     z_stream zs;
     memset(&zs, 0, sizeof(zs));
-    if (deflateInit2(&zs, level, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK)
-        return r;
+    int initRc = deflateInit2(&zs, level, Z_DEFLATED, CZ_WINDOW_BITS + 16,
+                              CZ_MEM_LEVEL, Z_DEFAULT_STRATEGY);
+    GZTRACE("GZ: deflateInit2 rc=%d", initRc);
+    if (initRc != Z_OK) { free(inbuf); free(outbuf); return r; }
 
-    const size_t BUF = 16384;
-    unsigned char inbuf[BUF];
-    unsigned char outbuf[BUF];
     int flush = Z_NO_FLUSH;
-
     do {
         size_t got = rd(rctx, inbuf, BUF);
         r.inBytes += got;
@@ -148,20 +91,21 @@ inline GzipResult gzipStream(cz_read_fn rd, void* rctx, cz_write_fn wr, void* wc
             zs.next_out = outbuf;
             zs.avail_out = (uInt)BUF;
             int ret = deflate(&zs, flush);
-            if (ret == Z_STREAM_ERROR) { deflateEnd(&zs); return r; }
+            if (ret == Z_STREAM_ERROR) { GZTRACE("GZ: deflate STREAM_ERROR"); deflateEnd(&zs); free(inbuf); free(outbuf); return r; }
             size_t have = BUF - zs.avail_out;
             if (have) {
-                if (wr(wctx, outbuf, have) != have) { deflateEnd(&zs); return r; }
+                if (wr(wctx, outbuf, have) != have) { GZTRACE("GZ: write FAILED"); deflateEnd(&zs); free(inbuf); free(outbuf); return r; }
                 r.outBytes += have;
             }
         } while (zs.avail_out == 0);
     } while (flush != Z_FINISH);
 
     deflateEnd(&zs);
+    free(inbuf); free(outbuf);
     r.ok = true;
+    GZTRACE("GZ: ok in=%llu out=%llu", (unsigned long long)r.inBytes, (unsigned long long)r.outBytes);
     return r;
 }
-#endif
 
 // stdio adapters (unit tests; also handy for host tooling).
 inline size_t cz_stdio_read(void* ctx, void* buf, size_t n) {

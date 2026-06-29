@@ -4567,7 +4567,7 @@ extern "C" void app_main(void) {
     // s3ApiGetViaHal) nests several multi-KB frames (s3Path[2500], hdr[2700], …),
     // which overflows the old 16KB stack and crashes mid-upload on hardware.
     xTaskCreatePinnedToCore(uploadTask,    "upload",    32768, nullptr, 1, &g_upload_task,  1);
-    xTaskCreatePinnedToCore(harvestTask,   "harvest",   16384, nullptr, 1, &g_harvest_task, 1);
+    xTaskCreatePinnedToCore(harvestTask,   "harvest",   24576, nullptr, 1, &g_harvest_task, 1);  // +8KB headroom for zlib deflate (gzip)
     xTaskCreatePinnedToCore(modemTask,     "modem",     16384, nullptr, 2, &g_modem_task,   0);  // core 0, 16KB stack for reconnection
     xTaskCreatePinnedToCore(main_loop_task, "main_loop", 4096, nullptr, 1, nullptr,         0);
     // High priority + core 0; takes no contended locks so it survives any wedge.
