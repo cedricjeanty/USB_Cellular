@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260629120000"
+#define FW_VERSION "20260629220000"
 
 #include <cstring>
 #include <ctime>
@@ -2974,53 +2974,66 @@ static void modemTask(void* param) {
         // the SD mutex) — so a unit whose SD is the problem is still recoverable over
         // cellular: format_sd → NVS sys/format flag + esp_restart (no SD/harvest needed).
         // The acceptance ack is POSTed BEFORE any restart so a reboot can't swallow it.
+        // CRITICAL: the fetch+execute runs in a SPAWNED task, never inline. This loop
+        // is the PPP RX pump (esp_netif_receive above); a synchronous GET inline blocks
+        // it, so the GET's own response — which arrives over that very PPP link — can
+        // never be received, and the fetch always times out. (Hardware: inline command
+        // polls NEVER completed, while the spawned heartbeat/OTA/log tasks worked fine.)
         {
             static uint32_t lastCmdPollMs = 0;
             static bool     cmdPolledThisConnect = false;
+            static volatile bool cmdPollRunning = false;
             if (!g_pppConnected) cmdPolledThisConnect = false;
             bool firstCmd = (g_pppConnected && !cmdPolledThisConnect && sinceConnect > 5000);
-            if (g_pppConnected && !g_surveyMode && g_deviceId[0] &&
+            if (g_pppConnected && !g_surveyMode && g_deviceId[0] && !cmdPollRunning &&
                 (firstCmd || (millis() - lastCmdPollMs) > 300000)) {
                 lastCmdPollMs = millis();
                 cmdPolledThisConnect = true;
-                static char cmdText[1024];
-                if (halFetchCommands(g_deviceId, cmdText, sizeof(cmdText)) && cmdText[0]) {
-                    airbridge_log("CMD: remote command received (%u bytes)", (unsigned)strlen(cmdText));
-                    CmdRunResult cr = runCommandTextBuffer(
-                        cmdText, /*runtimeOnly=*/false, "/sdcard/diag", "/sdcard/logs",
-                        "/sdcard/upload", nullptr, 0, /*allowSdOps=*/false);
-                    // Acceptance confirmation — POST BEFORE any restart.
-                    char ack[320];
-                    snprintf(ack, sizeof(ack),
-                        "{\"fw\":\"%s\",\"ran\":%s,\"reboot\":%s,\"format\":%s,\"cdc\":%s,"
-                        "\"survey\":%s,\"compress\":%s,\"uptime_s\":%lu}",
-                        FW_VERSION, cr.ran?"true":"false", cr.reboot?"true":"false",
-                        cr.format?"true":"false", cr.cdc?"true":"false", cr.survey?"true":"false",
-                        g_compress?"true":"false", (unsigned long)(millis()/1000));
-                    halAckCommand(g_deviceId, ack);
-                    if (cr.cdc)     g_msc_only = false;                       // effective next boot
-                    if (cr.survey){ g_surveyMode = true; g_surveyBand = cr.surveyBand; }
-                    if (cr.format) {
-                        airbridge_log("CMD: format_sd — reformat on next boot (remote)");
-                        nvs_handle_t fh;
-                        if (nvs_open("sys", NVS_READWRITE, &fh) == ESP_OK) {
-                            nvs_set_u8(fh, "format", 1); nvs_commit(fh); nvs_close(fh);
+                cmdPollRunning = true;
+                xTaskCreatePinnedToCore([](void* arg) {
+                    volatile bool* running = (volatile bool*)arg;
+                    static char cmdText[1024];
+                    if (halFetchCommands(g_deviceId, cmdText, sizeof(cmdText)) && cmdText[0]) {
+                        airbridge_log("CMD: remote command received (%u bytes)", (unsigned)strlen(cmdText));
+                        CmdRunResult cr = runCommandTextBuffer(
+                            cmdText, /*runtimeOnly=*/false, "/sdcard/diag", "/sdcard/logs",
+                            "/sdcard/upload", nullptr, 0, /*allowSdOps=*/false);
+                        // Acceptance confirmation — POST BEFORE any restart (delete-on-ack
+                        // on the backend also removes the pending command once we ack).
+                        char ack[320];
+                        snprintf(ack, sizeof(ack),
+                            "{\"fw\":\"%s\",\"ran\":%s,\"reboot\":%s,\"format\":%s,\"cdc\":%s,"
+                            "\"survey\":%s,\"compress\":%s,\"uptime_s\":%lu}",
+                            FW_VERSION, cr.ran?"true":"false", cr.reboot?"true":"false",
+                            cr.format?"true":"false", cr.cdc?"true":"false", cr.survey?"true":"false",
+                            g_compress?"true":"false", (unsigned long)(millis()/1000));
+                        halAckCommand(g_deviceId, ack);
+                        if (cr.cdc)     g_msc_only = false;                       // effective next boot
+                        if (cr.survey){ g_surveyMode = true; g_surveyBand = cr.surveyBand; }
+                        if (cr.format) {
+                            airbridge_log("CMD: format_sd — reformat on next boot (remote)");
+                            nvs_handle_t fh;
+                            if (nvs_open("sys", NVS_READWRITE, &fh) == ESP_OK) {
+                                nvs_set_u8(fh, "format", 1); nvs_commit(fh); nvs_close(fh);
+                            }
+                            // Deliberate remote fix → clear the crash-loop firewall so the
+                            // next boot attempts NORMAL (escapes Safe Mode) and applies the
+                            // reformat that should clear whatever corrupted the SD.
+                            nvs_handle_t bh;
+                            if (nvs_open("dbg", NVS_READWRITE, &bh) == ESP_OK) {
+                                nvs_set_u32(bh, "boots", 0); nvs_commit(bh); nvs_close(bh);
+                            }
+                            if (!g_harvesting && !g_safe_mode) sd_before_restart();  // safe mode: SD never mounted
+                            esp_restart();
+                        } else if (cr.reboot) {
+                            airbridge_log("CMD: reboot (remote)");
+                            if (!g_harvesting && !g_safe_mode) sd_before_restart();
+                            esp_restart();
                         }
-                        // Deliberate remote fix → clear the crash-loop firewall so the
-                        // next boot attempts NORMAL (escapes Safe Mode) and applies the
-                        // reformat that should clear whatever corrupted the SD.
-                        nvs_handle_t bh;
-                        if (nvs_open("dbg", NVS_READWRITE, &bh) == ESP_OK) {
-                            nvs_set_u32(bh, "boots", 0); nvs_commit(bh); nvs_close(bh);
-                        }
-                        if (!g_harvesting) sd_before_restart();  // skip teardown if SD busy (race)
-                        esp_restart();
-                    } else if (cr.reboot) {
-                        airbridge_log("CMD: reboot (remote)");
-                        if (!g_harvesting) sd_before_restart();
-                        esp_restart();
                     }
-                }
+                    *running = false;
+                    vTaskDelete(nullptr);
+                }, "cmd_poll", 12288, (void*)&cmdPollRunning, 2, nullptr, 1);
             }
         }
 
