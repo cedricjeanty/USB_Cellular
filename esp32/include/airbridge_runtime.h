@@ -34,6 +34,38 @@ inline bool watchdogShouldReboot(uint32_t lastHeartbeatMs, uint32_t nowMs,
     return (uint32_t)(nowMs - lastHeartbeatMs) > stallMs;
 }
 
+// ── Crash-loop firewall / boot-mode decision ────────────────────────────────
+// A data fault (corrupt SD, bad config, a panic in the app init) must never turn
+// the device into an unreachable brick. The boot counter `dbg/boots` is bumped at
+// the very top of boot and reset to 0 only once the app proves *healthy* (ran
+// stably past the risky init — see the main-loop "mark healthy" point). So a high
+// count means consecutive boots that never reached stable: a crash loop.
+//
+// This pure function decides what to do, given that count, whether the last reset
+// was a clean power-on (a human power-cycling the unit ⇒ give it a fresh normal
+// attempt, never trip on the first try), and whether an OTA image is pending
+// verification:
+//   NORMAL       — boot the full application plane (SD/harvest/USB/upload).
+//   OTA_ROLLBACK — a pending OTA is the likely culprit; roll back to the previous
+//                  slot (existing path), then boot.
+//   SAFE_MODE    — the app itself is crash-looping with nothing to roll back: boot
+//                  ONLY the survival plane (cellular + remote command channel +
+//                  heartbeat + watchdog), skip the SD/harvest/USB/upload entirely,
+//                  and await a remote fix (format_sd / OTA). The device stays
+//                  reachable instead of bricking. This is the escape that was
+//                  missing when a corrupt SD wedged a unit in early-boot reboot.
+// wasPowerOn maps from esp_reset_reason()==ESP_RST_POWERON in the firmware glue.
+enum BootAction { BOOT_NORMAL = 0, BOOT_OTA_ROLLBACK, BOOT_SAFE_MODE };
+
+inline BootAction decideBootMode(uint32_t boots, bool wasPowerOn, bool otaPending,
+                                 uint32_t threshold = 3) {
+    // A clean power-on is a deliberate retry — always give one normal attempt.
+    if (wasPowerOn) return BOOT_NORMAL;
+    if (boots < threshold) return BOOT_NORMAL;
+    // Crash loop. Prefer rolling back a suspect OTA; otherwise isolate to safe mode.
+    return otaPending ? BOOT_OTA_ROLLBACK : BOOT_SAFE_MODE;
+}
+
 // ── SD-card runtime health / recovery escalation ────────────────────────────
 // A card that goes bad mid-flight (corrupt FAT, SPI flake) must never silently
 // wedge the unit. The firmware probes the SD periodically and feeds the count of

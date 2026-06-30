@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260629030000"
+#define FW_VERSION "20260629120000"
 
 #include <cstring>
 #include <ctime>
@@ -557,6 +557,17 @@ static uint32_t g_bootEpoch   = 0;  // unix epoch at boot (from AT+CCLK)
 static uint32_t g_bootMs      = 0;  // millis() when epoch was captured
 static char     g_logFileName[48] = "";  // per-session log name (set after time sync)
 static uint32_t g_bootCount      = 0;   // persistent boot counter from NVS
+
+// ── Crash-loop firewall / Safe Mode ─────────────────────────────────────────
+// When consecutive boots fail to reach a stable "healthy" state, the device
+// enters Safe Mode: it boots ONLY the survival plane (cellular + remote command
+// channel + heartbeat + watchdog) and skips the entire application plane (SD
+// harvest, USB MSC, upload). It then stays reachable and awaits a remote fix
+// (format_sd / OTA) instead of bricking. See decideBootMode() in airbridge_runtime.h.
+static volatile bool g_safe_mode     = false;  // true ⇒ survival plane only
+static uint32_t      g_crashBoots    = 0;      // dbg/boots at this boot (for banner/heartbeat)
+static int           g_resetReason   = 0;      // esp_reset_reason() (for heartbeat)
+static volatile bool g_markedHealthy = false;  // main_loop reset dbg/boots after stable uptime
 
 // ── Cellular modem (SIM7600) ────────────────────────────────────────────────
 static esp_netif_t      *g_ppp_netif    = nullptr;
@@ -2995,6 +3006,13 @@ static void modemTask(void* param) {
                         if (nvs_open("sys", NVS_READWRITE, &fh) == ESP_OK) {
                             nvs_set_u8(fh, "format", 1); nvs_commit(fh); nvs_close(fh);
                         }
+                        // Deliberate remote fix → clear the crash-loop firewall so the
+                        // next boot attempts NORMAL (escapes Safe Mode) and applies the
+                        // reformat that should clear whatever corrupted the SD.
+                        nvs_handle_t bh;
+                        if (nvs_open("dbg", NVS_READWRITE, &bh) == ESP_OK) {
+                            nvs_set_u32(bh, "boots", 0); nvs_commit(bh); nvs_close(bh);
+                        }
                         if (!g_harvesting) sd_before_restart();  // skip teardown if SD busy (race)
                         esp_restart();
                     } else if (cr.reboot) {
@@ -3003,6 +3021,38 @@ static void modemTask(void* param) {
                         esp_restart();
                     }
                 }
+            }
+        }
+
+        // ── SAFE MODE: periodic OTA self-heal ───────────────────────────
+        // In Safe Mode the upload task (which normally runs OTA) is not started,
+        // so a crash loop caused by a *firmware* bug (not the SD) could not be
+        // fixed remotely. Here the survival plane checks S3 for a newer build
+        // every ~5 min; if one is staged, clear the crash-loop firewall (a
+        // deliberate fix) and reboot into it. This is the last recovery lever:
+        // upload a fixed firmware to S3 and a safe-mode unit heals itself, no
+        // command needed. Runs in a dedicated 32KB task (otaDownloadAndFlash
+        // nests multi-KB frames + a 4KB buffer — too heavy for the 16KB modem stack).
+        if (g_safe_mode && g_pppConnected && !g_otaActive && g_deviceId[0]) {
+            static uint32_t lastSafeOtaMs = 0;
+            if (lastSafeOtaMs == 0 || (millis() - lastSafeOtaMs) > 300000) {
+                lastSafeOtaMs = millis();
+                g_otaActive = true;
+                xTaskCreatePinnedToCore([](void*) {
+                    airbridge_log("SAFE MODE: OTA check (self-heal)");
+                    int r = otaCheck();  // 1=staged, 0=up-to-date, -1=error
+                    if (r == 1) {
+                        airbridge_log("SAFE MODE: new firmware staged — clearing firewall + rebooting");
+                        nvs_handle_t bh;
+                        if (nvs_open("dbg", NVS_READWRITE, &bh) == ESP_OK) {
+                            nvs_set_u32(bh, "boots", 0); nvs_commit(bh); nvs_close(bh);
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(500));
+                        esp_restart();
+                    }
+                    g_otaActive = false;
+                    vTaskDelete(nullptr);
+                }, "safe_ota", 32768, nullptr, 2, nullptr, 1);
             }
         }
 
@@ -3062,6 +3112,49 @@ static void modemTask(void* param) {
                 logUpRunning = false;
                 vTaskDelete(nullptr);
             }, "log_up_ram", 8192, nullptr, 2, nullptr, 1);
+        }
+
+        // ── Always-on heartbeat ─────────────────────────────────────────
+        // POST a compact health snapshot every 60s in BOTH normal and Safe Mode,
+        // over the same SD-independent path as the RAM-log egress (no SD, no app
+        // plane needed). Latest-wins at heartbeat/{device}.json so an operator can
+        // always SEE a unit — including one wedged in Safe Mode. This is the
+        // telemetry gap that blinded us when a unit went dark on a stale log.
+        static uint32_t lastHbMs = 0;
+        static volatile bool hbRunning = false;
+        static char hbBody[384];
+        if (g_pppConnected && !hbRunning && g_deviceId[0] &&
+            (lastHbMs == 0 || (millis() - lastHbMs) > 60000)) {
+            lastHbMs = millis();
+            hbRunning = true;
+            snprintf(hbBody, sizeof(hbBody),
+                "{\"device\":\"%s\",\"fw\":\"%s\",\"mode\":\"%s\",\"boots\":%lu,"
+                "\"reset_reason\":%d,\"net\":\"%s\",\"sd_mounted\":%s,\"rssi\":%d,"
+                "\"rsrp\":%d,\"sinr\":%d,\"heap\":%lu,\"uptime_s\":%lu}",
+                g_deviceId, FW_VERSION, g_safe_mode ? "safe" : "healthy",
+                (unsigned long)g_crashBoots, g_resetReason,
+                g_pppConnected ? "ppp" : "none", g_fatfs_mounted ? "true" : "false",
+                g_modemRssi, g_modemRsrp, g_modemSinr,
+                (unsigned long)esp_get_free_heap_size(), (unsigned long)(millis() / 1000));
+            xTaskCreatePinnedToCore([](void*) {
+                do {
+                    if (!s3LoadCreds()) break;
+                    esp_tls_t* tls = tls_connect(g_apiHost);
+                    if (!tls) break;
+                    int blen = (int)strlen(hbBody);
+                    char hdr[512];
+                    int hlen = snprintf(hdr, sizeof(hdr),
+                        "POST /prod/command/heartbeat?device=%s HTTP/1.1\r\n"
+                        "Host: %s\r\nx-api-key: %s\r\nContent-Type: application/json\r\n"
+                        "Content-Length: %d\r\nConnection: close\r\n\r\n",
+                        g_deviceId, g_apiHost, g_apiKey, blen);
+                    if (tls_write_all(tls, hdr, hlen) && tls_write_all(tls, hbBody, blen))
+                        httpReadResponse(tls);
+                    tls_destroy(tls);
+                } while (0);
+                hbRunning = false;
+                vTaskDelete(nullptr);
+            }, "heartbeat", 8192, nullptr, 2, nullptr, 1);
         }
 
         // Upload log to S3 via /prod/log/append (incremental, per-session)
@@ -3916,6 +4009,29 @@ static void main_loop_task(void* param) {
         // task holds), this stops advancing and watchdog_task reboots us.
         g_mainLoopHeartbeat = millis();
 
+        // ── Crash-loop firewall: "mark healthy" ─────────────────────────
+        // The app has now run stably past the risky init for HEALTHY_UPTIME_MS
+        // without crashing. Reset the crash-loop counter (the ONLY place it is
+        // reset in normal operation) and confirm any pending OTA as good. NOT in
+        // safe mode — surviving in safe mode proves nothing about the app, so the
+        // counter must stay elevated until a deliberate remote fix clears it.
+        #define HEALTHY_UPTIME_MS 60000
+        if (!g_markedHealthy && !g_safe_mode && millis() >= HEALTHY_UPTIME_MS) {
+            g_markedHealthy = true;
+            nvs_handle_t hd;
+            if (nvs_open("dbg", NVS_READWRITE, &hd) == ESP_OK) {
+                nvs_set_u32(hd, "boots", 0); nvs_commit(hd); nvs_close(hd);
+            }
+            nvs_handle_t ho;
+            if (nvs_open("ota", NVS_READWRITE, &ho) == ESP_OK) {
+                nvs_set_str(ho, "fw_ver", FW_VERSION);
+                nvs_set_str(ho, "ota_status", "ok");
+                nvs_commit(ho); nvs_close(ho);
+            }
+            log_write("Healthy: %ds stable — crash-loop counter cleared, OTA confirmed",
+                      HEALTHY_UPTIME_MS / 1000);
+        }
+
         // Watchdog: restart modem task if it died (init failure OR runtime crash)
         if (g_modem_task == nullptr) {
             log_write("Modem: task died — restarting");
@@ -4107,56 +4223,69 @@ extern "C" void app_main(void) {
             snprintf(g_logFileName, sizeof(g_logFileName), "boot_%04lu", (unsigned long)session);
 
             esp_reset_reason_t reason = esp_reset_reason();
+            g_crashBoots  = boots;
+            g_resetReason = (int)reason;
             ESP_LOGI(TAG, "Boot #%u  reset_reason=%d  heap=%lu",
                      boots, (int)reason, (unsigned long)esp_get_free_heap_size());
 
-            if (boots > 5 && reason != ESP_RST_POWERON) {
-                ESP_LOGW(TAG, "CRASH LOOP DETECTED — pausing 30s for debug");
-                g_hal->display->init();
-                disp("CRASH LOOP", "Paused 30s");
-
-                // OTA rollback: if last OTA is pending, revert to previous partition
+            // Is an OTA image pending its first-run confirmation? (set in the OTA
+            // apply path before reboot; confirmed "ok" only at the healthy mark.)
+            bool otaPending = false;
+            {
                 nvs_handle_t hota;
-                if (nvs_open("ota", NVS_READWRITE, &hota) == ESP_OK) {
+                if (nvs_open("ota", NVS_READONLY, &hota) == ESP_OK) {
                     char status[16] = "";
                     size_t slen = sizeof(status);
                     if (nvs_get_str(hota, "ota_status", status, &slen) == ESP_OK
-                        && strcmp(status, "pending") == 0) {
-                        ESP_LOGW(TAG, "OTA rollback: reverting to previous partition");
-                        disp("CRASH LOOP", "OTA rollback...");
-                        const esp_partition_t* prev = esp_ota_get_next_update_partition(NULL);
-                        if (prev) {
-                            esp_ota_set_boot_partition(prev);
-                            nvs_set_str(hota, "ota_status", "rolled_back");
-                            nvs_commit(hota);
-                        }
-                    }
-                    nvs_close(hota);
-                }
-
-                vTaskDelay(pdMS_TO_TICKS(30000));
-                nvs_handle_t h2;
-                if (nvs_open("dbg", NVS_READWRITE, &h2) == ESP_OK) {
-                    nvs_set_u32(h2, "boots", 0);
-                    nvs_commit(h2);
-                    nvs_close(h2);
-                }
-            } else {
-                // Normal boot — confirm OTA success + reset counter
-                nvs_handle_t h2;
-                if (nvs_open("dbg", NVS_READWRITE, &h2) == ESP_OK) {
-                    nvs_set_u32(h2, "boots", 0);
-                    nvs_commit(h2);
-                    nvs_close(h2);
-                }
-                nvs_handle_t hota;
-                if (nvs_open("ota", NVS_READWRITE, &hota) == ESP_OK) {
-                    nvs_set_str(hota, "fw_ver", FW_VERSION);
-                    nvs_set_str(hota, "ota_status", "ok");
-                    nvs_commit(hota);
+                        && strcmp(status, "pending") == 0) otaPending = true;
                     nvs_close(hota);
                 }
             }
+
+            // NOTE: dbg/boots is deliberately NOT reset here. It is reset to 0 only
+            // once the app proves healthy (main_loop, after ~60s of stable uptime)
+            // or by a deliberate remote fix (format_sd / OTA). So a high count means
+            // consecutive boots that never reached stable → a real crash loop.
+            BootAction act = decideBootMode(boots, reason == ESP_RST_POWERON, otaPending);
+
+            if (act == BOOT_OTA_ROLLBACK) {
+                // A pending OTA is the likely culprit: revert to the previous
+                // (known-good) partition, clear the counter so the good firmware
+                // gets a fresh normal attempt, and reboot into it.
+                ESP_LOGW(TAG, "CRASH LOOP (#%u) — OTA rollback to previous partition", boots);
+                g_hal->display->init();
+                disp("CRASH LOOP", "OTA rollback...");
+                nvs_handle_t hota;
+                if (nvs_open("ota", NVS_READWRITE, &hota) == ESP_OK) {
+                    const esp_partition_t* prev = esp_ota_get_next_update_partition(NULL);
+                    if (prev) esp_ota_set_boot_partition(prev);
+                    nvs_set_str(hota, "ota_status", "rolled_back");
+                    nvs_commit(hota);
+                    nvs_close(hota);
+                }
+                nvs_handle_t h2;
+                if (nvs_open("dbg", NVS_READWRITE, &h2) == ESP_OK) {
+                    nvs_set_u32(h2, "boots", 0);
+                    nvs_commit(h2);
+                    nvs_close(h2);
+                }
+                vTaskDelay(pdMS_TO_TICKS(500));
+                esp_restart();
+            } else if (act == BOOT_SAFE_MODE) {
+                // The app is crash-looping with nothing to roll back. Isolate to the
+                // survival plane: skip SD/harvest/USB/upload (any of which may be the
+                // crash cause), keep cellular + command channel + heartbeat alive so
+                // the unit is remotely recoverable. Counter is NOT reset — it stays in
+                // Safe Mode until a deliberate remote fix (format_sd / OTA) clears it.
+                g_safe_mode = true;
+                ESP_LOGW(TAG, "CRASH LOOP (#%u) — entering SAFE MODE (survival plane only)", boots);
+                g_hal->display->init();
+                char l2[24];
+                snprintf(l2, sizeof(l2), "%u crashes", (unsigned)boots);
+                disp("SAFE MODE", l2);
+            }
+            // BOOT_NORMAL: fall through into the full boot; the counter will be reset
+            // at the healthy mark once the app runs stably.
         }
     }
 
@@ -4225,6 +4354,31 @@ extern "C" void app_main(void) {
 #endif
             nvs_close(h);
         }
+    }
+
+    // ── SAFE MODE short-circuit: survival plane only ────────────────────
+    // We reached the crash-loop threshold with nothing to roll back. Do NOT touch
+    // the SD (it may be the crash cause), do NOT present USB, do NOT start
+    // harvest/upload. Bring up ONLY cellular + the remote command channel +
+    // heartbeat + watchdog so the unit stays reachable and a human can push a
+    // remote fix (format_sd / OTA). Creds + device_id were already loaded from NVS
+    // above, so the survival plane can reach the backend. app_main returns here;
+    // FreeRTOS keeps the three survival tasks running.
+    if (g_safe_mode) {
+        g_msc_only = true;  // never enumerate a possibly-corrupt SD over USB
+        s3LoadCreds();
+        char l2[24];
+        snprintf(l2, sizeof(l2), "%u crashes", (unsigned)g_crashBoots);
+        disp("SAFE MODE", l2);
+        log_write("SAFE MODE: boot #%u reset=%d heap=%lu — survival plane only (await format_sd/OTA)",
+                  g_crashBoots, g_resetReason, (unsigned long)esp_get_free_heap_size());
+
+        xTaskCreatePinnedToCore(modemTask,      "modem",     16384, nullptr, 2, &g_modem_task, 0);
+        xTaskCreatePinnedToCore(main_loop_task, "main_loop",  4096, nullptr, 1, nullptr,       0);
+        xTaskCreatePinnedToCore(watchdog_task,  "watchdog",   3072, nullptr, 5, nullptr,       0);
+
+        ESP_LOGW(TAG, "SAFE MODE active — survival plane up, awaiting remote recovery");
+        return;
     }
 
     disp("Init SD...");

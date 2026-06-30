@@ -244,6 +244,39 @@ void test_watchdog_millis_wraparound(void) {
     TEST_ASSERT_TRUE(watchdogShouldReboot(hb, hb + 400000u, 300000));
 }
 
+// ── Crash-loop firewall / boot-mode decision ────────────────────────────────
+
+void test_bootmode_normal_below_threshold(void) {
+    // Few boots, even on a crash reset → normal.
+    TEST_ASSERT_EQUAL_INT(BOOT_NORMAL, decideBootMode(0, false, false));
+    TEST_ASSERT_EQUAL_INT(BOOT_NORMAL, decideBootMode(2, false, false));
+    TEST_ASSERT_EQUAL_INT(BOOT_NORMAL, decideBootMode(2, false, true));
+}
+
+void test_bootmode_poweron_always_normal(void) {
+    // A human power-cycling the unit gets a fresh attempt regardless of count.
+    TEST_ASSERT_EQUAL_INT(BOOT_NORMAL, decideBootMode(9, true, false));
+    TEST_ASSERT_EQUAL_INT(BOOT_NORMAL, decideBootMode(9, true, true));
+}
+
+void test_bootmode_crashloop_safe(void) {
+    // Crash loop, nothing to roll back → isolate to safe mode.
+    TEST_ASSERT_EQUAL_INT(BOOT_SAFE_MODE, decideBootMode(3, false, false));
+    TEST_ASSERT_EQUAL_INT(BOOT_SAFE_MODE, decideBootMode(7, false, false));
+}
+
+void test_bootmode_crashloop_ota_rollback(void) {
+    // Crash loop with a pending OTA → roll the OTA back first.
+    TEST_ASSERT_EQUAL_INT(BOOT_OTA_ROLLBACK, decideBootMode(3, false, true));
+    TEST_ASSERT_EQUAL_INT(BOOT_OTA_ROLLBACK, decideBootMode(7, false, true));
+}
+
+void test_bootmode_custom_threshold(void) {
+    // Threshold is configurable; boundary is inclusive.
+    TEST_ASSERT_EQUAL_INT(BOOT_NORMAL,    decideBootMode(4, false, false, 5));
+    TEST_ASSERT_EQUAL_INT(BOOT_SAFE_MODE, decideBootMode(5, false, false, 5));
+}
+
 // ── SD recovery escalation ──────────────────────────────────────────────────
 
 void test_sd_recovery_healthy(void) {
@@ -353,6 +386,12 @@ int main(int argc, char** argv) {
     RUN_TEST(test_watchdog_fresh_heartbeat);
     RUN_TEST(test_watchdog_stalled);
     RUN_TEST(test_watchdog_millis_wraparound);
+
+    RUN_TEST(test_bootmode_normal_below_threshold);
+    RUN_TEST(test_bootmode_poweron_always_normal);
+    RUN_TEST(test_bootmode_crashloop_safe);
+    RUN_TEST(test_bootmode_crashloop_ota_rollback);
+    RUN_TEST(test_bootmode_custom_threshold);
 
     RUN_TEST(test_sd_recovery_healthy);
     RUN_TEST(test_sd_recovery_degrade_band);

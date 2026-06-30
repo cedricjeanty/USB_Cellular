@@ -646,6 +646,30 @@ inline bool halAckCommand(const char* device, const char* resultJson) {
     return ok;
 }
 
+// POST an always-on telemetry heartbeat — the Lambda stores it latest-wins at
+// heartbeat/{device}.json so an operator can always SEE a unit's health (mode,
+// crash-boot count, reset reason, net, sd, rssi, heap, uptime) even when its SD or
+// app plane is wedged. bodyJson is a compact JSON snapshot. SD-independent.
+inline bool halPostHeartbeat(const char* device, const char* bodyJson) {
+    if (!g_hal || !g_hal->network || !device || !bodyJson) return false;
+    S3Creds creds = loadS3Creds();
+    if (!creds.valid) return false;
+    int bodyLen = (int)strlen(bodyJson);
+    char hdr[512];
+    snprintf(hdr, sizeof(hdr),
+        "POST /prod/command/heartbeat?device=%s HTTP/1.1\r\n"
+        "Host: %s\r\nx-api-key: %s\r\n"
+        "Content-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+        urlEncode(device).c_str(), creds.apiHost, creds.apiKey, bodyLen);
+    TlsHandle tls = g_hal->network->connect(creds.apiHost);
+    if (!tls) return false;
+    bool ok = g_hal->network->write(tls, hdr, strlen(hdr)) &&
+              g_hal->network->write(tls, bodyJson, (size_t)bodyLen);
+    if (ok) { std::string resp = halHttpReadResponse(tls); ok = resp.find("\"ok\"") != std::string::npos; }
+    g_hal->network->destroy(tls);
+    return ok;
+}
+
 // Read the .meta sidecar for a .eaofh file and return first_flight.
 // metaPath is the full path to the .meta file (e.g. "/sdcard/upload/0001/f.eaofh.meta").
 inline uint32_t halReadMetaFirstFlight(const char* metaPath) {

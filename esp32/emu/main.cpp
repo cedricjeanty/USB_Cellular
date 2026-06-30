@@ -629,6 +629,19 @@ int main(int argc, char* argv[]) {
         s_gzipBps = (uint32_t)atoi(e) * 1000u;
         printf("Modeled on-device gzip rate: %u KB/s\n", (unsigned)(s_gzipBps / 1000u));
     }
+    // EMU_SAFE_MODE=1: simulate the crash-loop firewall's Safe Mode — the survival
+    // plane only (cellular + remote command channel + heartbeat), application plane
+    // (harvest/upload) disabled. Proves a wedged unit stays reachable + recoverable.
+    bool s_safeMode = false;
+    uint32_t s_crashBoots = 0;
+    if (const char* e = getenv("EMU_SAFE_MODE"); e && e[0] == '1') {
+        s_safeMode = true;
+        s_crashBoots = 4;  // pretend we tripped the threshold
+        if (const char* b = getenv("EMU_SAFE_BOOTS"); b && atoi(b) > 0) s_crashBoots = (uint32_t)atoi(b);
+        printf("SAFE MODE: survival plane only (%u crashes) — harvest/upload disabled\n",
+               (unsigned)s_crashBoots);
+        airbridge_log("SAFE MODE: boot — survival plane only (await format_sd/OTA)");
+    }
 
     // EMU_DSU_INTERNAL: backlog-in-the-DSU transfer thread (see dsuTransferThread).
     std::thread dsuThread;
@@ -1481,16 +1494,49 @@ int main(int argc, char* argv[]) {
                         cr.reboot?"true":"false", g_compress?"true":"false");
                     halAckCommand(deviceId, ack);
                     s_compress = g_compress;  // bridge shared flag → emulator harvest flag
-                    if (cr.format && s_blockFs) {
-                        printf("[CMD] format_sd — reformatting (remote recovery)\n");
-                        airbridge_log("CMD: format_sd — reformatting (remote)");
-                        s_blockFs->format();
-                        s_blockFs->importHostTree(SD_ROOT, SD_ROOT);
-                        s_blockFs->importHostTree(SD_INTERNAL, SD_INTERNAL);
-                        airbridge_log("SD: reformatted + reseeded — recovered (remote format_sd)");
-                        printf("[CMD] reformatted + recovered\n");
+                    if (cr.format) {
+                        // Deliberate remote fix clears the crash-loop firewall: a
+                        // safe-mode unit returns to the full application plane.
+                        if (s_safeMode) {
+                            s_safeMode = false; s_crashBoots = 0;
+                            printf("[CMD] format_sd — exiting SAFE MODE (firewall cleared)\n");
+                            airbridge_log("SAFE MODE: cleared by remote format_sd — application plane restored");
+                        }
+                        if (s_blockFs) {
+                            printf("[CMD] format_sd — reformatting (remote recovery)\n");
+                            airbridge_log("CMD: format_sd — reformatting (remote)");
+                            s_blockFs->format();
+                            s_blockFs->importHostTree(SD_ROOT, SD_ROOT);
+                            s_blockFs->importHostTree(SD_INTERNAL, SD_INTERNAL);
+                            airbridge_log("SD: reformatted + reseeded — recovered (remote format_sd)");
+                            printf("[CMD] reformatted + recovered\n");
+                        }
                     }
                 }
+            }
+        }
+
+        // ── Always-on heartbeat (mirrors the firmware modem-task heartbeat) ──
+        // POST a compact health snapshot to the real test Lambda in BOTH normal and
+        // Safe Mode, over the SD-independent HAL path. Latest-wins at
+        // heartbeat/{device}.json so an operator can always SEE the unit. Cadence is
+        // compressed to 5s for a watchable e2e (vs 60s on hardware).
+        {
+            static uint32_t lastHb = 0;
+            if (ds.pppConnected && deviceId[0] && (now - lastHb) > 5000) {
+                lastHb = now;
+                char hb[384];
+                snprintf(hb, sizeof(hb),
+                    "{\"device\":\"%s\",\"fw\":\"%s\",\"mode\":\"%s\",\"boots\":%lu,"
+                    "\"reset_reason\":%d,\"net\":\"%s\",\"sd_mounted\":%s,\"rssi\":%d,"
+                    "\"heap\":%lu,\"uptime_s\":%lu}",
+                    deviceId, FW_VERSION, s_safeMode ? "safe" : "healthy",
+                    (unsigned long)s_crashBoots, s_safeMode ? 12 : 1,
+                    ds.pppConnected ? "ppp" : "none", s_safeMode ? "false" : "true",
+                    ds.modemRssi, (unsigned long)200000, (unsigned long)(now / 1000));
+                if (halPostHeartbeat(deviceId, hb))
+                    printf("[HB] posted mode=%s boots=%u\n",
+                           s_safeMode ? "safe" : "healthy", (unsigned)s_crashBoots);
             }
         }
 

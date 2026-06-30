@@ -55,6 +55,42 @@ grep -qa "recovered (remote format_sd)" /tmp/emu_e2e.log && ok "device RECOVERED
 A2=$(aws s3 cp "s3://$BUCKET/commands/$DEV2/ack.json" - 2>/dev/null)
 echo "$A2" | grep -qE '"format":true' && ok "device ACKed the format: $A2" || no "no format ack ($A2)"
 
+# ── Scenario 3: SAFE MODE — survival plane stays reachable + heartbeats ───────
+# The crash-loop firewall has isolated the unit to Safe Mode (no SD/harvest/upload).
+# Prove it still (a) connects, (b) POSTs an always-on heartbeat reporting mode=safe,
+# (c) accepts a remote format_sd that clears the firewall, and (d) then heartbeats
+# mode=healthy. This is "never an unreachable brick" demonstrated end to end.
+HBHOST="${API_HOST:-disw6oxjed.execute-api.us-west-2.amazonaws.com}"
+HBKEY="${API_KEY:-7fFErx7ZCt9Vr2fvYfyOT7YxxeEjay4G5bpmfYdm}"
+DEV3="EMU_E2E_safe$(date +%H%M%S 2>/dev/null || echo 3)"
+L3=/tmp/emu_safe_e2e.log
+log "── Scenario 3: SAFE MODE heartbeat + remote recovery  device=$DEV3 ──"
+aws s3 rm "s3://$BUCKET/commands/$DEV3/ack.json" >/dev/null 2>&1
+aws s3 rm "s3://$BUCKET/heartbeat/$DEV3.json" >/dev/null 2>&1
+# Launch a unit already firewalled into Safe Mode. NO command yet — it must sit in
+# safe mode and heartbeat on its own (the realistic field state: reachable, awaiting
+# orders). Only after we SEE a safe-mode heartbeat do we push the recovery command.
+# exec so $! is the real emulator pid (not the subshell) → kill actually stops it.
+: > "$L3"
+export EMU_SAFE_MODE=1 EMU_SD_BLOCK=1
+( cd "$FW_DIR" && exec "$EMU" "$DEV3" >>"$L3" 2>&1 ) &
+EMU3=$!
+for i in $(seq 1 40); do grep -qa "\[HB\] posted mode=safe" "$L3" && break; kill -0 "$EMU3" 2>/dev/null || break; sleep 1; done
+grep -qa "SAFE MODE: survival plane only" "$L3" && ok "booted into SAFE MODE (survival plane only)" || no "did not enter safe mode"
+grep -qa "\[HB\] posted mode=safe" "$L3" && ok "heartbeat posted while in safe mode (unit reachable, awaiting orders)" || no "no safe-mode heartbeat"
+# Operator sees mode=safe in S3 and pushes the fix.
+HBSAFE=$(curl -s "https://$HBHOST/prod/command/heartbeat?device=$DEV3" -H "x-api-key: $HBKEY")
+echo "$HBSAFE" | grep -qE '"mode": *"safe"' && ok "operator GET shows mode=safe: $HBSAFE" || no "S3 heartbeat not mode=safe ($HBSAFE)"
+printf 'format_sd\n' | aws s3 cp - "s3://$BUCKET/commands/$DEV3/airbridge.cmd" >/dev/null 2>&1
+for i in $(seq 1 40); do grep -qa "\[HB\] posted mode=healthy" "$L3" && break; kill -0 "$EMU3" 2>/dev/null || break; sleep 1; done
+kill "$EMU3" 2>/dev/null; sleep 1; kill -9 "$EMU3" 2>/dev/null
+unset EMU_SAFE_MODE EMU_SD_BLOCK
+grep -qa "remote command received" "$L3" && ok "fetched command over cellular in safe mode" || no "command not fetched in safe mode"
+grep -qa "exiting SAFE MODE" "$L3" && ok "remote format_sd cleared the crash-loop firewall" || no "firewall not cleared"
+grep -qa "\[HB\] posted mode=healthy" "$L3" && ok "heartbeat flipped to healthy after recovery" || no "heartbeat did not flip to healthy"
+HB=$(curl -s "https://$HBHOST/prod/command/heartbeat?device=$DEV3" -H "x-api-key: $HBKEY")
+echo "$HB" | grep -qE '"mode": *"healthy"' && ok "operator GET /command/heartbeat now healthy: $HB" || no "heartbeat not healthy ($HB)"
+
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Remote command channel e2e:  PASS=$PASS  FAIL=$FAIL"
 echo "═══════════════════════════════════════════════════════════════"

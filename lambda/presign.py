@@ -205,6 +205,39 @@ def handler(event, context):
                 return respond(404, {"error": "no ack"})
             return respond(500, {"error": err})
 
+    elif path == "/command/heartbeat" and method == "POST":
+        # Always-on telemetry. The device POSTs a compact JSON snapshot every ~60s
+        # in BOTH normal and Safe Mode, over the SD-independent egress path — so a
+        # unit whose SD/app is wedged still reports {mode, boots, reset_reason, fw,
+        # net, sd, rssi, heap, uptime}. Stored latest-wins at heartbeat/{device}.json
+        # so an operator can always SEE a unit's health without scraping logs.
+        device = params.get("device", "")
+        if not device:
+            return respond(400, {"error": "device required"})
+        body = event.get("body", "") or ""
+        key = f"heartbeat/{device}.json"
+        try:
+            s3.put_object(Bucket=bucket, Key=key,
+                          Body=body.encode("utf-8"), ContentType="application/json")
+            return respond(200, {"ok": True})
+        except Exception as e:
+            return respond(500, {"error": str(e)})
+
+    elif path == "/command/heartbeat" and method == "GET":
+        # Operator reads a unit's latest heartbeat.
+        device = params.get("device", "")
+        if not device:
+            return respond(400, {"error": "device required"})
+        key = f"heartbeat/{device}.json"
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            return respond(200, json.loads(obj["Body"].read() or b"{}"))
+        except Exception as e:
+            err = str(e)
+            if "NoSuchKey" in err or "404" in err or "AccessDenied" in err:
+                return respond(404, {"error": "no heartbeat"})
+            return respond(500, {"error": err})
+
     elif path == "/firmware/download" and method == "GET":
         # Return pre-signed GET URL for firmware binary
         try:
