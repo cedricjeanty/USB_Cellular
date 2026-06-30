@@ -257,6 +257,39 @@ Coverage: `test/test_native_fatfsfs` (the backend in isolation) + `scripts/test_
 FatFs (LFN=0) and is deliberately decoupled from `lib/fatfs_native` (LFN=1) to avoid an ffconf
 collision on the native include path.
 
+### Safe Mode / Crash-Loop Firewall + Heartbeat
+
+A data fault (corrupt SD, bad config, an app-init panic) must never turn the device into an
+unreachable brick — once deployed, there's no physical access. The defense splits a **survival
+plane** (cellular + the remote command channel + telemetry, all SD-independent) from the
+**application plane** (SD harvest / USB MSC / upload). A crash loop degrades to "connected, in
+Safe Mode, awaiting orders," never a brick.
+
+- **Crash-loop counter** (`dbg/boots`): bumped at the top of every boot, reset to 0 **only** at
+  the main-loop "mark healthy" point (~60 s of stable uptime) or by a deliberate remote fix — so
+  it actually counts consecutive boots that never reached stable. (It used to reset every boot,
+  so `boots>5` never fired — there was no working crash-loop protection at all.)
+- **decideBootMode()** (`airbridge_runtime.h`, unit-tested, pure): `boots>=3 && reset!=POWERON`
+  → `SAFE_MODE`, or `OTA_ROLLBACK` if an OTA is pending its first-run confirmation. A clean
+  power-on always gets one normal retry (a human power-cycling forces a fresh attempt).
+- **Safe Mode** (`g_safe_mode`, set in `app_main` before any SD touch): short-circuits the
+  app-plane boot (no `sd_init`/magic/USB/`uploadTask`/`harvestTask`) and starts ONLY `modemTask`
+  (cellular + C2 command poll + SD-independent RAM-log egress) + `watchdog_task` + a minimal
+  `main_loop_task`. Surfaced on the boot banner, OLED, and heartbeat. **Stays** in Safe Mode
+  until a deliberate fix clears the firewall.
+- **Recovery, fully remote**: remote `format_sd` resets `dbg/boots` → next boot is NORMAL and
+  reformats the SD (clears the corruption); a pending-OTA crash loop auto-rolls-back to the
+  previous slot at boot; and a periodic **safe-mode OTA self-heal** lets a fixed firmware merely
+  *uploaded to S3* heal a firmware-bug crash loop with no command needed.
+- **Always-on heartbeat**: every 60 s in BOTH modes the device POSTs
+  `{mode, boots, reset_reason, fw, net, sd_mounted, rssi, rsrp, sinr, heap, uptime_s}` over the
+  SD-independent egress path → Lambda `POST/GET /command/heartbeat` → latest-wins
+  `heartbeat/{device}.json`. So an operator can always SEE a unit (including one wedged in Safe
+  Mode) instead of scraping a stale `logs/{session}.log`. Shared `halPostHeartbeat()` in
+  `airbridge_s3.h`. Emulator: `EMU_SAFE_MODE=1` runs the survival plane only;
+  `scripts/cmd_channel_e2e.sh` Scenario 3 proves safe-mode reachability → heartbeat `mode=safe`
+  → remote `format_sd` clears the firewall → `mode=healthy` (7/7).
+
 ### OTA Download Resume
 
 `otaDownloadAndFlash()` keeps the `esp_ota` handle across up to 4 attempts and **resumes** a
