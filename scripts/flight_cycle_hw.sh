@@ -50,9 +50,11 @@ HOSTDSU="python3 $HOME/USBCellular/scripts/host_dsu.py"
 CSV="/tmp/flight_cycle_hw.csv"
 
 # Find the device's USB-visible block partition (P1). Mirrors e2e_lib's scan.
+# Wait 150s: when the modem's OTA+cookie check is slow, USB presentation falls back
+# to the full 90s delay, so a 60s wait raced ahead of it and the seed/cmd-write failed.
 find_usb_part() {
     local w d
-    for w in $(seq 1 60); do
+    for w in $(seq 1 150); do
         for d in /dev/sda1 /dev/sdb1 /dev/sdc1 /dev/sdd1; do [ -b "$d" ] && { echo "$d"; return 0; }; done
         sleep 1
     done
