@@ -4373,6 +4373,13 @@ extern "C" void app_main(void) {
         log_write("SAFE MODE: boot #%u reset=%d heap=%lu — survival plane only (await format_sd/OTA)",
                   g_crashBoots, g_resetReason, (unsigned long)esp_get_free_heap_size());
 
+        // The modem task feeds PPP bytes into lwIP, so the TCP/IP stack + default
+        // event loop MUST be up first (normal boot does this just before task
+        // creation, which safe mode short-circuits past). Without it esp_netif_new/
+        // esp_netif_receive assert-panic ~786ms in → a safe-mode crash loop.
+        ESP_ERROR_CHECK(esp_netif_init());
+        ESP_ERROR_CHECK(esp_event_loop_create_default());
+
         xTaskCreatePinnedToCore(modemTask,      "modem",     16384, nullptr, 2, &g_modem_task, 0);
         xTaskCreatePinnedToCore(main_loop_task, "main_loop",  4096, nullptr, 1, nullptr,       0);
         xTaskCreatePinnedToCore(watchdog_task,  "watchdog",   3072, nullptr, 5, nullptr,       0);
