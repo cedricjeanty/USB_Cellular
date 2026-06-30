@@ -43,17 +43,40 @@ struct ModemReconnectResult {
 // Documented in CLAUDE.md "Reconnect backoff".
 struct ModemReconnectPlan {
     bool     radioReset;       // do a CFUN=0/1 reset this attempt
+    bool     factoryReset;     // do a full modem factory reset this attempt (deepest)
     uint32_t backoffSeconds;   // wait before the attempt (0 = none)
 };
 inline ModemReconnectPlan modemReconnectPlan(int failures) {
     ModemReconnectPlan p = {};
-    p.radioReset = (failures >= 4 && (failures - 4) % 5 == 0);
+    // Deepest tier: after several CFUN resets STILL can't register, the modem is likely
+    // stranded on persistent NVS state a radio reset can't clear — a stale survey band-
+    // lock (CNMP=38/CNBP) or a manual operator selection. Escalate to a full factory
+    // reset (clears CNMP/CNBP/COPS + reboots the module), then retry it periodically. So
+    // a unit can NEVER stay stranded off-network with no way to recover it.
+    p.factoryReset = (failures >= 12 && failures % 12 == 0);
+    p.radioReset   = !p.factoryReset && (failures >= 4 && (failures - 4) % 5 == 0);
     // Only a short settle before a radio reset (CFUN=0/1 itself takes ~15s) — NO long
     // backoff. The reconnect loop is signal-gated (modemWaitForSignal polls coverage
     // every ~10s and retries the instant the network returns), so we never burn minutes
     // idle: in good coverage the device reconnects within seconds of a drop.
-    p.backoffSeconds = p.radioReset ? 10u : 0u;
+    p.backoffSeconds = (p.radioReset || p.factoryReset) ? 10u : 0u;
     return p;
+}
+
+// Full modem factory reset — clears the persistent modem NVS that a CFUN=0/1 radio reset
+// does NOT: the band/RAT lock (CNMP/CNBP, e.g. a stale `survey band=N`) and manual operator
+// selection (COPS) — then reboots the module so it re-attaches with automatic band +
+// operator. Last-resort recovery when the modem answers AT but can't register (reg=0,
+// RSSI=99). The module reboots (~15-30s); the modem task's AT-sync re-initializes it after.
+// Also the action behind the remote `modem_reset` command. Shared so the emulator/tests
+// exercise it against sim_modem.
+inline void modemFactoryReset() {
+    char r[80];
+    modem_at_cmd("AT+CNMP=2", r, sizeof(r), 5000);                                    // auto RAT (all)
+    modem_at_cmd("AT+CNBP=0xFFFFFFFFFFFFFFFF,0xFFFFFFFFFFFFFFFF", r, sizeof(r), 5000); // all bands
+    modem_at_cmd("AT+COPS=0", r, sizeof(r), 10000);                                   // auto operator
+    modem_at_cmd("AT&F", r, sizeof(r), 3000);                                         // factory profile
+    modem_at_cmd("AT+CRESET", r, sizeof(r), 3000);                                    // reboot the module
 }
 
 // Poll LTE registration (AT+CEREG, with AT+CGREG fallback) every pollMs until the

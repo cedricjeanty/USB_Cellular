@@ -250,6 +250,24 @@ void test_reconnect_plan_backoff_is_flat_short(void) {
         TEST_ASSERT_LESS_OR_EQUAL_UINT32(10, modemReconnectPlan(f).backoffSeconds);
 }
 
+void test_reconnect_plan_factory_reset_escalation(void) {
+    // Deepest tier: after sustained failure, escalate to a full modem factory reset
+    // (clears a band/operator lock CFUN can't) — at 12, 24, 36... It supersedes the
+    // radio reset on those attempts.
+    ModemReconnectPlan p12 = modemReconnectPlan(12);
+    TEST_ASSERT_TRUE_MESSAGE(p12.factoryReset, "factory reset at 12 failures");
+    TEST_ASSERT_FALSE_MESSAGE(p12.radioReset, "factory reset supersedes radio reset");
+    TEST_ASSERT_TRUE(modemReconnectPlan(24).factoryReset);
+    TEST_ASSERT_TRUE(modemReconnectPlan(36).factoryReset);
+    // Not on the radio-reset / soft attempts.
+    TEST_ASSERT_FALSE(modemReconnectPlan(4).factoryReset);
+    TEST_ASSERT_FALSE(modemReconnectPlan(9).factoryReset);
+    TEST_ASSERT_FALSE(modemReconnectPlan(14).factoryReset);
+    TEST_ASSERT_FALSE(modemReconnectPlan(0).factoryReset);
+    // 4/9/14 stay radio resets (factory reset only at the 12-multiples).
+    TEST_ASSERT_TRUE(modemReconnectPlan(4).radioReset && modemReconnectPlan(9).radioReset);
+}
+
 // ── Flaky-link injection (marginal cellular) ────────────────────────────────
 // The flight-cycle test's "flaky approach" window drops a % of IP packets. The
 // load-bearing invariant: ONLY PPP_IP is ever dropped — dropping LCP/IPCP would
@@ -319,6 +337,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_reconnect_plan_first_cfun_at_five);
     RUN_TEST(test_reconnect_plan_soft_between_resets);
     RUN_TEST(test_reconnect_plan_backoff_is_flat_short);
+    RUN_TEST(test_reconnect_plan_factory_reset_escalation);
 
     // Flaky-link injection
     RUN_TEST(test_flaky_never_drops_control_frames);

@@ -44,6 +44,7 @@ enum CmdType {
     CMD_S3,          // args: <api_host> <api_key>              — runtime-safe (NVS)
     CMD_SURVEY,      // antenna signal-survey mode (no PPP)     — boot-only (changes duty cycle)
     CMD_COMPRESS,    // gzip .eaofh into the upload queue        — runtime-safe (takes effect next harvest)
+    CMD_MODEM_RESET, // full modem factory reset (clear band/operator lock + reboot module) — runtime-safe
 };
 
 struct Command {
@@ -66,6 +67,8 @@ inline CmdType cmdVerbType(const char* verb, bool* runtimeSafe) {
         { "s3",        CMD_S3,        true  },
         { "survey",    CMD_SURVEY,    false },
         { "compress",  CMD_COMPRESS,  true  },
+        { "modem_reset", CMD_MODEM_RESET, true },
+        { "modemreset",  CMD_MODEM_RESET, true },
     };
     for (auto& e : table) {
         if (strcmp(verb, e.v) == 0) { if (runtimeSafe) *runtimeSafe = e.rt; return e.t; }
@@ -306,6 +309,7 @@ struct CmdRunResult {
     bool cdcOnce;    // the cdc directive was "cdc once" (vs persistent)
     bool survey;     // a survey directive ran (caller: g_surveyMode=true)
     int  surveyBand; // 0=none, -1=auto, >0=lock LTE band N
+    bool modemReset; // a modem_reset directive ran (caller: modemFactoryReset on the modem task)
     int  rewrite;    // 0=no change, 1=write *out, 2=delete file (once-stripping)
 };
 
@@ -346,6 +350,7 @@ inline CmdRunResult runCommandTextBuffer(const char* text, bool runtimeOnly,
             }
             case CMD_REBOOT:    res.reboot = true; break;
             case CMD_FORMAT_SD: res.format = true; break;
+            case CMD_MODEM_RESET: res.modemReset = true; break;
             case CMD_SURVEY: {
                 res.survey = true;
                 const char* b = strstr(c.args, "band=");

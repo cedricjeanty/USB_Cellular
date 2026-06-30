@@ -84,6 +84,19 @@ void test_parse_compress(void) {
     TEST_ASSERT_EQUAL_STRING("off", c.args);
 }
 
+void test_parse_modem_reset(void) {
+    Command c;
+    TEST_ASSERT_TRUE(cmdParseLine("modem_reset", &c));
+    TEST_ASSERT_EQUAL(CMD_MODEM_RESET, c.type);
+    TEST_ASSERT_TRUE(c.runtimeSafe);   // no device reboot; modem reboots + reconnects
+    TEST_ASSERT_TRUE(cmdParseLine("modemreset", &c));  // alias
+    TEST_ASSERT_EQUAL(CMD_MODEM_RESET, c.type);
+    // Executor sets cr.modemReset
+    CmdRunResult r = runCommandTextBuffer("modem_reset\n", false, "", "", "", nullptr, 0, false);
+    TEST_ASSERT_TRUE(r.ran);
+    TEST_ASSERT_TRUE(r.modemReset);
+}
+
 void test_parse_unknown_verb(void) {
     Command c;
     TEST_ASSERT_TRUE(cmdParseLine("frobnicate now", &c));
@@ -225,6 +238,7 @@ int main(int, char**) {
     RUN_TEST(test_parse_args_with_once);
     RUN_TEST(test_parse_survey);
     RUN_TEST(test_parse_compress);
+    RUN_TEST(test_parse_modem_reset);
     RUN_TEST(test_parse_unknown_verb);
     RUN_TEST(test_parse_once_not_mistaken_in_args);
     RUN_TEST(test_parse_multiline);

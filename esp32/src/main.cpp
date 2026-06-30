@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260629230000"
+#define FW_VERSION "20260630020000"
 
 #include <cstring>
 #include <ctime>
@@ -573,6 +573,10 @@ static volatile bool g_markedHealthy = false;  // main_loop reset dbg/boots afte
 // deep spawned task pinned to the non-main core proved unreliable on hardware (a remote
 // format_sd set its NVS flags + ack'd, but the device never rebooted to apply them).
 static volatile bool g_restartRequested = false;
+// Set by the remote command poll (cmd_poll task) to ask the MODEM task to do a full
+// factory reset — the modem task owns the UART, so the reset must run there, never from
+// the spawned poll task (two tasks driving AT over the same UART would collide).
+static volatile bool g_modemResetRequested = false;
 
 // ── Cellular modem (SIM7600) ────────────────────────────────────────────────
 static esp_netif_t      *g_ppp_netif    = nullptr;
@@ -2636,6 +2640,21 @@ static void modemTask(void* param) {
         // never returns
     }
 
+    // ── Restore automatic band selection (self-heal a stale survey band-lock) ──
+    // A `survey band=N` locks the modem to one LTE band via AT+CNMP=38 + AT+CNBP, and
+    // those PERSIST in the MODEM's own NVS across reboot AND reflash. If band=auto was
+    // never run, the modem stays LTE-only on a band that may have no coverage here →
+    // it never registers (CEREG timeout, reg=0, RSSI=99) and the unit goes dark on
+    // cellular with no way to command it back. A field unit must NEVER get stranded
+    // like that, so on every NORMAL boot we restore auto mode + all bands. (Survey mode
+    // sets its lock above and returns before this, so surveys are unaffected.)
+    {
+        char r[64];
+        modem_at_cmd("AT+CNMP=2", r, sizeof(r), 5000);                                   // auto: all RATs
+        modem_at_cmd("AT+CNBP=0xFFFFFFFFFFFFFFFF,0xFFFFFFFFFFFFFFFF", r, sizeof(r), 5000); // all bands
+        log_write("Modem: restored auto band/mode (CNMP=2, CNBP=all) — clears stale lock");
+    }
+
     // ── Registration + RSSI/operator + APN + PPP dial — shared with emulator ──
     // modemRunInitPost(): AT+CEREG=1/AUTOCSQ, CEREG/CGREG registration wait,
     // CSQ, COPS, CGDCONT APN, ATD*99# dial (3 attempts). Runs after the baud
@@ -2871,6 +2890,19 @@ static void modemTask(void* param) {
             cdc_printf("Modem: no IP — reconnecting\r\n");
             g_pppNeedsReconnect = true;
         }
+        // Remote modem_reset command — run it here (modem task owns the UART). Tear PPP
+        // down first; the module reboots, then the reconnect path re-inits from AT sync.
+        if (g_modemResetRequested) {
+            g_modemResetRequested = false;
+            log_write("Modem: remote modem_reset — full factory reset");
+            cdc_printf("Modem: remote factory reset...\r\n");
+            g_pppConnected = false;
+            modemFactoryReset();
+            vTaskDelay(pdMS_TO_TICKS(20000));   // module reboots ~15-30s
+            g_pppNeedsReconnect = true;
+            continue;
+        }
+
         if (pppStale || g_pppNeedsReconnect) {
 
             if (pppStale) {
@@ -2890,6 +2922,20 @@ static void modemTask(void* param) {
             // CFUN=0/1 (full radio reset) starts at attempt 5 and every 5th after.
             // Escalation/backoff is the shared, unit-tested modemReconnectPlan().
             ModemReconnectPlan plan = modemReconnectPlan(s_reconnect_failures);
+            // Deepest escalation: a full modem factory reset clears a stale band/operator
+            // lock (which CFUN can't) and reboots the module. The module reboot makes the
+            // modem task's PPP pump irrelevant, so just trigger it + let the next loop
+            // iteration re-init from AT sync.
+            if (plan.factoryReset) {
+                log_write("Modem: STRANDED after %d attempts — full factory reset (clear band/operator lock)",
+                          s_reconnect_failures);
+                cdc_printf("Modem: factory reset (clearing band/operator lock)...\r\n");
+                modemFactoryReset();
+                s_reconnect_failures++;
+                vTaskDelay(pdMS_TO_TICKS(20000));  // module reboots ~15-30s
+                g_pppNeedsReconnect = true;        // re-attempt after the module comes back
+                continue;
+            }
             bool doRadioReset = plan.radioReset;
             if (plan.backoffSeconds > 0) {
                 log_write("Modem: backoff %lus before radio reset (failure #%d)",
@@ -3008,13 +3054,18 @@ static void modemTask(void* param) {
                         char ack[320];
                         snprintf(ack, sizeof(ack),
                             "{\"fw\":\"%s\",\"ran\":%s,\"reboot\":%s,\"format\":%s,\"cdc\":%s,"
-                            "\"survey\":%s,\"compress\":%s,\"uptime_s\":%lu}",
+                            "\"survey\":%s,\"compress\":%s,\"modem_reset\":%s,\"uptime_s\":%lu}",
                             FW_VERSION, cr.ran?"true":"false", cr.reboot?"true":"false",
                             cr.format?"true":"false", cr.cdc?"true":"false", cr.survey?"true":"false",
-                            g_compress?"true":"false", (unsigned long)(millis()/1000));
+                            g_compress?"true":"false", cr.modemReset?"true":"false",
+                            (unsigned long)(millis()/1000));
                         halAckCommand(g_deviceId, ack);
                         if (cr.cdc)     g_msc_only = false;                       // effective next boot
                         if (cr.survey){ g_surveyMode = true; g_surveyBand = cr.surveyBand; }
+                        if (cr.modemReset) {                                     // modem task does the reset (owns UART)
+                            airbridge_log("CMD: modem_reset — requesting full modem factory reset");
+                            g_modemResetRequested = true;
+                        }
                         if (cr.format) {
                             airbridge_log("CMD: format_sd — flags set, requesting reboot");
                             nvs_handle_t fh;
