@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260630020000"
+#define FW_VERSION "20260630030000"
 
 #include <cstring>
 #include <ctime>
@@ -85,6 +85,14 @@ HAL* g_hal = nullptr;
 static SemaphoreHandle_t g_sd_mutex = nullptr;
 static volatile bool     g_sd_ready = false;
 static volatile bool     g_tlsActive = false; // suppress +++ escape during TLS; lengthens modem-watchdog stale threshold
+// Serializes the TLS handshake/init across tasks. The first mbedTLS use lazily allocates
+// the hardware-AES DMA interrupt (esp_aes_intr_alloc); when several spawned tasks (heartbeat,
+// cmd_poll, OTA self-heal, upload, log egress) all call tls_connect() the instant PPP comes
+// up, that lazy alloc races and abort()s on core 1 — an intermittent reset_reason=4 crash
+// loop that masqueraded as an "app-plane panic" (and survived SD reformat, because it was
+// never the SD). Holding this mutex through the handshake serializes the init so the AES
+// interrupt is allocated exactly once; after that it's uncontended.
+static SemaphoreHandle_t g_tlsMutex = nullptr;
 
 // ── MSC-only mode (no CDC) ──────────────────────────────────────────────────
 // Default: MSC-only for avionics compatibility. Set via CLI: SETMODE CDC / SETMODE MSC
@@ -1417,7 +1425,12 @@ static esp_tls_t* tls_connect(const char* host) {
     if (!tls) return nullptr;
 
     g_tlsActive = true;
+    // Serialize the handshake (see g_tlsMutex) so concurrent first-use of hardware AES
+    // can't race esp_aes_intr_alloc into an abort(). Critical only at startup when many
+    // tasks connect at once; uncontended afterward.
+    if (g_tlsMutex) xSemaphoreTake(g_tlsMutex, portMAX_DELAY);
     int ret = esp_tls_conn_new_sync(host, strlen(host), 443, &cfg, tls);
+    if (g_tlsMutex) xSemaphoreGive(g_tlsMutex);
     if (ret != 1) {
         int esp_err = 0, mbedtls_err = 0;
         esp_tls_error_handle_t err_handle;
@@ -4290,6 +4303,7 @@ extern "C" void app_main(void) {
     g_noteApiRttMs = noteLinkLatency;
 
     g_sd_mutex = xSemaphoreCreateMutex();
+    g_tlsMutex = xSemaphoreCreateMutex();   // serialize TLS handshakes (AES-intr-alloc race)
 
     // ── Session counter (always increments) + crash-loop detection ──────
     {
