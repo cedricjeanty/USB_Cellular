@@ -265,16 +265,26 @@ void test_bootmode_crashloop_safe(void) {
     TEST_ASSERT_EQUAL_INT(BOOT_SAFE_MODE, decideBootMode(7, false, false));
 }
 
-void test_bootmode_crashloop_ota_rollback(void) {
-    // Crash loop with a pending OTA → roll the OTA back first.
-    TEST_ASSERT_EQUAL_INT(BOOT_OTA_ROLLBACK, decideBootMode(3, false, true));
-    TEST_ASSERT_EQUAL_INT(BOOT_OTA_ROLLBACK, decideBootMode(7, false, true));
+void test_bootmode_pending_ota_gets_safe_mode_first(void) {
+    // A pending OTA that crash-loops is NOT rolled back immediately — it first gets a
+    // chance to reach Safe Mode (the crash may be a data fault, not the new firmware).
+    TEST_ASSERT_EQUAL_INT(BOOT_SAFE_MODE, decideBootMode(3, false, true));
+    TEST_ASSERT_EQUAL_INT(BOOT_SAFE_MODE, decideBootMode(5, false, true));
+}
+
+void test_bootmode_broken_ota_rollback(void) {
+    // A pending OTA that can't even hold Safe Mode (past the rollback bar) → roll back.
+    TEST_ASSERT_EQUAL_INT(BOOT_OTA_ROLLBACK, decideBootMode(6, false, true));
+    TEST_ASSERT_EQUAL_INT(BOOT_OTA_ROLLBACK, decideBootMode(9, false, true));
+    // ...but with no pending OTA, even many crashes stay in Safe Mode (reachable).
+    TEST_ASSERT_EQUAL_INT(BOOT_SAFE_MODE, decideBootMode(9, false, false));
 }
 
 void test_bootmode_custom_threshold(void) {
-    // Threshold is configurable; boundary is inclusive.
-    TEST_ASSERT_EQUAL_INT(BOOT_NORMAL,    decideBootMode(4, false, false, 5));
-    TEST_ASSERT_EQUAL_INT(BOOT_SAFE_MODE, decideBootMode(5, false, false, 5));
+    // Thresholds are configurable; boundaries are inclusive.
+    TEST_ASSERT_EQUAL_INT(BOOT_NORMAL,    decideBootMode(4, false, false, 5, 8));
+    TEST_ASSERT_EQUAL_INT(BOOT_SAFE_MODE, decideBootMode(5, false, false, 5, 8));
+    TEST_ASSERT_EQUAL_INT(BOOT_OTA_ROLLBACK, decideBootMode(8, false, true, 5, 8));
 }
 
 // ── SD recovery escalation ──────────────────────────────────────────────────
@@ -390,7 +400,8 @@ int main(int argc, char** argv) {
     RUN_TEST(test_bootmode_normal_below_threshold);
     RUN_TEST(test_bootmode_poweron_always_normal);
     RUN_TEST(test_bootmode_crashloop_safe);
-    RUN_TEST(test_bootmode_crashloop_ota_rollback);
+    RUN_TEST(test_bootmode_pending_ota_gets_safe_mode_first);
+    RUN_TEST(test_bootmode_broken_ota_rollback);
     RUN_TEST(test_bootmode_custom_threshold);
 
     RUN_TEST(test_sd_recovery_healthy);

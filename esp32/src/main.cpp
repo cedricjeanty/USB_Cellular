@@ -4029,20 +4029,32 @@ static void main_loop_task(void* param) {
         // safe mode — surviving in safe mode proves nothing about the app, so the
         // counter must stay elevated until a deliberate remote fix clears it.
         #define HEALTHY_UPTIME_MS 60000
-        if (!g_markedHealthy && !g_safe_mode && millis() >= HEALTHY_UPTIME_MS) {
+        if (!g_markedHealthy && millis() >= HEALTHY_UPTIME_MS) {
             g_markedHealthy = true;
-            nvs_handle_t hd;
-            if (nvs_open("dbg", NVS_READWRITE, &hd) == ESP_OK) {
-                nvs_set_u32(hd, "boots", 0); nvs_commit(hd); nvs_close(hd);
-            }
+            // Confirm a pending OTA in BOTH modes: reaching stable uptime — even in Safe
+            // Mode — proves the new image boots and runs its survival plane, so it must
+            // NOT be rolled back (otherwise an OTA'd fix to a data-faulted unit bounces in
+            // a flash→crash→rollback loop and can never land).
             nvs_handle_t ho;
             if (nvs_open("ota", NVS_READWRITE, &ho) == ESP_OK) {
                 nvs_set_str(ho, "fw_ver", FW_VERSION);
                 nvs_set_str(ho, "ota_status", "ok");
                 nvs_commit(ho); nvs_close(ho);
             }
-            log_write("Healthy: %ds stable — crash-loop counter cleared, OTA confirmed",
-                      HEALTHY_UPTIME_MS / 1000);
+            if (!g_safe_mode) {
+                // Normal, fully-healthy: also clear the crash-loop firewall.
+                nvs_handle_t hd;
+                if (nvs_open("dbg", NVS_READWRITE, &hd) == ESP_OK) {
+                    nvs_set_u32(hd, "boots", 0); nvs_commit(hd); nvs_close(hd);
+                }
+                log_write("Healthy: %ds stable — crash-loop counter cleared, OTA confirmed",
+                          HEALTHY_UPTIME_MS / 1000);
+            } else {
+                // Safe Mode is reachable + stable: confirm the OTA but KEEP the firewall up
+                // (boots stays elevated) until a deliberate fix (format_sd / newer OTA).
+                log_write("SAFE MODE stable %ds — OTA confirmed (fw boots); firewall held",
+                          HEALTHY_UPTIME_MS / 1000);
+            }
         }
 
         // Watchdog: restart modem task if it died (init failure OR runtime crash)

@@ -57,13 +57,26 @@ inline bool watchdogShouldReboot(uint32_t lastHeartbeatMs, uint32_t nowMs,
 // wasPowerOn maps from esp_reset_reason()==ESP_RST_POWERON in the firmware glue.
 enum BootAction { BOOT_NORMAL = 0, BOOT_OTA_ROLLBACK, BOOT_SAFE_MODE };
 
+// safeThreshold:    consecutive failed boots before isolating to Safe Mode.
+// rollbackThreshold: only a pending OTA that can't even hold Safe Mode (keeps crashing
+//                    well past safeThreshold) is treated as a genuinely broken image and
+//                    rolled back. CRUCIAL: a pending OTA is NOT rolled back the instant it
+//                    crash-loops — the crash may be a DATA fault (corrupt SD), not the new
+//                    firmware, and rolling back to the old image just crash-loops on the
+//                    same SD. So a fresh OTA first gets a chance to reach Safe Mode (where
+//                    it's reachable + can self-confirm); rollback is the last resort if even
+//                    that fails. Without this, you could never OTA a fix to a data-faulted
+//                    unit — the fix would roll back before it ever ran (seen on hardware: an
+//                    OTA'd fix bounced in an endless flash→crash→rollback loop).
 inline BootAction decideBootMode(uint32_t boots, bool wasPowerOn, bool otaPending,
-                                 uint32_t threshold = 3) {
+                                 uint32_t safeThreshold = 3, uint32_t rollbackThreshold = 6) {
     // A clean power-on is a deliberate retry — always give one normal attempt.
     if (wasPowerOn) return BOOT_NORMAL;
-    if (boots < threshold) return BOOT_NORMAL;
-    // Crash loop. Prefer rolling back a suspect OTA; otherwise isolate to safe mode.
-    return otaPending ? BOOT_OTA_ROLLBACK : BOOT_SAFE_MODE;
+    // Genuinely broken OTA: crashed past Safe Mode too → revert to the previous image.
+    if (otaPending && boots >= rollbackThreshold) return BOOT_OTA_ROLLBACK;
+    // Crash loop (incl. a still-pending OTA below the rollback bar) → isolate, stay reachable.
+    if (boots >= safeThreshold) return BOOT_SAFE_MODE;
+    return BOOT_NORMAL;
 }
 
 // ── SD-card runtime health / recovery escalation ────────────────────────────
