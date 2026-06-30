@@ -157,9 +157,15 @@ def handler(event, context):
             return respond(500, {"error": err})
 
     elif path == "/command" and method == "GET":
-        # Remote command channel — one-shot fetch of an airbridge.cmd-syntax command,
-        # then delete (run-once delivery). The device executes it through the SAME
-        # command executor as a USB-delivered airbridge.cmd. Key: commands/{device}/airbridge.cmd
+        # Remote command channel — fetch an airbridge.cmd-syntax command. The device
+        # executes it through the SAME command executor as a USB-delivered airbridge.cmd.
+        # Key: commands/{device}/airbridge.cmd. Delivery is AT-LEAST-ONCE: the command is
+        # NOT deleted on GET (a truncated/lost response on a flaky cellular link would
+        # otherwise lose the command forever — seen on hardware at rsrp -111). It is
+        # deleted only when the device POSTs /command/ack confirming execution. So a lost
+        # GET response just means the next 5-min poll re-fetches. The device's directives
+        # (format_sd / reboot / cdc / compress / wifi / s3) are idempotent, so re-running
+        # one before an ack lands is harmless.
         device = params.get("device", "")
         if not device:
             return respond(400, {"error": "device required"})
@@ -167,7 +173,6 @@ def handler(event, context):
         try:
             obj = s3.get_object(Bucket=bucket, Key=key)
             data = obj["Body"].read()
-            s3.delete_object(Bucket=bucket, Key=key)          # one-shot
             return respond(200, {"cmd": data.decode("utf-8", "replace"), "size": len(data)})
         except Exception as e:
             err = str(e)
@@ -178,6 +183,9 @@ def handler(event, context):
     elif path == "/command/ack" and method == "POST":
         # Device confirms it executed a command. Body = result JSON (echoed cmd, per-
         # directive result, fw, reset reason, ts). Stored at commands/{device}/ack.json.
+        # Acking ALSO deletes the pending command (delete-on-ack = at-least-once delivery):
+        # the command lives until the device proves it ran it, so a lost GET response can't
+        # silently drop it.
         device = params.get("device", "")
         if not device:
             return respond(400, {"error": "device required"})
@@ -186,6 +194,10 @@ def handler(event, context):
         try:
             s3.put_object(Bucket=bucket, Key=key,
                           Body=body.encode("utf-8"), ContentType="application/json")
+            try:
+                s3.delete_object(Bucket=bucket, Key=f"commands/{device}/airbridge.cmd")
+            except Exception:
+                pass  # already gone / nothing pending — ack still succeeds
             return respond(200, {"ok": True})
         except Exception as e:
             return respond(500, {"error": str(e)})
