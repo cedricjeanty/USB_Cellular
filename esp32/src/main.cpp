@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260629220000"
+#define FW_VERSION "20260629230000"
 
 #include <cstring>
 #include <ctime>
@@ -568,6 +568,11 @@ static volatile bool g_safe_mode     = false;  // true ⇒ survival plane only
 static uint32_t      g_crashBoots    = 0;      // dbg/boots at this boot (for banner/heartbeat)
 static int           g_resetReason   = 0;      // esp_reset_reason() (for heartbeat)
 static volatile bool g_markedHealthy = false;  // main_loop reset dbg/boots after stable uptime
+// A worker task (the spawned remote-command poll) requests a reboot by setting this;
+// main_loop_task performs esp_restart() from a clean, shallow context. esp_restart() from a
+// deep spawned task pinned to the non-main core proved unreliable on hardware (a remote
+// format_sd set its NVS flags + ack'd, but the device never rebooted to apply them).
+static volatile bool g_restartRequested = false;
 
 // ── Cellular modem (SIM7600) ────────────────────────────────────────────────
 static esp_netif_t      *g_ppp_netif    = nullptr;
@@ -3011,7 +3016,7 @@ static void modemTask(void* param) {
                         if (cr.cdc)     g_msc_only = false;                       // effective next boot
                         if (cr.survey){ g_surveyMode = true; g_surveyBand = cr.surveyBand; }
                         if (cr.format) {
-                            airbridge_log("CMD: format_sd — reformat on next boot (remote)");
+                            airbridge_log("CMD: format_sd — flags set, requesting reboot");
                             nvs_handle_t fh;
                             if (nvs_open("sys", NVS_READWRITE, &fh) == ESP_OK) {
                                 nvs_set_u8(fh, "format", 1); nvs_commit(fh); nvs_close(fh);
@@ -3023,17 +3028,15 @@ static void modemTask(void* param) {
                             if (nvs_open("dbg", NVS_READWRITE, &bh) == ESP_OK) {
                                 nvs_set_u32(bh, "boots", 0); nvs_commit(bh); nvs_close(bh);
                             }
-                            if (!g_harvesting && !g_safe_mode) sd_before_restart();  // safe mode: SD never mounted
-                            esp_restart();
+                            g_restartRequested = true;   // main_loop performs the reboot
                         } else if (cr.reboot) {
-                            airbridge_log("CMD: reboot (remote)");
-                            if (!g_harvesting && !g_safe_mode) sd_before_restart();
-                            esp_restart();
+                            airbridge_log("CMD: reboot — requesting reboot");
+                            g_restartRequested = true;
                         }
                     }
                     *running = false;
                     vTaskDelete(nullptr);
-                }, "cmd_poll", 12288, (void*)&cmdPollRunning, 2, nullptr, 1);
+                }, "cmd_poll", 16384, (void*)&cmdPollRunning, 2, nullptr, 1);
             }
         }
 
@@ -4021,6 +4024,17 @@ static void main_loop_task(void* param) {
         // iteration: if the loop body wedges (e.g. blocked on a mutex a hung
         // task holds), this stops advancing and watchdog_task reboots us.
         g_mainLoopHeartbeat = millis();
+
+        // A worker task (remote command poll) asked us to reboot (format_sd / reboot).
+        // Do it here, from a clean shallow context — esp_restart() from the deep spawned
+        // poll task didn't take on hardware. Tear down the SD only if it was actually
+        // mounted (never in Safe Mode, where it was never initialized).
+        if (g_restartRequested) {
+            airbridge_log("Reboot requested by command — restarting now");
+            if (g_fatfs_mounted && !g_harvesting) sd_before_restart();
+            vTaskDelay(pdMS_TO_TICKS(200));
+            esp_restart();
+        }
 
         // ── Crash-loop firewall: "mark healthy" ─────────────────────────
         // The app has now run stably past the risky init for HEALTHY_UPTIME_MS
