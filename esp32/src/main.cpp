@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260701100000"
+#define FW_VERSION "20260701110000"
 
 #include <cstring>
 #include <ctime>
@@ -1620,6 +1620,21 @@ static esp_err_t nvsSetCritical(nvs_handle_t h, const char* key, const char* val
         e = nvs_set_str(h, key, val);     // retry with reclaimed space
         log_write("NVS full — sacrificed s3up to persist creds (key=%s retry=%s)",
                   key, esp_err_to_name(e));
+    }
+    return e;
+}
+
+// u32 counterpart of nvsSetCritical — for the crash-loop counter / OTA status, which the
+// same multipart-upload churn can wedge. The counter RESET happens at the 60s healthy mark
+// (after the app has churned NVS), so it's exactly where NOT_ENOUGH_SPACE bites: the reset
+// silently fails and dbg/boots ratchets up every boot (falsely tripping Safe Mode on a later
+// non-poweron reboot). Sacrifice the expendable s3up to guarantee it lands.
+static esp_err_t nvsSetU32Critical(nvs_handle_t h, const char* key, uint32_t val) {
+    esp_err_t e = nvs_set_u32(h, key, val);
+    if (e == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        s3ClearSession();
+        e = nvs_set_u32(h, key, val);
+        log_write("NVS full — sacrificed s3up for dbg/%s (retry=%s)", key, esp_err_to_name(e));
     }
     return e;
 }
@@ -4252,16 +4267,20 @@ static void main_loop_task(void* param) {
             // a flash→crash→rollback loop and can never land).
             nvs_handle_t ho;
             if (nvs_open("ota", NVS_READWRITE, &ho) == ESP_OK) {
-                nvs_set_str(ho, "fw_ver", FW_VERSION);
-                nvs_set_str(ho, "ota_status", "ok");
+                nvsSetCritical(ho, "fw_ver", FW_VERSION);
+                nvsSetCritical(ho, "ota_status", "ok");
                 nvs_commit(ho); nvs_close(ho);
             }
             if (!g_safe_mode) {
-                // Normal, fully-healthy: also clear the crash-loop firewall.
+                // Normal, fully-healthy: also clear the crash-loop firewall. Use the
+                // s3up-sacrificing write so the reset lands even when multipart churn has
+                // filled NVS by now (otherwise dbg/boots ratchets up every boot). Also
+                // refresh g_crashBoots so the heartbeat/banner report the cleared count.
                 nvs_handle_t hd;
                 if (nvs_open("dbg", NVS_READWRITE, &hd) == ESP_OK) {
-                    nvs_set_u32(hd, "boots", 0); nvs_commit(hd); nvs_close(hd);
+                    nvsSetU32Critical(hd, "boots", 0); nvs_commit(hd); nvs_close(hd);
                 }
+                g_crashBoots = 0;
                 log_write("Healthy: %ds stable — crash-loop counter cleared, OTA confirmed",
                           HEALTHY_UPTIME_MS / 1000);
             } else {
