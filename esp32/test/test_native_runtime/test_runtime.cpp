@@ -287,6 +287,21 @@ void test_bootmode_custom_threshold(void) {
     TEST_ASSERT_EQUAL_INT(BOOT_OTA_ROLLBACK, decideBootMode(8, false, true, 5, 8));
 }
 
+void test_creds_fallback(void) {
+    // Confirmed creds (counter stays 0) never fall back.
+    TEST_ASSERT_FALSE(credsShouldFallback(0, true));
+    // No backup → nowhere to fall back to, even after many failed boots.
+    TEST_ASSERT_FALSE(credsShouldFallback(9, false));
+    // Below threshold → keep trying the new creds.
+    TEST_ASSERT_FALSE(credsShouldFallback(2, true));
+    // Unconfirmed past the threshold WITH a backup → fall back.
+    TEST_ASSERT_TRUE(credsShouldFallback(3, true));
+    TEST_ASSERT_TRUE(credsShouldFallback(7, true));
+    // Configurable threshold.
+    TEST_ASSERT_FALSE(credsShouldFallback(4, true, 5));
+    TEST_ASSERT_TRUE(credsShouldFallback(5, true, 5));
+}
+
 // ── SD recovery escalation ──────────────────────────────────────────────────
 
 void test_sd_recovery_healthy(void) {
@@ -403,6 +418,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_bootmode_pending_ota_gets_safe_mode_first);
     RUN_TEST(test_bootmode_broken_ota_rollback);
     RUN_TEST(test_bootmode_custom_threshold);
+    RUN_TEST(test_creds_fallback);
 
     RUN_TEST(test_sd_recovery_healthy);
     RUN_TEST(test_sd_recovery_degrade_band);

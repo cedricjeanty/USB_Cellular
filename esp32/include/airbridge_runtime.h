@@ -79,6 +79,20 @@ inline BootAction decideBootMode(uint32_t boots, bool wasPowerOn, bool otaPendin
     return BOOT_NORMAL;
 }
 
+// ── S3 credential confirm / fallback ─────────────────────────────────────────
+// Updating the upload credentials (api_host/api_key) is a one-way trip today: a bad set
+// (typo, wrong endpoint, rotated-but-not-yet-live key) strands the unit — it can't reach
+// the backend to be told the correct ones. So new creds are "unconfirmed" until the device
+// actually reaches the backend once (a heartbeat/command/upload succeeds), which sets a
+// confirmed flag and 0s this counter. Each boot that starts unconfirmed bumps the counter;
+// once it passes the threshold with a saved previous-known-good set available, the device
+// falls back to that set — exactly like the OTA rollback, but for creds. Confirmed creds
+// never fall back. Pure so it's unit-tested.
+inline bool credsShouldFallback(uint32_t unconfirmedBoots, bool hasBackup,
+                                uint32_t threshold = 3) {
+    return hasBackup && unconfirmedBoots >= threshold;
+}
+
 // ── SD-card runtime health / recovery escalation ────────────────────────────
 // A card that goes bad mid-flight (corrupt FAT, SPI flake) must never silently
 // wedge the unit. The firmware probes the SD periodically and feeds the count of

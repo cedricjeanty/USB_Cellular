@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260630030000"
+#define FW_VERSION "20260630040000"
 
 #include <cstring>
 #include <ctime>
@@ -1346,6 +1346,23 @@ static bool s3LoadCreds() {
         return false;
     }
     return true;
+}
+
+// Mark the active S3 creds as confirmed-working — called the first time the device
+// successfully reaches the backend (a heartbeat/command exchange returns OK). This clears
+// the unconfirmed-boot counter so credsShouldFallback stops considering a rollback: the
+// creds provably work. Idempotent + cheap (skips after the first confirm this boot).
+static void s3ConfirmCreds() {
+    static bool done = false;
+    if (done) return;
+    nvs_handle_t h;
+    if (nvs_open("s3", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "creds_ok", 1);
+        nvs_set_u32(h, "cred_boots", 0);
+        nvs_commit(h); nvs_close(h);
+        done = true;
+        log_write("S3 creds confirmed working (backend reached)");
+    }
 }
 
 // ── TLS HTTP helpers ────────────────────────────────────────────────────────
@@ -3228,8 +3245,11 @@ static void modemTask(void* param) {
                         "Host: %s\r\nx-api-key: %s\r\nContent-Type: application/json\r\n"
                         "Content-Length: %d\r\nConnection: close\r\n\r\n",
                         g_deviceId, g_apiHost, g_apiKey, blen);
-                    if (tls_write_all(tls, hdr, hlen) && tls_write_all(tls, hbBody, blen))
-                        httpReadResponse(tls);
+                    if (tls_write_all(tls, hdr, hlen) && tls_write_all(tls, hbBody, blen)) {
+                        std::string resp = httpReadResponse(tls);
+                        // Backend reached + accepted → the active creds provably work.
+                        if (resp.find("\"ok\"") != std::string::npos) s3ConfirmCreds();
+                    }
                     tls_destroy(tls);
                 } while (0);
                 hbRunning = false;
@@ -4418,14 +4438,21 @@ extern "C" void app_main(void) {
     // ── Provision S3 upload credentials on first boot ───────────────────
     {
         nvs_handle_t h;
-        if (nvs_open("s3", NVS_READWRITE, &h) == ESP_OK) {
-            char tmp[4] = "";
-            size_t len = sizeof(tmp);
-            if (nvs_get_str(h, "api_host", tmp, &len) != ESP_OK || tmp[0] == '\0') {
-                nvs_set_str(h, "api_host", "disw6oxjed.execute-api.us-west-2.amazonaws.com");
-                nvs_set_str(h, "api_key",  "7fFErx7ZCt9Vr2fvYfyOT7YxxeEjay4G5bpmfYdm");
-                nvs_commit(h);
-                ESP_LOGI(TAG, "S3 upload credentials provisioned");
+        esp_err_t oe = nvs_open("s3", NVS_READWRITE, &h);
+        if (oe == ESP_OK) {
+            // Probe existence via the length query (NULL out). The old code read into a
+            // 4-byte buffer, so a ~50-char host ALWAYS returned INVALID_LENGTH != ESP_OK →
+            // it re-provisioned the defaults on every boot (harmless writes, but masked any
+            // real commit failure). Now provision only when genuinely absent, and log the
+            // set/commit result so a failing NVS is visible instead of silently losing creds.
+            size_t need = 0;
+            esp_err_t ge = nvs_get_str(h, "api_host", nullptr, &need);
+            if (ge != ESP_OK || need <= 1) {
+                esp_err_t e1 = nvs_set_str(h, "api_host", "disw6oxjed.execute-api.us-west-2.amazonaws.com");
+                esp_err_t e2 = nvs_set_str(h, "api_key",  "7fFErx7ZCt9Vr2fvYfyOT7YxxeEjay4G5bpmfYdm");
+                esp_err_t ec = nvs_commit(h);
+                ESP_LOGW(TAG, "S3 creds provisioned: set=%s/%s commit=%s",
+                         esp_err_to_name(e1), esp_err_to_name(e2), esp_err_to_name(ec));
             }
             // Device ID from MAC.
             uint8_t mac[6];
@@ -4456,7 +4483,36 @@ extern "C" void app_main(void) {
                 ESP_LOGI(TAG, "Device ID: %s", macStr);
             }
 #endif
+            // ── S3 credential confirm / fallback ────────────────────────
+            // Roll back to the last known-good creds if the active set has never reached
+            // the backend after several boots (see credsShouldFallback + s3ConfirmCreds).
+            uint8_t credsOk = 0; nvs_get_u8(h, "creds_ok", &credsOk);
+            if (credsOk != 1) {
+                uint32_t cb = 0; nvs_get_u32(h, "cred_boots", &cb); cb++;
+                nvs_set_u32(h, "cred_boots", cb); nvs_commit(h);
+                char bakHost[128] = ""; size_t bl = sizeof(bakHost);
+                bool hasBak = (nvs_get_str(h, "api_host_bak", bakHost, &bl) == ESP_OK && bakHost[0]);
+                if (credsShouldFallback(cb, hasBak)) {
+                    char bakKey[64] = ""; size_t kl = sizeof(bakKey);
+                    nvs_get_str(h, "api_key_bak", bakKey, &kl);
+                    nvs_set_str(h, "api_host", bakHost);
+                    nvs_set_str(h, "api_key",  bakKey);
+                    nvs_set_u32(h, "cred_boots", 0);
+                    nvs_commit(h);
+                    ESP_LOGW(TAG, "S3 creds: %u unconfirmed boots — rolled back to previous known-good (%s)",
+                             (unsigned)cb, bakHost);
+                }
+            }
+            // Diagnostic: read back what's actually stored so a silent NVS failure is visible.
+            char vHost[128] = "", vId[40] = "";
+            size_t vhl = sizeof(vHost), vil = sizeof(vId);
+            nvs_get_str(h, "api_host", vHost, &vhl);
+            nvs_get_str(h, "device_id", vId, &vil);
+            ESP_LOGW(TAG, "S3 NVS readback: api_host=%s device_id=%s creds_ok=%u",
+                     vHost[0] ? "SET" : "EMPTY", vId[0] ? vId : "EMPTY", credsOk);
             nvs_close(h);
+        } else {
+            ESP_LOGE(TAG, "S3 NVS open FAILED: %s — creds/device_id cannot persist!", esp_err_to_name(oe));
         }
     }
 

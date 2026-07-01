@@ -48,8 +48,21 @@ inline CliResult cliSetS3(const char* args) {
         return r;
     }
     if (g_hal && g_hal->nvs) {
+        // Back up the current (last known-good) creds before overwriting, so a bad update
+        // can auto-roll-back if it can't reach the backend (see credsShouldFallback). Only
+        // back up when actually changing them, so re-sending the same set can't clobber a
+        // good backup.
+        char curHost[128] = "", curKey[64] = "";
+        g_hal->nvs->get_str("s3", "api_host", curHost, sizeof(curHost));
+        g_hal->nvs->get_str("s3", "api_key",  curKey,  sizeof(curKey));
+        if (curHost[0] && (strcmp(curHost, apiHost) != 0 || strcmp(curKey, apiKey) != 0)) {
+            g_hal->nvs->set_str("s3", "api_host_bak", curHost);
+            g_hal->nvs->set_str("s3", "api_key_bak",  curKey);
+        }
         g_hal->nvs->set_str("s3", "api_host", apiHost);
-        g_hal->nvs->set_str("s3", "api_key", apiKey);
+        g_hal->nvs->set_str("s3", "api_key",  apiKey);
+        g_hal->nvs->set_u8 ("s3", "creds_ok", 0);   // unconfirmed until a backend contact succeeds
+        g_hal->nvs->set_u32("s3", "cred_boots", 0);
     }
     snprintf(r.output, sizeof(r.output), "S3 saved: api_host=%s", apiHost);
     return r;
