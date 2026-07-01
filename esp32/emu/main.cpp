@@ -212,6 +212,7 @@ static bool     s_hostWasConnected = false;
 static bool     s_harvesting = false;
 static uint32_t s_lastWriteMs = 0;
 static bool     s_bootHarvestPending = false;
+static bool     s_bootRecoveryHarvest = false;  // harvest of pre-existing (possibly truncated) files
 static uint32_t s_lastHarvestMs = 0;
 static uint32_t s_harvestCoolMs = 30000;  // initial cooldown, then QUIET_WINDOW_MS
 
@@ -1303,9 +1304,10 @@ int main(int argc, char* argv[]) {
         // Harvest trigger — uses shared shouldHarvest() (same logic as firmware)
         if (shouldHarvest(s_harvesting, s_writeDetected, s_hostWasConnected,
                           s_lastWriteMs, s_lastHarvestMs, s_harvestCoolMs, now, s_bootHarvestPending)) {
-            if (s_bootHarvestPending)
+            if (s_bootHarvestPending) {
                 printf("[Harvest] Triggering (boot scan — no quiet window)\n");
-            else
+                s_bootRecoveryHarvest = true;   // last flight may be a partial interrupted transfer
+            } else
                 printf("[Harvest] Triggering (%.1f MB written, %us idle)\n",
                        ds.hostWrittenMb, (now - s_lastWriteMs) / 1000);
             s_bootHarvestPending = false;
@@ -1342,17 +1344,24 @@ int main(int argc, char* argv[]) {
             s_harvestRetries = 0;
             ds.mbQueued += r.usedMb;
 
-            // Write DSU cookie if flight history files were harvested
+            // Write DSU cookie if flight history files were harvested. On a boot-recovery
+            // harvest the last flight may be a TRUNCATED interrupted transfer, so back the
+            // cookie off by one to re-request it (shared recoveryCookieFlight, same as firmware).
+            uint32_t cookieFlight = recoveryCookieFlight(r.maxFlight, s_bootRecoveryHarvest);
+            if (cookieFlight != r.maxFlight)
+                printf("[Harvest] Boot recovery: last flight %u may be partial — cookie backed off to %u\n",
+                       r.maxFlight, cookieFlight);
+            s_bootRecoveryHarvest = false;  // consumed (this harvest completed past the retry guard)
             if (r.maxFlight > 0 && r.dsuSerial[0]) {
                 uint8_t cookie[78];
-                buildDsuCookie(r.dsuSerial, r.maxFlight, cookie);
+                buildDsuCookie(r.dsuSerial, cookieFlight, cookie);
                 char cookiePath[256];
                 snprintf(cookiePath, sizeof(cookiePath), "%s/dsuCookie.easdf", SD_ROOT);
                 void* cf = g_hal->filesys->open(cookiePath, "wb");
                 if (cf) {
                     g_hal->filesys->write(cf, cookie, 78);
                     g_hal->filesys->close(cf);
-                    printf("[Harvest] Cookie: %s flight %u\n", r.dsuSerial, r.maxFlight);
+                    printf("[Harvest] Cookie: %s flight %u\n", r.dsuSerial, cookieFlight);
                 }
             }
 

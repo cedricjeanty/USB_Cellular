@@ -266,11 +266,26 @@ void test_harvest_no_compress_verbatim(void) {
 }
 #endif
 
+// recoveryCookieFlight: normal harvest keeps maxFlight; boot-recovery backs off by one to
+// re-request the possibly-partial last flight (DSU resumes at cookie+1). Never underflows.
+void test_recovery_cookie_backoff(void) {
+    // Normal harvest (complete transfer): cookie = maxFlight, DSU resumes at maxFlight+1.
+    TEST_ASSERT_EQUAL_UINT32(1077, recoveryCookieFlight(1077, false));
+    TEST_ASSERT_EQUAL_UINT32(5,    recoveryCookieFlight(5,    false));
+    // Boot recovery (possibly truncated last flight): back off one → DSU re-sends it.
+    TEST_ASSERT_EQUAL_UINT32(1076, recoveryCookieFlight(1077, true));
+    TEST_ASSERT_EQUAL_UINT32(0,    recoveryCookieFlight(1,    true));   // flight 1 partial → re-send all
+    // maxFlight==0 (nothing parseable): no cookie should be written; never underflow.
+    TEST_ASSERT_EQUAL_UINT32(0,    recoveryCookieFlight(0,    true));
+    TEST_ASSERT_EQUAL_UINT32(0,    recoveryCookieFlight(0,    false));
+}
+
 // ── Test runner ─────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
     UNITY_BEGIN();
 
+    RUN_TEST(test_recovery_cookie_backoff);
     RUN_TEST(test_harvest_empty_dir);
     RUN_TEST(test_harvest_single_file);
     RUN_TEST(test_harvest_skips_system_files);

@@ -45,6 +45,20 @@ struct HarvestResult {
                           // the emulator models the device's on-device gzip throughput off it)
 };
 
+// Flight number to write into the DSU cookie after a harvest. The cookie holds the LAST
+// fully-downloaded flight N; the DSU resumes at N+1 (buildDsuCookie + upper_bound semantics).
+// A NORMAL (15s-quiet) harvest sees the DSU's *finished* write, so every flight up to
+// maxFlight is complete → cookie = maxFlight. A BOOT-RECOVERY harvest, though, may be
+// reconciling a TRUNCATED interrupted transfer whose LAST flight (maxFlight) could be only
+// PARTIALLY written — and lastRecordFromLog cannot tell a flight's mid record from its last —
+// so back the cookie off by one to RE-REQUEST that flight (the DSU re-sends it whole next
+// cycle). This never loses the tail of a partial flight; worst case it re-sends one
+// already-complete flight, which is then harvested normally so the cookie advances (no loop).
+inline uint32_t recoveryCookieFlight(uint32_t maxFlight, bool bootRecovery) {
+    if (bootRecovery && maxFlight > 0) return maxFlight - 1;
+    return maxFlight;
+}
+
 // HAL filesys adapter for lastRecordFromLog. Wraps a HAL file handle so the
 // content parser can do random-access reads via the same I/O abstraction.
 struct HalLogReader {

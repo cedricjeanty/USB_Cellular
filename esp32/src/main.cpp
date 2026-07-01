@@ -362,6 +362,9 @@ static BYTE g_fatfs_pdrv = 0xFF;  // FATFS drive number, persists across mount/u
 static volatile bool     g_hostConnected    = false;
 static volatile bool     g_hostWasConnected = false;
 static volatile bool     g_bootHarvestPending = false; // set by boot scan; bypasses quiet window
+static volatile bool     g_bootRecoveryHarvest = false;// this harvest is of pre-existing files that
+                                                       // may be a TRUNCATED interrupted transfer — its
+                                                       // last flight is possibly partial, so re-request it
 static volatile uint32_t g_lastIoMs         = 0;
 static volatile uint32_t g_lastWriteMs      = 0;
 static volatile bool     g_writeDetected    = false;
@@ -4016,10 +4019,23 @@ static void doHarvest() {
         s_lastHarvestWrittenMb = g_hostWrittenMb;  // snapshot only on a completed harvest
     }
 
-    // Write DSU cookie to the partition the DSU reads from
+    // Write DSU cookie to the partition the DSU reads from.
+    // Cookie semantics: it holds the LAST fully-downloaded flight N; the DSU resumes at N+1.
+    // For a NORMAL harvest (15s-quiet ⇒ the DSU finished writing) maxFlight is a complete
+    // flight, so cookie = maxFlight. But a BOOT-RECOVERY harvest may be reconciling a
+    // TRUNCATED interrupted transfer whose LAST flight (maxFlight) could be only partially
+    // written — lastRecordFromLog can't tell a flight's mid record from its last. So back the
+    // cookie off by one (cookie = maxFlight-1) to RE-REQUEST that last flight; the earlier
+    // flights are wholly before it and stay acknowledged. Worst case re-sends one already-
+    // complete flight (harvested normally next cycle → cookie advances, no loop); it NEVER
+    // loses the tail of a partially-transferred flight. Only ever applied on boot recovery.
+    uint32_t cookieFlight = recoveryCookieFlight(hr.maxFlight, g_bootRecoveryHarvest);
+    if (cookieFlight != hr.maxFlight)
+        log_write("Boot recovery: last flight %lu may be a partial transfer — cookie backed off to %lu (re-request)",
+                  (unsigned long)hr.maxFlight, (unsigned long)cookieFlight);
     if (count > 0 && !harvestIncomplete && !g_s3CookieActive && hr.maxFlight > 0 && hr.dsuSerial[0]) {
         uint8_t cookie[78];
-        buildDsuCookie(hr.dsuSerial, hr.maxFlight, cookie);
+        buildDsuCookie(hr.dsuSerial, cookieFlight, cookie);
         if (g_dual_partition && dsu_mounted) {
             // Write directly to /dsu (P1 is still mounted)
             char cookiePath[64];
@@ -4029,9 +4045,12 @@ static void doHarvest() {
         } else {
             write_cookie_to_dsu(cookie, 78);
         }
-        log_write("Cookie: %s flight %lu", hr.dsuSerial, (unsigned long)hr.maxFlight);
-        cdc_printf("Cookie: %s flight %lu\r\n", hr.dsuSerial, (unsigned long)hr.maxFlight);
+        log_write("Cookie: %s flight %lu", hr.dsuSerial, (unsigned long)cookieFlight);
+        cdc_printf("Cookie: %s flight %lu\r\n", hr.dsuSerial, (unsigned long)cookieFlight);
     }
+    // Consume the boot-recovery flag only on a COMPLETED harvest — an incomplete retry
+    // must keep it so the retry still backs the cookie off.
+    if (!harvestIncomplete) g_bootRecoveryHarvest = false;
 
     // Unified command file (runtime) — the host may have dropped airbridge.cmd on
     // the USB-visible volume; process runtime-safe directives (dump_logs/wifi/s3/
@@ -4372,9 +4391,10 @@ static void main_loop_task(void* param) {
         uint32_t lastWr = g_lastWriteMs;
         if (shouldHarvest(g_harvesting, g_writeDetected, g_hostWasConnected,
                           lastWr, g_lastHarvestMs, g_harvestCoolMs, now, g_bootHarvestPending)) {
-            if (g_bootHarvestPending)
+            if (g_bootHarvestPending) {
                 log_write("Harvest trigger: boot scan (no quiet window)");
-            else
+                g_bootRecoveryHarvest = true;   // last flight may be a partial interrupted transfer
+            } else
                 log_write("Harvest trigger: %.1fKB, %us idle", g_hostWrittenMb * 1024.0f, (now - lastWr) / 1000);
             g_bootHarvestPending = false;
             if (g_harvest_task) xTaskNotifyGive(g_harvest_task);
