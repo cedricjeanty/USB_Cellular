@@ -87,27 +87,43 @@ write_cmd_and_cookie() {
 CURSOR=/tmp/soak_next_flight
 FEEDON=/tmp/soak_feed_on
 
-feed_one_flight() {   # $1 = flight number; write it to the USB volume; nonzero if the device is gone
-    local f="$1" dev
-    dev=$(find_usb_part) || return 1
-    sudo mount -o noatime,uid=$(id -u),gid=$(id -g) "$dev" /mnt 2>/dev/null || return 1
-    $HOSTDSU --mount /mnt --serial "$SERIAL" --max-flight "$f" --size-kb "$FLIGHT_KB" \
-             --compressible --ignore-cookie >/dev/null 2>&1
-    local rc=$?
+# Returns: 0=written, 1=device gone (power cut), 2=transient (device busy harvesting).
+# The device briefly drops/holds its USB volume while it harvests each flight, so a
+# failed mount is usually transient — the caller retries rather than quitting the cycle.
+feed_one_flight() {   # $1 = flight number
+    local f="$1" dev d w
+    dev=""
+    for w in $(seq 1 8); do
+        for d in /dev/sda1 /dev/sdb1 /dev/sdc1 /dev/sdd1; do [ -b "$d" ] && { dev="$d"; break; }; done
+        [ -n "$dev" ] && break
+        sleep 1
+    done
+    [ -z "$dev" ] && return 1                          # no USB → device is off (cut)
+    sudo mount -o noatime,uid=$(id -u),gid=$(id -g) "$dev" /mnt 2>/dev/null || return 2   # busy → retry
+    if ! $HOSTDSU --mount /mnt --serial "$SERIAL" --max-flight "$f" --size-kb "$FLIGHT_KB" \
+                  --compressible --ignore-cookie >/dev/null 2>&1; then
+        sync 2>/dev/null; sudo umount /mnt 2>/dev/null || sudo umount -l /mnt 2>/dev/null
+        return 2
+    fi
     sync 2>/dev/null; sudo umount /mnt 2>/dev/null || sudo umount -l /mnt 2>/dev/null
-    return $rc
+    return 0
 }
 
-run_feeder() {   # background: dribble remaining flights until stopped or the whole backlog is written
+run_feeder() {   # background: keep the device continuously fed so cuts land mid-work + a backlog builds
+    local misses=0
     while [ -f "$FEEDON" ]; do
         local f; f=$(cat "$CURSOR" 2>/dev/null || echo 1)
-        [ "$f" -gt "$NFLIGHTS" ] && break
-        if feed_one_flight "$f"; then
-            echo $((f+1)) > "$CURSOR"; log "  fed flight $f/$NFLIGHTS"
+        [ "$f" -gt "$NFLIGHTS" ] && break             # whole backlog transferred
+        feed_one_flight "$f"; local rc=$?
+        if [ "$rc" = 0 ]; then
+            echo $((f+1)) > "$CURSOR"; log "  fed flight $f/$NFLIGHTS"; misses=0
+            local g=0; while [ -f "$FEEDON" ] && [ "$g" -lt "$FEED_GAP" ]; do sleep 1; g=$((g+1)); done
+        elif [ "$rc" = 1 ]; then
+            misses=$((misses+1)); [ "$misses" -ge 20 ] && break   # ~20s no USB → power was cut
+            sleep 1
         else
-            break                          # device off (cut) or mount failed — stop this cycle
+            sleep 3                                    # device busy harvesting — retry same flight
         fi
-        local g=0; while [ -f "$FEEDON" ] && [ "$g" -lt "$FEED_GAP" ]; do sleep 1; g=$((g+1)); done
     done
 }
 
