@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260630060000"
+#define FW_VERSION "20260630070000"
 
 #include <cstring>
 #include <ctime>
@@ -4541,6 +4541,25 @@ extern "C" void app_main(void) {
     {
         nvs_handle_t h;
         esp_err_t oe = nvs_open("s3", NVS_READWRITE, &h);
+        // Credentials must WIN the NVS space race. The 20 KB (4-page) NVS is churned every
+        // upload (s3up etags/uploadId) and every boot (dbg counters); its free-entry pool can
+        // intermittently run dry, and if a creds open/write lands in that window the device
+        // loses its identity (device= empty, "No S3 credentials") — seen under power-cut soak
+        // stress. Escalate to guarantee the open succeeds: sacrifice the expendable
+        // multipart-resume namespace first (a dropped upload just restarts), then, if still
+        // wedged by stale entries elsewhere, wipe NVS wholesale — everything but the creds is
+        // regenerable and the creds are re-provisioned just below into a clean partition.
+        if (oe == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+            log_write("S3 NVS open full — clearing s3up to make room for creds");
+            s3ClearSession();
+            oe = nvs_open("s3", NVS_READWRITE, &h);
+            if (oe != ESP_OK) {
+                log_write("S3 NVS still full — erasing NVS to guarantee creds (was %s)", esp_err_to_name(oe));
+                nvs_flash_erase();
+                nvs_flash_init();
+                oe = nvs_open("s3", NVS_READWRITE, &h);
+            }
+        }
         if (oe == ESP_OK) {
             // Probe existence via the length query (NULL out). The old code read into a
             // 4-byte buffer, so a ~50-char host ALWAYS returned INVALID_LENGTH != ESP_OK →
