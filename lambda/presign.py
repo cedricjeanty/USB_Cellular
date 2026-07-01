@@ -8,6 +8,7 @@ Routes:
   POST /aircraft/manifest   — Update manifest with a newly uploaded file
 """
 
+import base64
 import json
 import math
 import os
@@ -232,6 +233,25 @@ def handler(event, context):
             s3.put_object(Bucket=bucket, Key=key,
                           Body=body.encode("utf-8"), ContentType="application/json")
             return respond(200, {"ok": True})
+        except Exception as e:
+            return respond(500, {"error": str(e)})
+
+    elif path == "/command/coredump" and method == "POST":
+        # A unit that panicked ships its ELF coredump here over the SD-independent
+        # cellular path (base64 text body), so a FIELD crash is decodable remotely
+        # (esptool + espcoredump) — no physical BOOT-download read ever needed.
+        # Stored latest-wins at coredump/{device}.elf; the device erases its on-flash
+        # image only after this returns {"ok":true}.
+        device = params.get("device", "")
+        if not device:
+            return respond(400, {"error": "device required"})
+        body = event.get("body", "") or ""
+        try:
+            raw = base64.b64decode(body, validate=False)
+            key = f"coredump/{device}.elf"
+            s3.put_object(Bucket=bucket, Key=key, Body=raw,
+                          ContentType="application/octet-stream")
+            return respond(200, {"ok": True, "bytes": len(raw)})
         except Exception as e:
             return respond(500, {"error": str(e)})
 

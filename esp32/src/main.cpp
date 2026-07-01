@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260630040000"
+#define FW_VERSION "20260630050000"
 
 #include <cstring>
 #include <ctime>
@@ -73,6 +73,8 @@
 #include "esp_netif_net_stack.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "esp_core_dump.h"
+#include "mbedtls/base64.h"
 
 static const char *TAG = "airbridge";
 
@@ -1483,6 +1485,72 @@ static bool tls_write_all(esp_tls_t* tls, const char* data, size_t len) {
         } else return false;
     }
     return true;
+}
+
+// ── Remote coredump egress ────────────────────────────────────────────────
+// If the previous boot panicked, ESP-IDF wrote an ELF coredump to the dedicated
+// `coredump` flash partition (CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH). Read it,
+// base64-encode it, and POST it over the SAME SD-independent cellular path to
+// /command/coredump — so a FIELD panic is decodable remotely (esptool +
+// espcoredump), never needing a physical BOOT-download read. Runs in BOTH normal
+// and Safe Mode; the image is erased ONLY after a confirmed 200, so a lost POST on
+// a flaky link just retries next cycle. OTA leaves this partition intact, so a
+// unit that self-heals to new firmware still ships its predecessor's crash dump.
+static volatile bool g_cdDone    = false;   // egressed (or permanently skipped) — stop retrying
+static volatile bool g_cdRunning = false;
+static void egressCoredumpTask(void*) {
+    do {
+        size_t addr = 0, size = 0;
+        if (esp_core_dump_image_get(&addr, &size) != ESP_OK || size == 0) { g_cdDone = true; break; }
+        if (size > 128 * 1024) { airbridge_log("Coredump too large — skipping egress"); g_cdDone = true; break; }
+        const esp_partition_t* part = esp_partition_find_first(
+            ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_COREDUMP, NULL);
+        if (!part) { g_cdDone = true; break; }
+        uint8_t* raw = (uint8_t*)heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+        if (!raw) break;                                 // transient OOM — retry later
+        if (esp_partition_read(part, 0, raw, size) != ESP_OK) { heap_caps_free(raw); g_cdDone = true; break; }
+        size_t b64cap = ((size + 2) / 3) * 4 + 8;
+        char* b64 = (char*)heap_caps_malloc(b64cap, MALLOC_CAP_SPIRAM);
+        if (!b64) { heap_caps_free(raw); break; }        // transient OOM — retry later
+        size_t b64len = 0;
+        int e = mbedtls_base64_encode((unsigned char*)b64, b64cap, &b64len, raw, size);
+        heap_caps_free(raw);
+        if (e != 0) { heap_caps_free(b64); g_cdDone = true; break; }
+        log_write("Coredump present (%u bytes) — egressing over cellular", (unsigned)size);
+        bool ok = false;
+        if (s3LoadCreds()) {
+            esp_tls_t* tls = tls_connect(g_apiHost);
+            if (tls) {
+                char hdr[512];
+                int hlen = snprintf(hdr, sizeof(hdr),
+                    "POST /prod/command/coredump?device=%s HTTP/1.1\r\n"
+                    "Host: %s\r\nx-api-key: %s\r\nContent-Type: text/plain\r\n"
+                    "Content-Length: %u\r\nConnection: close\r\n\r\n",
+                    g_deviceId, g_apiHost, g_apiKey, (unsigned)b64len);
+                ok = tls_write_all(tls, hdr, hlen);
+                for (size_t off = 0; ok && off < b64len; ) {
+                    size_t n = b64len - off; if (n > 4096) n = 4096;
+                    ok = tls_write_all(tls, b64 + off, n);
+                    off += n;
+                }
+                if (ok) {
+                    std::string resp = httpReadResponse(tls);
+                    ok = resp.find("\"ok\"") != std::string::npos;
+                }
+                tls_destroy(tls);
+            }
+        }
+        heap_caps_free(b64);
+        if (ok) {
+            airbridge_log("Coredump egressed OK — erasing image");
+            esp_core_dump_image_erase();
+            g_cdDone = true;
+        } else {
+            airbridge_log("Coredump egress failed — will retry next cycle");
+        }
+    } while (0);
+    g_cdRunning = false;
+    vTaskDelete(nullptr);
 }
 
 // Stream `len` bytes from an open file to TLS connection.
@@ -3255,6 +3323,19 @@ static void modemTask(void* param) {
                 hbRunning = false;
                 vTaskDelete(nullptr);
             }, "heartbeat", 8192, nullptr, 2, nullptr, 1);
+        }
+
+        // ── One-shot coredump egress (survival plane) ────────────────────
+        // Ship any pending panic dump over cellular so a field crash is
+        // decodable remotely. Same SD-independent path; retries until a 200,
+        // then erases. Spawned (not inline) so it never blocks the PPP pump.
+        if (!g_cdDone && !g_cdRunning && g_pppConnected && g_deviceId[0]) {
+            static uint32_t lastCdMs = 0;
+            if (lastCdMs == 0 || (millis() - lastCdMs) > 60000) {
+                lastCdMs = millis();
+                g_cdRunning = true;
+                xTaskCreatePinnedToCore(egressCoredumpTask, "coredump", 12288, nullptr, 2, nullptr, 1);
+            }
         }
 
         // Upload log to S3 via /prod/log/append (incremental, per-session)
