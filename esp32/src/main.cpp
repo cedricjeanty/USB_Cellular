@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260630080000"
+#define FW_VERSION "20260701100000"
 
 #include <cstring>
 #include <ctime>
@@ -1335,18 +1335,33 @@ static char g_deviceId[24] = "";  // 12-hex MAC id, or "TEST_<12hex>" (17) in e2
 static bool s3LoadCreds() {
     if (g_apiHost[0] && g_apiKey[0] && g_deviceId[0]) return true;
     nvs_handle_t h;
-    if (nvs_open("s3", NVS_READONLY, &h) != ESP_OK) {
-        cdc_printf("S3: no credentials in NVS\r\n");
-        return false;
+    if (nvs_open("s3", NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_string(h, "api_host",  g_apiHost,   sizeof(g_apiHost));
+        nvs_get_string(h, "api_key",   g_apiKey,    sizeof(g_apiKey));
+        nvs_get_string(h, "device_id", g_deviceId,  sizeof(g_deviceId));
+        nvs_close(h);
     }
-    nvs_get_string(h, "api_host", g_apiHost, sizeof(g_apiHost));
-    nvs_get_string(h, "api_key",  g_apiKey,  sizeof(g_apiKey));
-    nvs_get_string(h, "device_id", g_deviceId, sizeof(g_deviceId));
-    nvs_close(h);
-    if (!g_apiHost[0] || !g_apiKey[0]) {
-        cdc_printf("S3: no credentials in NVS\r\n");
-        return false;
+    // FALLBACK — credentials must NEVER depend on NVS being intact. The 20 KB NVS can
+    // lose entries under power-cut churn/fragmentation; without this the device goes dark
+    // (device= empty, "No S3 credentials", flights stuck) — the exact power-cut-soak
+    // failure. All three fields are ALWAYS reconstructable: the api host/key are the SHARED
+    // backend creds (the same compiled default the provisioner writes for every unit), and
+    // device_id derives from the immutable chip MAC. So the device can never lose its
+    // identity to an NVS fault; NVS merely overrides these when present. This makes the
+    // whole NVS-durability problem moot for staying reachable + uploading.
+    if (!g_deviceId[0]) {
+        uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        char m[13];
+        snprintf(m, sizeof(m), "%02X%02X%02X%02X%02X%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+#ifdef ALLOW_CDC_PERSIST
+        snprintf(g_deviceId, sizeof(g_deviceId), "TEST_%s", m);   // e2e: test-bucket routing
+#else
+        strlcpy(g_deviceId, m, sizeof(g_deviceId));
+#endif
     }
+    if (!g_apiHost[0]) strlcpy(g_apiHost, "disw6oxjed.execute-api.us-west-2.amazonaws.com", sizeof(g_apiHost));
+    if (!g_apiKey[0])  strlcpy(g_apiKey,  "7fFErx7ZCt9Vr2fvYfyOT7YxxeEjay4G5bpmfYdm",       sizeof(g_apiKey));
     return true;
 }
 
@@ -4419,6 +4434,25 @@ extern "C" void app_main(void) {
     g_hal = &s_hal;
     // uart is nullptr — mdm_* helpers fall back to raw ESP-IDF uart_* calls
 
+    // Install the NVS-independent creds fallback used by the HAL upload path
+    // (loadS3Creds). The shared api host/key + a MAC-derived device_id are always
+    // reconstructable, so no NVS fault can strand the device off the backend.
+    s3CredsFallback() = [](S3Creds* c) {
+        if (!c->apiHost[0]) strlcpy(c->apiHost, "disw6oxjed.execute-api.us-west-2.amazonaws.com", sizeof(c->apiHost));
+        if (!c->apiKey[0])  strlcpy(c->apiKey,  "7fFErx7ZCt9Vr2fvYfyOT7YxxeEjay4G5bpmfYdm",       sizeof(c->apiKey));
+        if (!c->deviceId[0]) {
+            uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_WIFI_STA);
+            char m[13];
+            snprintf(m, sizeof(m), "%02X%02X%02X%02X%02X%02X",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+#ifdef ALLOW_CDC_PERSIST
+            snprintf(c->deviceId, sizeof(c->deviceId), "TEST_%s", m);
+#else
+            strlcpy(c->deviceId, m, sizeof(c->deviceId));
+#endif
+        }
+    };
+
     // Feed the OLED connection-quality bars from the upload path's presign RTT too —
     // not just the 60s log-append probe, which starves during a long upload and let the
     // bars drop to 0 mid-transfer. Now every per-file presign refreshes the sample.
@@ -4653,6 +4687,11 @@ extern "C" void app_main(void) {
             if (provAttempt == 0) { nvs_flash_erase(); nvs_flash_init(); }
         }
     }
+
+    // Populate the cred globals now (with the MAC/shared-default fallback) so device_id is
+    // available immediately for the heartbeat/upload/command gates — never a dark window,
+    // even if NVS lost the creds this boot.
+    s3LoadCreds();
 
     // ── SAFE MODE short-circuit: survival plane only ────────────────────
     // We reached the crash-loop threshold with nothing to roll back. Do NOT touch

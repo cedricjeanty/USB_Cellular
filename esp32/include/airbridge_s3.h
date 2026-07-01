@@ -246,12 +246,24 @@ struct S3Creds {
     bool valid;
 };
 
+// Optional fallback the FIRMWARE installs so credentials never depend on NVS being
+// intact (the 20 KB NVS can lose entries under power-cut churn — the power-cut-soak
+// failure where uploads stall on "No S3 credentials"). It fills any empty field from
+// always-reconstructable sources: the shared compiled api host/key + a MAC-derived
+// device_id. The emulator/tests leave it null, so their empty-NVS semantics (a test
+// asserts loadS3Creds() is invalid on empty NVS) are unchanged.
+typedef void (*S3CredsFallbackFn)(S3Creds* c);
+inline S3CredsFallbackFn& s3CredsFallback() { static S3CredsFallbackFn fn = nullptr; return fn; }
+
 inline S3Creds loadS3Creds() {
     S3Creds c = {};
-    if (!g_hal || !g_hal->nvs) return c;
-    g_hal->nvs->get_str("s3", "api_host", c.apiHost, sizeof(c.apiHost));
-    g_hal->nvs->get_str("s3", "api_key", c.apiKey, sizeof(c.apiKey));
-    g_hal->nvs->get_str("s3", "device_id", c.deviceId, sizeof(c.deviceId));
+    if (g_hal && g_hal->nvs) {
+        g_hal->nvs->get_str("s3", "api_host", c.apiHost, sizeof(c.apiHost));
+        g_hal->nvs->get_str("s3", "api_key", c.apiKey, sizeof(c.apiKey));
+        g_hal->nvs->get_str("s3", "device_id", c.deviceId, sizeof(c.deviceId));
+    }
+    if ((!c.apiHost[0] || !c.apiKey[0] || !c.deviceId[0]) && s3CredsFallback())
+        s3CredsFallback()(&c);
     c.valid = (c.apiHost[0] && c.apiKey[0]);
     return c;
 }
