@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260630050000"
+#define FW_VERSION "20260630060000"
 
 #include <cstring>
 #include <ctime>
@@ -1586,6 +1586,27 @@ static void s3ClearSession() {
         nvs_commit(h);
         nvs_close(h);
     }
+}
+
+// Write a CRITICAL NVS key (creds / device_id) with self-healing against a full
+// partition. The NVS partition is small (20 KB); a large multipart upload that
+// never completes (e.g. the link drops mid-file) leaves its per-part etag keys in
+// the `s3up` namespace, and enough of those can wedge NVS in a partially-full state
+// where new writes fail with NOT_ENOUGH_SPACE while boot-init still succeeds (so the
+// auto-erase never fires). The symptom is brutal: credentials silently stop
+// persisting and the unit goes dark (no device_id → no auth → no upload/heartbeat/
+// egress). Resume state is EXPENDABLE (a dropped upload just restarts), so when a
+// creds write hits a full partition we sacrifice `s3up` to reclaim space and retry.
+// This lets a wedged unit self-heal over OTA instead of needing a bench NVS erase.
+static esp_err_t nvsSetCritical(nvs_handle_t h, const char* key, const char* val) {
+    esp_err_t e = nvs_set_str(h, key, val);
+    if (e == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        s3ClearSession();                 // drop expendable multipart-resume state
+        e = nvs_set_str(h, key, val);     // retry with reclaimed space
+        log_write("NVS full — sacrificed s3up to persist creds (key=%s retry=%s)",
+                  key, esp_err_to_name(e));
+    }
+    return e;
 }
 
 // urlEncode(), jsonStr(), jsonInt(), parseUrl() — moved to airbridge_utils.h
@@ -4529,11 +4550,11 @@ extern "C" void app_main(void) {
             size_t need = 0;
             esp_err_t ge = nvs_get_str(h, "api_host", nullptr, &need);
             if (ge != ESP_OK || need <= 1) {
-                esp_err_t e1 = nvs_set_str(h, "api_host", "disw6oxjed.execute-api.us-west-2.amazonaws.com");
-                esp_err_t e2 = nvs_set_str(h, "api_key",  "7fFErx7ZCt9Vr2fvYfyOT7YxxeEjay4G5bpmfYdm");
+                esp_err_t e1 = nvsSetCritical(h, "api_host", "disw6oxjed.execute-api.us-west-2.amazonaws.com");
+                esp_err_t e2 = nvsSetCritical(h, "api_key",  "7fFErx7ZCt9Vr2fvYfyOT7YxxeEjay4G5bpmfYdm");
                 esp_err_t ec = nvs_commit(h);
-                ESP_LOGW(TAG, "S3 creds provisioned: set=%s/%s commit=%s",
-                         esp_err_to_name(e1), esp_err_to_name(e2), esp_err_to_name(ec));
+                log_write("S3 creds provisioned: set=%s/%s commit=%s",
+                          esp_err_to_name(e1), esp_err_to_name(e2), esp_err_to_name(ec));
             }
             // Device ID from MAC.
             uint8_t mac[6];
@@ -4551,17 +4572,17 @@ extern "C" void app_main(void) {
             if (strncmp(curId, "TEST_", 5) != 0) {
                 char id[40];
                 snprintf(id, sizeof(id), "TEST_%s", macStr);
-                nvs_set_str(h, "device_id", id);
+                esp_err_t de = nvsSetCritical(h, "device_id", id);
                 nvs_commit(h);
-                ESP_LOGW(TAG, "E2E build: device_id forced to %s (test-bucket routing)", id);
+                log_write("E2E build: device_id forced to %s set=%s", id, esp_err_to_name(de));
             }
 #else
             // Production: ensure the real MAC id; strip any leftover TEST_ identity
             // from a prior e2e build so routing returns to the production bucket.
             if (!haveId || strncmp(curId, "TEST_", 5) == 0) {
-                nvs_set_str(h, "device_id", macStr);
+                esp_err_t de = nvsSetCritical(h, "device_id", macStr);
                 nvs_commit(h);
-                ESP_LOGI(TAG, "Device ID: %s", macStr);
+                log_write("Device ID: %s set=%s", macStr, esp_err_to_name(de));
             }
 #endif
             // ── S3 credential confirm / fallback ────────────────────────
@@ -4589,11 +4610,11 @@ extern "C" void app_main(void) {
             size_t vhl = sizeof(vHost), vil = sizeof(vId);
             nvs_get_str(h, "api_host", vHost, &vhl);
             nvs_get_str(h, "device_id", vId, &vil);
-            ESP_LOGW(TAG, "S3 NVS readback: api_host=%s device_id=%s creds_ok=%u",
-                     vHost[0] ? "SET" : "EMPTY", vId[0] ? vId : "EMPTY", credsOk);
+            log_write("S3 NVS readback: api_host=%s device_id=%s creds_ok=%u",
+                      vHost[0] ? "SET" : "EMPTY", vId[0] ? vId : "EMPTY", credsOk);
             nvs_close(h);
         } else {
-            ESP_LOGE(TAG, "S3 NVS open FAILED: %s — creds/device_id cannot persist!", esp_err_to_name(oe));
+            log_write("S3 NVS open FAILED: %s — creds/device_id cannot persist!", esp_err_to_name(oe));
         }
     }
 
