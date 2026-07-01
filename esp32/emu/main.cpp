@@ -103,7 +103,7 @@ static time_t      s_cellFileMtime = 0;
 // EMU_DSU_DELAY_MS after boot (the 90s USB-present moment). Models a NEW aircraft
 // whose full log backlog lives in the DSU and must transfer over USB before the
 // device can upload it. See dsuTransferThread() + scripts/flight_cycle_test.sh.
-static std::atomic<bool> s_dsuStop{false};
+static volatile bool s_dsuStop = false;  // one-shot power-off flag (main thread → DSU thread)
 
 // EMU_COMPRESS=1: gzip .eaofh files into the upload queue at harvest (~3x fewer
 // bytes on the cellular PUT). Mirrors the firmware's opt-in compression.
@@ -531,6 +531,7 @@ static void dsuTransferThread(std::string internalPath, uint32_t delayMs, std::s
     SimDSU dsu;
     dsu.sdRoot = sdRoot.c_str();
     dsu.internalMemoryPath = internalPath.c_str();
+    dsu.stopFlag = &s_dsuStop;   // power-off interrupts a transfer mid-write (non-atomic DSU)
     if (const char* m = getenv("EMU_DSU_KBPS"); m && atoi(m) > 0) dsu.writeSpeedKBps = atoi(m);
 
     uint32_t cookie = dsu.readCookie();

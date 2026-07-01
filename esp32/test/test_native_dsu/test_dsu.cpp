@@ -495,12 +495,15 @@ void test_transfer_flight_atomic_and_content(void) {
     TEST_ASSERT_EQUAL_UINT32(2, r.flightNum);
     TEST_ASSERT_GREATER_THAN_UINT32(15 * 1024, r.bytesWritten);
 
-    // The .part temp must be gone (atomic rename), and the real file present.
+    // Non-atomic DSU: the flight is written DIRECTLY to its .eaofh (no temp), so a
+    // clean transfer leaves no .part — and neither would an interrupted one (it would
+    // leave a TRUNCATED .eaofh instead; see test_transfer_flight_interrupted).
     char fhDir[300];
     snprintf(fhDir, sizeof(fhDir), "%s/flightHistory", TEST_SD);
     char findPart[400];
     snprintf(findPart, sizeof(findPart), "ls %s/.*.part >/dev/null 2>&1", fhDir);
-    TEST_ASSERT_NOT_EQUAL(0, system(findPart));  // no leftover .part
+    TEST_ASSERT_NOT_EQUAL(0, system(findPart));  // no .part temp at all in the non-atomic model
+    TEST_ASSERT_FALSE(r.interrupted);            // a full, clean transfer
 
     // The transferred slice must contain flight 2 as its last record.
     char fpath[420];

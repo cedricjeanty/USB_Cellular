@@ -132,6 +132,8 @@ public:
     const char* serial = "EA500.000243";
     const char* sdRoot = "./emu_sdcard";
     int writeSpeedKBps = 500;       // throttle for copyFileSlice (~500 KB/s observed on real device)
+    volatile bool* stopFlag = nullptr;  // if set & becomes true, copyFileSlice stops mid-write
+                                        // (models a power-off mid-transfer → truncated file)
     // Path to directory containing real metric files to copy verbatim.
     // If null, fallback writes zeroed files of correct size.
     const char* metricsSource = nullptr;
@@ -149,6 +151,7 @@ public:
         uint32_t firstFlight; // first flight in downloaded slice (0 = nothing)
         uint32_t flightNum;   // last flight in downloaded slice (0 = nothing)
         uint32_t bytesWritten;
+        bool interrupted;     // transferFlight: a power-off left this file TRUNCATED
     };
 
     // Read and validate the cookie from sdRoot/dsuCookie.easdf.
@@ -271,11 +274,14 @@ public:
     // the cookie. The caller (emulator DSU thread) tracks its own forward cursor
     // so a long backlog streams flight-by-flight, each its own file — a power-off
     // mid-backlog leaves the already-transferred flights intact (incremental
-    // progress) instead of discarding a giant all-in-one slice. Atomic: writes a
-    // dot-prefixed ".part" temp (skipped by harvest) and renames on completion, so
-    // a kill mid-write never leaves a partial .eaofh the device would harvest.
-    // Rate-limited at writeSpeedKBps (models the real ~500 KB/s USB transfer).
-    // No metrics/report (lean — the soak metric comes from the flight files).
+    // progress) instead of discarding a giant all-in-one slice.
+    // NON-ATOMIC — models the REAL aircraft DSU, which writes the flight file
+    // DIRECTLY (no temp+rename). So a power-off mid-write leaves a TRUNCATED
+    // {name}.eaofh on the card that the firmware MUST reconcile (harvest it,
+    // recompute the cookie from the last complete record, present a clean volume) —
+    // NOT a clean .part the harvest could ignore. copyFileSlice honors stopFlag so
+    // the cut can land mid-file deterministically. Rate-limited at writeSpeedKBps
+    // (models the real ~500 KB/s USB transfer). No metrics/report (lean).
     SessionResult transferFlight(uint32_t flightNum) {
         SessionResult r = {};
         if (!internalMemoryPath) return r;
@@ -299,17 +305,18 @@ public:
                  usedSerial, flightNum, dateStr);
         char fhPath[384];
         snprintf(fhPath, sizeof(fhPath), "%s/flightHistory/%s", sdRoot, r.filename);
-        char tmpPath[420];
-        snprintf(tmpPath, sizeof(tmpPath), "%s/flightHistory/.%s.part", sdRoot, r.filename);
 
-        r.bytesWritten = copyFileSlice(internalMemoryPath, tmpPath,
+        // Write DIRECTLY to the final .eaofh (non-atomic, like the real DSU). If a
+        // power-off (stopFlag) lands mid-write, the file is left TRUNCATED for the
+        // firmware to reconcile. r.interrupted flags that for the caller.
+        uint64_t want = fe->blockEnd - fe->blockStart;
+        r.bytesWritten = copyFileSlice(internalMemoryPath, fhPath,
                                        fe->blockStart, fe->blockEnd);
-        if (r.bytesWritten == 0) { ::remove(tmpPath); return r; }
-        if (::rename(tmpPath, fhPath) != 0) { ::remove(tmpPath); return r; }
-
+        if (r.bytesWritten == 0) { ::remove(fhPath); return r; }
+        r.interrupted = (r.bytesWritten < want);   // partial file left on the card
         r.firstFlight = flightNum;
         r.flightNum = flightNum;
-        r.success = true;
+        r.success = !r.interrupted;                // a full flight only if not truncated
         return r;
     }
 
@@ -345,6 +352,7 @@ private:
         uint32_t total = 0;
 
         while (rem > 0) {
+            if (stopFlag && *stopFlag) break;   // power-off mid-write → leave a TRUNCATED file
             uint32_t chunk = (rem > sizeof(buf)) ? (uint32_t)sizeof(buf) : (uint32_t)rem;
             size_t got = fread(buf, 1, chunk, sf);
             if (got == 0) break;
@@ -352,8 +360,15 @@ private:
             fflush(df);
             rem -= got;
             total += (uint32_t)got;
-            if (writeSpeedKBps > 0)
-                usleep((uint32_t)(got * 1000 / writeSpeedKBps));
+            if (writeSpeedKBps > 0) {
+                // Throttle in small steps so stopFlag (power-off) is honored promptly
+                // mid-chunk instead of after a full slow sleep.
+                uint32_t usecs = (uint32_t)(got * 1000 / writeSpeedKBps);
+                while (usecs > 0 && !(stopFlag && *stopFlag)) {
+                    uint32_t step = usecs > 5000 ? 5000 : usecs;
+                    usleep(step); usecs -= step;
+                }
+            }
         }
 
         fclose(sf);
