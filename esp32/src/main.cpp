@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260630070000"
+#define FW_VERSION "20260630080000"
 
 #include <cstring>
 #include <ctime>
@@ -4537,8 +4537,15 @@ extern "C" void app_main(void) {
         ESP_LOGE(TAG, "SSD1306 failed — continuing without display");
     }
 
-    // ── Provision S3 upload credentials on first boot ───────────────────
-    {
+    // ── Provision S3 credentials — GUARANTEE they persist ───────────────
+    // Provision, then VERIFY via readback; if the creds didn't stick (the small 20 KB NVS
+    // fragmented/filled under upload+counter churn so even the tiny creds writes failed —
+    // the power-cut-soak failure, where sacrificing s3up doesn't help because s3up is empty
+    // when the device isn't uploading), wipe NVS wholesale and re-provision into a clean
+    // partition. Retry once — a freshly-erased NVS always has room for the creds, so the
+    // device can never lose its identity to churn. Everything else in NVS (dbg/wifi/ota/s3up)
+    // is regenerable.
+    for (int provAttempt = 0; provAttempt < 2; provAttempt++) {
         nvs_handle_t h;
         esp_err_t oe = nvs_open("s3", NVS_READWRITE, &h);
         // Credentials must WIN the NVS space race. The 20 KB (4-page) NVS is churned every
@@ -4632,8 +4639,18 @@ extern "C" void app_main(void) {
             log_write("S3 NVS readback: api_host=%s device_id=%s creds_ok=%u",
                       vHost[0] ? "SET" : "EMPTY", vId[0] ? vId : "EMPTY", credsOk);
             nvs_close(h);
+            // VERIFY the creds actually persisted; if not, wipe + re-provision next pass.
+            if (vHost[0] && vId[0]) break;   // creds present — done
+            if (provAttempt == 0) {
+                log_write("S3 creds did NOT persist (host=%s id=%s) — erasing NVS + re-provisioning",
+                          vHost[0] ? "set" : "EMPTY", vId[0] ? "set" : "EMPTY");
+                nvs_flash_erase(); nvs_flash_init();
+            } else {
+                log_write("S3 creds STILL absent after NVS wipe — possible NVS hardware fault");
+            }
         } else {
-            log_write("S3 NVS open FAILED: %s — creds/device_id cannot persist!", esp_err_to_name(oe));
+            log_write("S3 NVS open FAILED: %s — wiping NVS + retry", esp_err_to_name(oe));
+            if (provAttempt == 0) { nvs_flash_erase(); nvs_flash_init(); }
         }
     }
 
