@@ -365,6 +365,10 @@ static volatile bool     g_bootHarvestPending = false; // set by boot scan; bypa
 static volatile bool     g_bootRecoveryHarvest = false;// this harvest is of pre-existing files that
                                                        // may be a TRUNCATED interrupted transfer — its
                                                        // last flight is possibly partial, so re-request it
+static volatile bool     g_bootHarvestNeeded = false; // boot scan found leftover files
+static volatile bool     g_bootHarvestDone   = false; // the boot-recovery harvest has moved them out +
+                                                       // written the cookie → safe to present a CLEAN
+                                                       // volume to the DSU (gates USB presentation)
 static volatile uint32_t g_lastIoMs         = 0;
 static volatile uint32_t g_lastWriteMs      = 0;
 static volatile bool     g_writeDetected    = false;
@@ -4049,8 +4053,12 @@ static void doHarvest() {
         cdc_printf("Cookie: %s flight %lu\r\n", hr.dsuSerial, (unsigned long)cookieFlight);
     }
     // Consume the boot-recovery flag only on a COMPLETED harvest — an incomplete retry
-    // must keep it so the retry still backs the cookie off.
-    if (!harvestIncomplete) g_bootRecoveryHarvest = false;
+    // must keep it so the retry still backs the cookie off. On completion the leftover
+    // files are moved out + the cookie is written, so a CLEAN volume can now be presented.
+    if (!harvestIncomplete) {
+        if (g_bootRecoveryHarvest) g_bootHarvestDone = true;
+        g_bootRecoveryHarvest = false;
+    }
 
     // Unified command file (runtime) — the host may have dropped airbridge.cmd on
     // the USB-visible volume; process runtime-safe directives (dump_logs/wifi/s3/
@@ -4322,12 +4330,17 @@ static void main_loop_task(void* param) {
             vTaskDelay(pdMS_TO_TICKS(30000));  // 30s cooldown for modem cold boot
         }
 
-        // Enable USB MSC: present when pre-USB tasks done OR 90s timeout elapses
+        // Enable USB MSC: present when pre-USB tasks done OR 90s timeout elapses.
+        // Also hold until any BOOT-RECOVERY harvest has moved leftover (possibly-truncated)
+        // files out + rewritten the cookie, so the DSU always sees a CLEAN volume + correct
+        // resume point — never a stale partial it might overwrite. The 90s cap still forces
+        // presentation if the harvest wedges (defense-in-depth, not a data path).
         if (!g_sd_ready && g_card_sectors > 0) {
             uint32_t elapsed = millis() - usbPresentMs;
             bool minElapsed = (elapsed >= USB_MIN_DELAY_MS);
             bool maxElapsed = (elapsed >= USB_MAX_DELAY_MS);
-            if (maxElapsed || (minElapsed && g_preUsbDone)) {
+            bool bootHarvestOk = (!g_bootHarvestNeeded || g_bootHarvestDone);
+            if (maxElapsed || (minElapsed && g_preUsbDone && bootHarvestOk)) {
                 // In MSC-only mode we held D+ low at boot to hide the device.
                 // Now raise D+ so the host enumerates for the first time.
                 if (g_msc_only) {
@@ -5243,6 +5256,7 @@ extern "C" void app_main(void) {
             g_writeDetected = true;
             g_hostWasConnected = true;
             g_bootHarvestPending = true;  // pre-existing files need no quiet window
+            g_bootHarvestNeeded  = true;  // hold USB presentation until they're moved out (clean volume)
         }
 
         if (dsu_tmp) unmount_dsu();
