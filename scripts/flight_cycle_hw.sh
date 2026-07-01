@@ -29,8 +29,9 @@ source "$(dirname "$0")/e2e_lib.sh"
 BACKLOG_MB="${BACKLOG_MB:-200}"
 FLIGHT_KB="${FLIGHT_KB:-8192}"        # mean flight size (~8MB, like the emulator)
 COMPRESS=0                            # --compress → gzip on-device
-CYCLE_SECS="${CYCLE_SECS:-480}"       # upload window per power cycle (~8 min)
-MAX_CYCLES="${MAX_CYCLES:-12}"
+CYCLE_SECS="${CYCLE_SECS:-300}"       # power-on window per cycle (~5 min) → cut power every 5 min
+FEED_GAP="${FEED_GAP:-20}"            # pause between DSU flight writes (lets the device harvest)
+MAX_CYCLES="${MAX_CYCLES:-20}"
 SERIAL="${SERIAL:-EA500.E2ETES}"      # test serial (never collides with fleet data)
 
 while [ $# -gt 0 ]; do
@@ -38,6 +39,7 @@ while [ $# -gt 0 ]; do
         --backlog-mb)  BACKLOG_MB="$2"; shift 2 ;;
         --flight-kb)   FLIGHT_KB="$2"; shift 2 ;;
         --compress)    COMPRESS=1; shift ;;
+        --feed-gap)    FEED_GAP="$2"; shift 2 ;;
         --cycle-secs)  CYCLE_SECS="$2"; shift 2 ;;
         --max-cycles)  MAX_CYCLES="$2"; shift 2 ;;
         *) echo "unknown arg: $1"; exit 1 ;;
@@ -74,19 +76,39 @@ write_cmd_and_cookie() {
     log "  airbridge.cmd='$directive'${cookie:+ cookie=$cookie}"
 }
 
-# Seed the backlog: mount once, write flights 1..NFLIGHTS (compressible) past a
-# cookie of 0. host_dsu --mount avoids a per-flight remount.
-seed_backlog_hw() {
-    local dev; dev=$(find_usb_part) || { fail "no USB partition to seed"; return 1; }
-    sudo mount -o noatime,uid=$(id -u),gid=$(id -g) "$dev" /mnt 2>/dev/null || { fail "seed mount failed"; return 1; }
-    $HOSTDSU --mount /mnt --serial "$SERIAL" --plant-cookie 0 >/dev/null
-    local f
-    for f in $(seq 1 "$NFLIGHTS"); do
-        $HOSTDSU --mount /mnt --serial "$SERIAL" --max-flight "$f" --size-kb "$FLIGHT_KB" \
-                 --compressible --ignore-cookie >/dev/null
+# ── Interleaved DSU feeder ─────────────────────────────────────────────────
+# Realistic model: the aircraft DSU dribbles flights onto the USB volume WHILE the
+# device harvests+uploads, and power is cut every $CYCLE_SECS mid-stream. So we do NOT
+# seed up front — a background feeder writes one flight at a time (mount → write →
+# UNMOUNT so the device gets a USB-quiet window to harvest → pause), advancing across
+# power cycles via a persistent cursor. A cut lands on whatever's live: a half-written
+# flight (TRANSFER phase) or an in-flight S3 part (UPLOAD phase). host_dsu is atomic
+# (.part+rename) so a torn write leaves no half-flight; the cursor re-writes it next cycle.
+CURSOR=/tmp/soak_next_flight
+FEEDON=/tmp/soak_feed_on
+
+feed_one_flight() {   # $1 = flight number; write it to the USB volume; nonzero if the device is gone
+    local f="$1" dev
+    dev=$(find_usb_part) || return 1
+    sudo mount -o noatime,uid=$(id -u),gid=$(id -g) "$dev" /mnt 2>/dev/null || return 1
+    $HOSTDSU --mount /mnt --serial "$SERIAL" --max-flight "$f" --size-kb "$FLIGHT_KB" \
+             --compressible --ignore-cookie >/dev/null 2>&1
+    local rc=$?
+    sync 2>/dev/null; sudo umount /mnt 2>/dev/null || sudo umount -l /mnt 2>/dev/null
+    return $rc
+}
+
+run_feeder() {   # background: dribble remaining flights until stopped or the whole backlog is written
+    while [ -f "$FEEDON" ]; do
+        local f; f=$(cat "$CURSOR" 2>/dev/null || echo 1)
+        [ "$f" -gt "$NFLIGHTS" ] && break
+        if feed_one_flight "$f"; then
+            echo $((f+1)) > "$CURSOR"; log "  fed flight $f/$NFLIGHTS"
+        else
+            break                          # device off (cut) or mount failed — stop this cycle
+        fi
+        local g=0; while [ -f "$FEEDON" ] && [ "$g" -lt "$FEED_GAP" ]; do sleep 1; g=$((g+1)); done
     done
-    sync; sudo umount /mnt 2>/dev/null
-    log "  Seeded $NFLIGHTS flights (~${BACKLOG_MB}MB, ~3x-compressible) onto USB volume"
 }
 
 # Total MB stored in S3 for this aircraft (the cellular bytes billed).
@@ -103,11 +125,12 @@ log "═════════════════════════
 
 command -v aws >/dev/null || { fail "aws CLI required"; exit 1; }
 cleanup_aircraft_s3 "$SERIAL"
-echo "cycle,hwm,backlog_flights,s3_mb" > "$CSV"
+echo "cycle,hwm,inflight_backlog,s3_mb" > "$CSV"
 
 # Setup boot: drop the compress directive + cookie BEFORE seeding, so check_p1_magic
 # enables compression from the first harvest. Power-cycle so boot processes it.
 log "── setup: enable compression + reset cookie ──"
+echo 1 > "$CURSOR"; rm -f "$FEEDON"
 start_device
 [ "$COMPRESS" = 1 ] && write_cmd_and_cookie "compress on" 0 || write_cmd_and_cookie "compress off" 0
 stop_device; sleep 3
@@ -116,23 +139,26 @@ auc=0; catchup=-1; cycle=0
 while [ "$cycle" -lt "$MAX_CYCLES" ]; do
     cycle=$((cycle+1))
     log ""
-    log "── cycle $cycle ──"
+    log "── cycle $cycle ── (power on; cut in ${CYCLE_SECS}s)"
     start_device
-    if [ "$cycle" = 1 ]; then
-        seed_backlog_hw                       # DSU writes the whole backlog at first connect
-    fi
-    # Let the device harvest (gzip) + upload over real cell for the cycle window.
+    # Background feeder dribbles remaining flights DURING this window (transfer phase),
+    # while the device harvests+uploads. Both run concurrently until the cut.
+    touch "$FEEDON"; run_feeder & FEEDER=$!
     sleep "$CYCLE_SECS"
+    # CUT POWER mid-stream — lands on a live transfer OR a live upload.
     stop_device
+    rm -f "$FEEDON"; kill "$FEEDER" 2>/dev/null; wait "$FEEDER" 2>/dev/null
+    sudo umount /mnt 2>/dev/null || sudo umount -l /mnt 2>/dev/null   # clear any stale feeder mount
 
     hwm=$(get_manifest_hwm "$SERIAL"); hwm=${hwm:-0}
-    bf=$((NFLIGHTS - hwm)); [ "$bf" -lt 0 ] && bf=0
+    fed=$(( $(cat "$CURSOR" 2>/dev/null || echo 1) - 1 ))   # flights transferred to device so far
+    bf=$((fed - hwm)); [ "$bf" -lt 0 ] && bf=0              # written-but-not-yet-uploaded (in-flight backlog)
     mb=$(s3_uploaded_mb)
     auc=$((auc + bf))
     echo "$cycle,$hwm,$bf,$mb" >> "$CSV"
-    log "  RESULT cycle=$cycle hwm=$hwm backlog=${bf}flights s3=${mb}MB"
-    if [ "$hwm" -ge "$NFLIGHTS" ] && [ "$catchup" -lt 0 ]; then
-        catchup=$cycle; log "  ★ CAUGHT UP at cycle $cycle"; break
+    log "  RESULT cycle=$cycle fed=$fed/$NFLIGHTS hwm=$hwm inflight=${bf} s3=${mb}MB"
+    if [ "$fed" -ge "$NFLIGHTS" ] && [ "$hwm" -ge "$NFLIGHTS" ] && [ "$catchup" -lt 0 ]; then
+        catchup=$cycle; log "  ★ CAUGHT UP at cycle $cycle (all fed + all uploaded)"; break
     fi
 done
 
