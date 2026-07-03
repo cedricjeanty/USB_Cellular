@@ -699,9 +699,10 @@ def make_record(flight):
     body[20] = (flight >> 8) & 0xFF
     body[21] = flight & 0xFF
     return bytes([0xEA, 0x4C, 0x00, 0x1C]) + bytes(body)
-# 50KB random preamble + last complete record (1700) + truncated header at tail.
-# Backward scanner rejects the truncated header (length overruns EOF), then
-# finds record(1700) whose framing check passes (truncated header starts 0xEA).
+# 50KB random preamble + record(1699) + last complete record (1700) + truncated
+# header at tail. Backward scanner rejects the truncated header (length overruns EOF),
+# then finds record(1700) whose framing check passes (truncated header starts 0xEA).
+# Boot-recovery then backs the cookie off by one → 1699 (re-request the partial 1700).
 data  = os.urandom(50 * 1024)
 data += make_record(1699)
 data += make_record(1700)
@@ -727,10 +728,13 @@ import struct
 data = open('$SD_EMU/dsuCookie.easdf', 'rb').read()
 print(struct.unpack('>I', data[62:66])[0])
 ")
-        if [ "$FLIGHT" = "1700" ]; then
-            pass "Power-loss recovery: cookie flight=$FLIGHT matches partial file"
+        # Boot-recovery backs the cookie off by one (recoveryCookieFlight, unit-tested):
+        # the last complete record (1700) may itself be a truncated interrupted transfer,
+        # so the cookie is set to 1699 to RE-REQUEST 1700 from the DSU. So 1699 is correct.
+        if [ "$FLIGHT" = "1699" ]; then
+            pass "Power-loss recovery: cookie flight=$FLIGHT (backed off one to re-request the partial 1700)"
         else
-            fail "Power-loss recovery: cookie flight=$FLIGHT (want 1700)"
+            fail "Power-loss recovery: cookie flight=$FLIGHT (want 1699 = 1700 backed off one)"
         fi
     else
         fail "Power-loss recovery: no cookie written after reboot harvest"
