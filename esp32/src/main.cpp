@@ -3879,18 +3879,8 @@ static void main_loop_task(void* param) {
     }
 }
 
-// ── app_main ────────────────────────────────────────────────────────────────
-extern "C" void app_main(void) {
-    // Initialize NVS
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-    log_init();
-    airbridge_log("AirBridge fw=%s heap=%lu", FW_VERSION, (unsigned long)esp_get_free_heap_size());
-
+// ── Boot-sequence steps (extracted from app_main for readability) ──
+static void bootReportPriorFaults() {
     // Surface a prior watchdog-forced reboot (set by watchdog_task before restart).
     {
         nvs_handle_t h;
@@ -3921,44 +3911,9 @@ extern "C" void app_main(void) {
             nvs_close(h);
         }
     }
+}
 
-    // ── HAL initialization ─────────────────────────────────────────────
-    static Esp32Display  s_display;
-    static Esp32Clock    s_clock;
-    static Esp32Nvs      s_nvs;
-    static Esp32Filesys  s_filesys;
-    static Esp32Network  s_network;
-    static HAL           s_hal = { &s_display, &s_clock, &s_nvs, &s_filesys, &s_network, nullptr };
-    g_hal = &s_hal;
-    // uart is nullptr — mdm_* helpers fall back to raw ESP-IDF uart_* calls
-
-    // Install the NVS-independent creds fallback used by the HAL upload path
-    // (loadS3Creds). The shared api host/key + a MAC-derived device_id are always
-    // reconstructable, so no NVS fault can strand the device off the backend.
-    s3CredsFallback() = [](S3Creds* c) {
-        if (!c->apiHost[0]) strlcpy(c->apiHost, "disw6oxjed.execute-api.us-west-2.amazonaws.com", sizeof(c->apiHost));
-        if (!c->apiKey[0])  strlcpy(c->apiKey,  "7fFErx7ZCt9Vr2fvYfyOT7YxxeEjay4G5bpmfYdm",       sizeof(c->apiKey));
-        if (!c->deviceId[0]) {
-            uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_WIFI_STA);
-            char m[13];
-            snprintf(m, sizeof(m), "%02X%02X%02X%02X%02X%02X",
-                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-#ifdef ALLOW_CDC_PERSIST
-            snprintf(c->deviceId, sizeof(c->deviceId), "TEST_%s", m);
-#else
-            strlcpy(c->deviceId, m, sizeof(c->deviceId));
-#endif
-        }
-    };
-
-    // Feed the OLED connection-quality bars from the upload path's presign RTT too —
-    // not just the 60s log-append probe, which starves during a long upload and let the
-    // bars drop to 0 mid-transfer. Now every per-file presign refreshes the sample.
-    g_noteApiRttMs = noteLinkLatency;
-
-    g_sd_mutex = xSemaphoreCreateMutex();
-    g_tlsMutex = xSemaphoreCreateMutex();   // serialize TLS handshakes (AES-intr-alloc race)
-
+static void bootCountersAndCrashLoop() {
     // ── Session counter (always increments) + crash-loop detection ──────
     {
         nvs_handle_t h;
@@ -4046,29 +4001,9 @@ extern "C" void app_main(void) {
             // at the healthy mark once the app runs stably.
         }
     }
+}
 
-    // ── MSC-only mode selection (NVS-based) ────────────────────────────
-    {
-        nvs_handle_t h;
-        if (nvs_open("usb", NVS_READWRITE, &h) == ESP_OK) {
-            uint8_t mode = 1;  // default: MSC-only; drop ENABLE_CDC on SD for debug
-            nvs_get_u8(h, "msc_only", &mode);
-            g_msc_only = (mode != 0);
-            nvs_close(h);
-        }
-#ifdef FORCE_CDC
-        g_msc_only = false;  // diagnostic build: force CDC console for a wedged unit
-                             // that can't present a writable SD to drop a cdc magic file
-#endif
-        ESP_LOGI(TAG, "USB mode: %s", g_msc_only ? "MSC-only" : "CDC+MSC");
-    }
-
-    // ── OLED init ───────────────────────────────────────────────────────
-    if (!g_hal->display->ok()) g_hal->display->init();
-    if (!g_hal->display->ok()) {
-        ESP_LOGE(TAG, "SSD1306 failed — continuing without display");
-    }
-
+static void bootProvisionCreds() {
     // ── Provision S3 credentials — GUARANTEE they persist ───────────────
     // Provision, then VERIFY via readback; if the creds didn't stick (the small 20 KB NVS
     // fragmented/filled under upload+counter churn so even the tiny creds writes failed —
@@ -4185,12 +4120,9 @@ extern "C" void app_main(void) {
             if (provAttempt == 0) { nvs_flash_erase(); nvs_flash_init(); }
         }
     }
+}
 
-    // Populate the cred globals now (with the MAC/shared-default fallback) so device_id is
-    // available immediately for the heartbeat/upload/command gates — never a dark window,
-    // even if NVS lost the creds this boot.
-    s3LoadCreds();
-
+static void bootRunSafeMode() {
     // ── SAFE MODE short-circuit: survival plane only ────────────────────
     // We reached the crash-loop threshold with nothing to roll back. Do NOT touch
     // the SD (it may be the crash cause), do NOT present USB, do NOT start
@@ -4199,7 +4131,6 @@ extern "C" void app_main(void) {
     // remote fix (format_sd / OTA). Creds + device_id were already loaded from NVS
     // above, so the survival plane can reach the backend. app_main returns here;
     // FreeRTOS keeps the three survival tasks running.
-    if (g_safe_mode) {
         g_msc_only = true;  // never enumerate a possibly-corrupt SD over USB
         s3LoadCreds();
         char l2[24];
@@ -4220,49 +4151,9 @@ extern "C" void app_main(void) {
         xTaskCreatePinnedToCore(watchdog_task,  "watchdog",   3072, nullptr, 5, nullptr,       0);
 
         ESP_LOGW(TAG, "SAFE MODE active — survival plane up, awaiting remote recovery");
-        return;
-    }
+}
 
-    disp("Init SD...");
-
-    // ── SD card init ────────────────────────────────────────────────────
-    {
-        bool has_sd = false;
-        for (int i = 1; i <= 10 && !has_sd; i++) {
-            has_sd = sd_init();
-            if (!has_sd) {
-                ESP_LOGE(TAG, "SD init attempt %d failed", i);
-                disp("SD init...", i <= 5 ? "retrying" : "check card");
-                vTaskDelay(pdMS_TO_TICKS(1000));
-            }
-        }
-        if (!has_sd) {
-            ESP_LOGE(TAG, "SD init failed — NOT formatting (data preservation)");
-            ESP_LOGI(TAG, "Use CLI command FORMAT to format if card is truly blank");
-            disp("SD FAILED", "serial: FORMAT");
-        }
-    }
-
-    g_sdTotalMb = g_card_sectors * 512.0f / 1e6f;
-
-    // Create logs directory on SD for per-session log files
-    if (g_fatfs_mounted) {
-        mkdir("/sdcard/logs", 0775);
-    }
-
-    // Initialize SD used space for display
-    if (g_fatfs_mounted) {
-        FATFS* fs;
-        DWORD freeClusters;
-        if (f_getfree("0:", &freeClusters, &fs) == FR_OK) {
-            DWORD totalSectors = (fs->n_fatent - 2) * fs->csize;
-            DWORD freeSectors  = freeClusters * fs->csize;
-            g_sdUsedMb = (totalSectors - freeSectors) * 512.0f / 1e6f;
-        }
-    }
-
-    // Boot splash is shown later, after file scan
-
+static void bootProcessMagicFiles() {
     // ── P1 magic files (accessible via USB MSC even when P2 FATFS is down) ──
     check_p1_magic();
 
@@ -4373,9 +4264,9 @@ extern "C" void app_main(void) {
             esp_restart();
         }
     }
+}
 
-    // FATFS already mounted by sd_init() — no separate mount needed
-
+static void bootInstallUsb() {
     // ── TinyUSB init ────────────────────────────────────────────────────
     {
         // MSC-only descriptors: pure mass storage device (no CDC/IAD)
@@ -4455,15 +4346,9 @@ extern "C" void app_main(void) {
             disp("No SD card", "CLI: FORMAT");
         }
     }
+}
 
-    g_lastDisplayMs = millis();
-
-    // ── WiFi disabled — cellular only ────────────────────────────────────
-    // wifi_init();
-    // Initialize event loop + netif (needed for PPP even without WiFi)
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-
+static void bootRunDeferredFormat() {
     // ── FORMAT_SD request (set by the P1/P2 magic-file handler + reboot) ──
     // Honor it by forcing a full reformat, then clear the flag.
     {
@@ -4588,18 +4473,9 @@ extern "C" void app_main(void) {
         while (!fmt_done) vTaskDelay(pdMS_TO_TICKS(100));
         ESP_LOGI(TAG, "SD: deferred format complete");
     }
+}
 
-    // ── Create tasks ────────────────────────────────────────────────────
-    // 32KB stack: the shared upload path (halS3UploadEaofh → halS3UploadFile →
-    // s3ApiGetViaHal) nests several multi-KB frames (s3Path[2500], hdr[2700], …),
-    // which overflows the old 16KB stack and crashes mid-upload on hardware.
-    xTaskCreatePinnedToCore(uploadTask,    "upload",    32768, nullptr, 1, &g_upload_task,  1);
-    xTaskCreatePinnedToCore(harvestTask,   "harvest",   24576, nullptr, 1, &g_harvest_task, 1);  // +8KB headroom for zlib deflate (gzip)
-    xTaskCreatePinnedToCore(modemTask,     "modem",     16384, nullptr, 2, &g_modem_task,   0);  // core 0, 16KB stack for reconnection
-    xTaskCreatePinnedToCore(main_loop_task, "main_loop", 4096, nullptr, 1, nullptr,         0);
-    // High priority + core 0; takes no contended locks so it survives any wedge.
-    xTaskCreatePinnedToCore(watchdog_task,  "watchdog",   3072, nullptr, 5, nullptr,        0);
-
+static void bootScanUploadBacklog() {
     // ── Scan /upload/ subfolders for leftover files from before last reboot ──
     if (g_fatfs_mounted) {
         char harvBase[64];
@@ -4633,7 +4509,9 @@ extern "C" void app_main(void) {
             }
         }
     }
+}
 
+static void bootMoveOldLogs() {
     // ── Move old boot logs into upload queue ────────────────────────────
     // With dual-partition, harvest scans P1 (DSU) — old logs on P2 won't be
     // found by harvest. Move them directly into /sdcard/upload/NNNN/ so the
@@ -4683,7 +4561,9 @@ extern "C" void app_main(void) {
             }
         }
     }
+}
 
+static void bootScanUnharvested() {
     // ── Scan for unharvested files (from previous session) ─────────────
     // For dual-partition: scan partition 1 (DSU side) by temp-mounting at /dsu.
     // For single partition: scan /sdcard root as before.
@@ -4707,6 +4587,164 @@ extern "C" void app_main(void) {
 
         if (dsu_tmp) unmount_dsu();
     }
+}
+
+// ── app_main ────────────────────────────────────────────────────────────────
+extern "C" void app_main(void) {
+    // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    log_init();
+    airbridge_log("AirBridge fw=%s heap=%lu", FW_VERSION, (unsigned long)esp_get_free_heap_size());
+
+    bootReportPriorFaults();
+
+    // ── HAL initialization ─────────────────────────────────────────────
+    static Esp32Display  s_display;
+    static Esp32Clock    s_clock;
+    static Esp32Nvs      s_nvs;
+    static Esp32Filesys  s_filesys;
+    static Esp32Network  s_network;
+    static HAL           s_hal = { &s_display, &s_clock, &s_nvs, &s_filesys, &s_network, nullptr };
+    g_hal = &s_hal;
+    // uart is nullptr — mdm_* helpers fall back to raw ESP-IDF uart_* calls
+
+    // Install the NVS-independent creds fallback used by the HAL upload path
+    // (loadS3Creds). The shared api host/key + a MAC-derived device_id are always
+    // reconstructable, so no NVS fault can strand the device off the backend.
+    s3CredsFallback() = [](S3Creds* c) {
+        if (!c->apiHost[0]) strlcpy(c->apiHost, "disw6oxjed.execute-api.us-west-2.amazonaws.com", sizeof(c->apiHost));
+        if (!c->apiKey[0])  strlcpy(c->apiKey,  "7fFErx7ZCt9Vr2fvYfyOT7YxxeEjay4G5bpmfYdm",       sizeof(c->apiKey));
+        if (!c->deviceId[0]) {
+            uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_WIFI_STA);
+            char m[13];
+            snprintf(m, sizeof(m), "%02X%02X%02X%02X%02X%02X",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+#ifdef ALLOW_CDC_PERSIST
+            snprintf(c->deviceId, sizeof(c->deviceId), "TEST_%s", m);
+#else
+            strlcpy(c->deviceId, m, sizeof(c->deviceId));
+#endif
+        }
+    };
+
+    // Feed the OLED connection-quality bars from the upload path's presign RTT too —
+    // not just the 60s log-append probe, which starves during a long upload and let the
+    // bars drop to 0 mid-transfer. Now every per-file presign refreshes the sample.
+    g_noteApiRttMs = noteLinkLatency;
+
+    g_sd_mutex = xSemaphoreCreateMutex();
+    g_tlsMutex = xSemaphoreCreateMutex();   // serialize TLS handshakes (AES-intr-alloc race)
+
+    bootCountersAndCrashLoop();
+
+    // ── MSC-only mode selection (NVS-based) ────────────────────────────
+    {
+        nvs_handle_t h;
+        if (nvs_open("usb", NVS_READWRITE, &h) == ESP_OK) {
+            uint8_t mode = 1;  // default: MSC-only; drop ENABLE_CDC on SD for debug
+            nvs_get_u8(h, "msc_only", &mode);
+            g_msc_only = (mode != 0);
+            nvs_close(h);
+        }
+#ifdef FORCE_CDC
+        g_msc_only = false;  // diagnostic build: force CDC console for a wedged unit
+                             // that can't present a writable SD to drop a cdc magic file
+#endif
+        ESP_LOGI(TAG, "USB mode: %s", g_msc_only ? "MSC-only" : "CDC+MSC");
+    }
+
+    // ── OLED init ───────────────────────────────────────────────────────
+    if (!g_hal->display->ok()) g_hal->display->init();
+    if (!g_hal->display->ok()) {
+        ESP_LOGE(TAG, "SSD1306 failed — continuing without display");
+    }
+
+    bootProvisionCreds();
+
+    // Populate the cred globals now (with the MAC/shared-default fallback) so device_id is
+    // available immediately for the heartbeat/upload/command gates — never a dark window,
+    // even if NVS lost the creds this boot.
+    s3LoadCreds();
+
+    if (g_safe_mode) { bootRunSafeMode(); return; }
+
+    disp("Init SD...");
+
+    // ── SD card init ────────────────────────────────────────────────────
+    {
+        bool has_sd = false;
+        for (int i = 1; i <= 10 && !has_sd; i++) {
+            has_sd = sd_init();
+            if (!has_sd) {
+                ESP_LOGE(TAG, "SD init attempt %d failed", i);
+                disp("SD init...", i <= 5 ? "retrying" : "check card");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+        }
+        if (!has_sd) {
+            ESP_LOGE(TAG, "SD init failed — NOT formatting (data preservation)");
+            ESP_LOGI(TAG, "Use CLI command FORMAT to format if card is truly blank");
+            disp("SD FAILED", "serial: FORMAT");
+        }
+    }
+
+    g_sdTotalMb = g_card_sectors * 512.0f / 1e6f;
+
+    // Create logs directory on SD for per-session log files
+    if (g_fatfs_mounted) {
+        mkdir("/sdcard/logs", 0775);
+    }
+
+    // Initialize SD used space for display
+    if (g_fatfs_mounted) {
+        FATFS* fs;
+        DWORD freeClusters;
+        if (f_getfree("0:", &freeClusters, &fs) == FR_OK) {
+            DWORD totalSectors = (fs->n_fatent - 2) * fs->csize;
+            DWORD freeSectors  = freeClusters * fs->csize;
+            g_sdUsedMb = (totalSectors - freeSectors) * 512.0f / 1e6f;
+        }
+    }
+
+    // Boot splash is shown later, after file scan
+
+    bootProcessMagicFiles();
+
+    // FATFS already mounted by sd_init() — no separate mount needed
+
+    bootInstallUsb();
+
+    g_lastDisplayMs = millis();
+
+    // ── WiFi disabled — cellular only ────────────────────────────────────
+    // wifi_init();
+    // Initialize event loop + netif (needed for PPP even without WiFi)
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    bootRunDeferredFormat();
+
+    // ── Create tasks ────────────────────────────────────────────────────
+    // 32KB stack: the shared upload path (halS3UploadEaofh → halS3UploadFile →
+    // s3ApiGetViaHal) nests several multi-KB frames (s3Path[2500], hdr[2700], …),
+    // which overflows the old 16KB stack and crashes mid-upload on hardware.
+    xTaskCreatePinnedToCore(uploadTask,    "upload",    32768, nullptr, 1, &g_upload_task,  1);
+    xTaskCreatePinnedToCore(harvestTask,   "harvest",   24576, nullptr, 1, &g_harvest_task, 1);  // +8KB headroom for zlib deflate (gzip)
+    xTaskCreatePinnedToCore(modemTask,     "modem",     16384, nullptr, 2, &g_modem_task,   0);  // core 0, 16KB stack for reconnection
+    xTaskCreatePinnedToCore(main_loop_task, "main_loop", 4096, nullptr, 1, nullptr,         0);
+    // High priority + core 0; takes no contended locks so it survives any wedge.
+    xTaskCreatePinnedToCore(watchdog_task,  "watchdog",   3072, nullptr, 5, nullptr,        0);
+
+    bootScanUploadBacklog();
+
+    bootMoveOldLogs();
+
+    bootScanUnharvested();
 
     // ── Boot splash (10s) — uses shared dispBootSplash() ──────────────
     if (g_hal->display->ok()) {

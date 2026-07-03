@@ -22,7 +22,7 @@ harvest files when idle, and upload via cellular.
 
 **OTA:** Auto-updates via S3. Dual OTA partitions (ota_0 + ota_1, 1.875 MB each). Rollback on crash loop.
 
-**Source:** `esp32/src/main.cpp` (PlatformIO, single-file firmware ~5300 lines)
+**Source:** `esp32/src/main.cpp` (PlatformIO, single-file firmware ~4800 lines)
 
 **Two firmware branches:**
 - `esp32-s3` — Arduino framework (90 KB/s upload, fallback)
@@ -382,7 +382,7 @@ shared logic belongs in a header, not duplicated in `main.cpp` (see Developer Br
 
 ```
 esp32/
-├── src/main.cpp                 # Firmware entry: USB MSC, FreeRTOS task wiring, ESP-IDF glue (~5300 lines)
+├── src/main.cpp                 # Firmware entry: USB MSC, FreeRTOS task wiring, ESP-IDF glue (~4800 lines)
 │
 ├── include/                     # ── Shared, hardware-independent logic (firmware + emulator + tests) ──
 │   ├── DSU protocol & data
