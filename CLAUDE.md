@@ -22,7 +22,7 @@ harvest files when idle, and upload via cellular.
 
 **OTA:** Auto-updates via S3. Dual OTA partitions (ota_0 + ota_1, 1.875 MB each). Rollback on crash loop.
 
-**Source:** `esp32/src/main.cpp` (PlatformIO, single-file firmware ~5400 lines)
+**Source:** `esp32/src/main.cpp` (PlatformIO, single-file firmware ~5300 lines)
 
 **Two firmware branches:**
 - `esp32-s3` — Arduino framework (90 KB/s upload, fallback)
@@ -134,7 +134,7 @@ dump_logs once
 | `wifi` | `ssid0`..`ssid4`, `pass0`..`pass4`, `count` | Saved WiFi networks |
 | `ota` | `ota_status`, `fw_ver` | OTA rollback tracking |
 | `usb` | `msc_only` | USB mode preference |
-| `dbg` | `session` | Monotonic boot counter for log filenames |
+| `dbg` | `session`, `boots`, `wdt_reboots`, `wdt_stall_s`, `sd_fmt_pending`, `sd_fmt_count` | Boot session counter for log filenames; crash-loop counter; watchdog reboot record; SD-reformat record |
 | `harvest` | `count` | Sequential harvest folder counter |
 
 ### FreeRTOS Tasks
@@ -142,8 +142,8 @@ dump_logs once
 | Task | Stack | Core | Priority | Purpose |
 |------|-------|------|----------|---------|
 | modem | 16 KB | 0 | 2 | UART→PPPoS pump, reconnection, log upload |
-| upload | 16 KB | 1 | 1 | OTA check, S3 file upload |
-| harvest | 16 KB | 1 | 1 | SD file harvest from root to /harvested/ |
+| upload | 32 KB | 1 | 1 | OTA check, S3 file upload |
+| harvest | 24 KB | 1 | 1 | SD file harvest from root to /harvested/ (+headroom for zlib deflate) |
 | main_loop | 4 KB | 0 | 1 | Display, USB delay, modem watchdog, heartbeat |
 | watchdog | 3 KB | 0 | 5 | No-progress reboot if main loop wedges |
 
@@ -382,7 +382,7 @@ shared logic belongs in a header, not duplicated in `main.cpp` (see Developer Br
 
 ```
 esp32/
-├── src/main.cpp                 # Firmware entry: USB MSC, FreeRTOS task wiring, ESP-IDF glue (~5400 lines)
+├── src/main.cpp                 # Firmware entry: USB MSC, FreeRTOS task wiring, ESP-IDF glue (~5300 lines)
 │
 ├── include/                     # ── Shared, hardware-independent logic (firmware + emulator + tests) ──
 │   ├── DSU protocol & data
@@ -390,6 +390,9 @@ esp32/
 │   │   ├── airbridge_harvest.h  #   Recursive dir walk, file move to /harvested/NNNN/, skip list;
 │   │   │                        #   opt-in gzip of .eaofh into the queue (compress arg, -DAIRBRIDGE_COMPRESS)
 │   │   └── airbridge_compress.h  #   Streaming gzip (zlib) for flight logs — ~3x fewer upload bytes
+│   ├── Storage
+│   │   └── airbridge_sd.h       #   Shared SD service: dual-partition FORMAT sequence (f_fdisk+MBR fixup+
+│   │                            #   f_mkfs P1/P2), diskio injected via SdDiskOps (sdmmc / FakeSd)
 │   ├── Cellular
 │   │   ├── airbridge_modem.h    #   modemAtSync/modemRunInit/modemReconnect (CEREG/CGACT sequence)
 │   │   └── ppp_proto.h          #   Minimal PPP (HDLC/LCP/IPCP) — used by the modem simulator
@@ -401,21 +404,23 @@ esp32/
 │   │   ├── airbridge_runtime.h  #   OTA version check, speed calc, STATUS formatting
 │   │   ├── airbridge_display.h  #   SSD1306 page rendering (via HAL display)
 │   │   ├── airbridge_triggers.h #   Harvest trigger logic (15s quiet window)
+│   │   ├── airbridge_commands.h #   Unified airbridge.cmd parse + persist-rewrite + dump_logs (once modifier)
 │   │   └── airbridge_utils.h    #   JSON helpers, URL encode/decode, version compare, skip list
 │   ├── airbridge_cli.h          #   CLI command parsing — extracted/tested but DISABLED in firmware
 │   ├── airbridge_wifi_creds.h   #   WiFi MRU credential list — extracted/tested but WiFi DISABLED in firmware
 │   └── hal/                     #   Hardware Abstraction Layer: g_hal interfaces (nvs/uart/network/filesys/
 │                                #   display/clock) + native_impls.h (emulator) + test_impls.h (unit tests)
 │
-├── emu/main.cpp                 # SDL2 emulator (~1140 lines): wires headers to FakeSD/FileNvs + SimModem PTY
+├── emu/main.cpp                 # SDL2 emulator (~1630 lines): wires headers to FakeSD/FileNvs + SimModem PTY
 ├── include/sim_modem.h          # SIM7600 simulator: AT commands + PPP bridge via pppd
 ├── include/sim_dsu.h            # Aircraft DSU simulator: reads cookie, emits only un-sent flights;
 │                                #   runSession (batched 'd' keypress) + transferFlight (per-flight, atomic
 │                                #   .part+rename, rate-limited — used by the emulator's DSU backlog thread)
 │
 ├── lib/fatfs_native/            # Standalone FatFs for native tests (no ESP-IDF/FreeRTOS)
-├── test/test_native_*/          # 16 Unity test suites (proto, dsu, harvest, modem, modem_init, http,
-│                                #   s3, ppp, nvs, cli, display, runtime, triggers, utils, sd_block, sd_format)
+├── test/test_native_*/          # 22 Unity test suites (proto, dsu, harvest, modem, modem_init, http,
+│                                #   s3, ppp, nvs, cli, display, runtime, triggers, utils, sd_block, sd_format,
+│                                #   commands, command_fetch, compress, fatfsfs, log, net_util)
 ├── test/fixtures/               # Real .eaofh flight + metrics/ DSU fixtures for sim_dsu
 │
 ├── platformio.ini               # Build config (Arduino on esp32-s3, ESP-IDF on esp32-idf)

@@ -4,9 +4,10 @@
 
 The active variant has two test layers, both running the shared `airbridge_*.h` logic:
 
-- **Native Unity unit tests** — `esp32/test/test_native_*/` (16 suites: proto, dsu,
+- **Native Unity unit tests** — `esp32/test/test_native_*/` (22 suites: proto, dsu,
   harvest, modem, modem_init, http, s3, ppp, nvs, cli, display, runtime, triggers,
-  utils, sd_block, sd_format). Run on the host via PlatformIO native env, no hardware.
+  utils, sd_block, sd_format, commands, command_fetch, compress, fatfsfs, log,
+  net_util). Run on the host via PlatformIO native env, no hardware.
   ```bash
   cd esp32 && pio test -e native
   ```
