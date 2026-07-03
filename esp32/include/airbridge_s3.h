@@ -970,25 +970,3 @@ inline UploadResult halS3UploadEaofh(const char* harvestDir, const char* relPath
     return res;
 }
 
-// ── Upload all pending files ────────────────────────────────────────────────
-
-// Upload all pending files from harvestDir. Returns count of files uploaded.
-// findNextUploadFile returns "NNNN/filename" relative paths.
-inline int uploadAllFiles(const char* harvestDir, UploadProgressFn progress = nullptr) {
-    int count = 0;
-    char relPath[128];
-    while (findNextUploadFile(harvestDir, relPath, sizeof(relPath))) {
-        char fullpath[256];
-        snprintf(fullpath, sizeof(fullpath), "%s/%s", harvestDir, relPath);
-
-        // Use the relative path (NNNN/filename) as the S3 key component
-        UploadResult r = halS3UploadFile(fullpath, relPath, progress);
-        if (r.success) {
-            markFileUploaded(harvestDir, relPath);
-            count++;
-        } else {
-            break;
-        }
-    }
-    return count;
-}

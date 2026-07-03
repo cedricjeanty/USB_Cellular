@@ -48,12 +48,6 @@ inline void linkWindowAdd(LinkWindow& w, uint32_t nowMs, float val) {
     w.head = (uint8_t)((w.head + 1) % LinkWindow::CAP);
     if (w.count < LinkWindow::CAP) w.count++;
 }
-inline float linkWindowMax(const LinkWindow& w, uint32_t nowMs, uint32_t windowMs) {
-    float mx = 0;
-    for (int i = 0; i < w.count; i++)
-        if ((uint32_t)(nowMs - w.ms[i]) <= windowMs && w.val[i] > mx) mx = w.val[i];
-    return mx;
-}
 // Best (min) value in the window; returns <0 if no sample in window.
 inline float linkWindowMin(const LinkWindow& w, uint32_t nowMs, uint32_t windowMs) {
     float mn = -1;
@@ -261,40 +255,6 @@ inline void dispBootSplash(const char* fwVersion, const char* deviceId,
         snprintf(modeLine, sizeof(modeLine), "%s v%s", usbMode, verShort);
         int mW = strlen(modeLine) * 6;
         g_hal->display->text((128 - mW) / 2, 46, modeLine);
-    }
-
-    g_hal->display->flush();
-}
-
-// OTA update display — shows version being downloaded + progress
-inline void dispOtaProgress(const char* newVersion, int pct) {
-    g_hal->display->clear();
-    g_hal->display->text(10, 1, "AirBridge", 2);
-    g_hal->display->hline(0, 127, 20);
-
-    char updLine[24];
-    snprintf(updLine, sizeof(updLine), "Update: v%s", newVersion);
-    int uw = g_hal->display->text_width(updLine);
-    g_hal->display->text((128 - uw) / 2, 24, updLine);
-
-    if (pct >= 0) {
-        // Progress bar
-        g_hal->display->rect(4, 38, 120, 8, false);
-        int fill = pct * 116 / 100;
-        if (fill > 0) g_hal->display->rect(6, 40, fill, 4, true);
-
-        char pctStr[8];
-        snprintf(pctStr, sizeof(pctStr), "%d%%", pct);
-        int pw = strlen(pctStr) * 6;
-        g_hal->display->text((128 - pw) / 2, 50, pctStr);
-    } else {
-        static int dotFrame2 = 0;
-        const char* dots[] = { "   ", ".  ", ".. ", "..." };
-        char chkLine[20];
-        snprintf(chkLine, sizeof(chkLine), "Checking%s", dots[dotFrame2 % 4]);
-        dotFrame2++;
-        int cw = strlen(chkLine) * 6;
-        g_hal->display->text((128 - cw) / 2, 38, chkLine);
     }
 
     g_hal->display->flush();
