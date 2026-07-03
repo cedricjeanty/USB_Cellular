@@ -569,35 +569,49 @@ inline uint32_t halFetchManifest(const char* serial) {
     return (hwm > 0) ? (uint32_t)hwm : 0;
 }
 
-// POST /prod/aircraft/manifest → update manifest with new file entry.
-inline bool halUpdateManifest(const char* serial, uint32_t firstFlight,
-                              uint32_t lastFlight, const char* s3Key) {
+// Shared POST-with-JSON-body helper for the manifest/ack/heartbeat endpoints, which
+// are otherwise identical boilerplate: build the full HTTP/1.1 header for `requestLine`
+// (the caller's already-formed "POST /path HTTP/1.1" first line, incl. any ?device=),
+// send header+body, and return true iff the response contains `successToken`. When
+// `logTag` is non-null, failures are printf'd as "[tag] …" with the response snippet
+// (used by the manifest path); pass nullptr to stay silent (ack/heartbeat).
+inline bool halPostJson(const char* requestLine, const char* body,
+                        const char* successToken, const char* logTag = nullptr) {
     if (!g_hal || !g_hal->network) return false;
     S3Creds creds = loadS3Creds();
     if (!creds.valid) return false;
-    char body[512];
-    int bodyLen = snprintf(body, sizeof(body),
-        "{\"serial\":\"%s\",\"last_flight\":%lu,\"first_flight\":%lu,\"s3_key\":\"%s\"}",
-        serial, (unsigned long)lastFlight, (unsigned long)firstFlight, s3Key ? s3Key : "");
-    char hdr[512];
+    int bodyLen = (int)strlen(body);
+    char hdr[640];
     snprintf(hdr, sizeof(hdr),
-        "POST /prod/aircraft/manifest HTTP/1.1\r\n"
+        "%s\r\n"
         "Host: %s\r\nx-api-key: %s\r\n"
         "Content-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
-        creds.apiHost, creds.apiKey, bodyLen);
+        requestLine, creds.apiHost, creds.apiKey, bodyLen);
     TlsHandle tls = g_hal->network->connect(creds.apiHost);
     if (!tls) return false;
     bool ok = g_hal->network->write(tls, hdr, strlen(hdr)) &&
-              g_hal->network->write(tls, body, bodyLen);
-    if (ok) {
-        std::string resp = halHttpReadResponse(tls);
-        ok = resp.find("high_water_mark") != std::string::npos;
-        if (!ok) printf("[Manifest] POST failed, resp: %.200s\n", resp.c_str());
-        else      printf("[Manifest] POST OK hwm advancing to %lu\n", (unsigned long)lastFlight);
-    } else {
-        printf("[Manifest] POST write failed (TLS error)\n");
+              g_hal->network->write(tls, body, (size_t)bodyLen);
+    if (!ok) {
+        if (logTag) printf("[%s] POST write failed (TLS error)\n", logTag);
+        g_hal->network->destroy(tls);
+        return false;
     }
+    std::string resp = halHttpReadResponse(tls);
     g_hal->network->destroy(tls);
+    ok = resp.find(successToken) != std::string::npos;
+    if (!ok && logTag) printf("[%s] POST failed, resp: %.200s\n", logTag, resp.c_str());
+    return ok;
+}
+
+// POST /prod/aircraft/manifest → update manifest with new file entry.
+inline bool halUpdateManifest(const char* serial, uint32_t firstFlight,
+                              uint32_t lastFlight, const char* s3Key) {
+    char body[512];
+    snprintf(body, sizeof(body),
+        "{\"serial\":\"%s\",\"last_flight\":%lu,\"first_flight\":%lu,\"s3_key\":\"%s\"}",
+        serial, (unsigned long)lastFlight, (unsigned long)firstFlight, s3Key ? s3Key : "");
+    bool ok = halPostJson("POST /prod/aircraft/manifest HTTP/1.1", body, "high_water_mark", "Manifest");
+    if (ok) printf("[Manifest] POST OK hwm advancing to %lu\n", (unsigned long)lastFlight);
     return ok;
 }
 
@@ -639,23 +653,11 @@ inline bool halFetchCommands(const char* device, char* outText, size_t outSz) {
 // commands/{device}/ack.json for the operator. resultJson is a compact JSON string.
 // Sent BEFORE any reboot/format restart so a restart can't swallow the confirmation.
 inline bool halAckCommand(const char* device, const char* resultJson) {
-    if (!g_hal || !g_hal->network || !device || !resultJson) return false;
-    S3Creds creds = loadS3Creds();
-    if (!creds.valid) return false;
-    int bodyLen = (int)strlen(resultJson);
-    char hdr[512];
-    snprintf(hdr, sizeof(hdr),
-        "POST /prod/command/ack?device=%s HTTP/1.1\r\n"
-        "Host: %s\r\nx-api-key: %s\r\n"
-        "Content-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
-        urlEncode(device).c_str(), creds.apiHost, creds.apiKey, bodyLen);
-    TlsHandle tls = g_hal->network->connect(creds.apiHost);
-    if (!tls) return false;
-    bool ok = g_hal->network->write(tls, hdr, strlen(hdr)) &&
-              g_hal->network->write(tls, resultJson, (size_t)bodyLen);
-    if (ok) { std::string resp = halHttpReadResponse(tls); ok = resp.find("\"ok\"") != std::string::npos; }
-    g_hal->network->destroy(tls);
-    return ok;
+    if (!device || !resultJson) return false;
+    char reqLine[300];
+    snprintf(reqLine, sizeof(reqLine),
+             "POST /prod/command/ack?device=%s HTTP/1.1", urlEncode(device).c_str());
+    return halPostJson(reqLine, resultJson, "\"ok\"");
 }
 
 // POST an always-on telemetry heartbeat — the Lambda stores it latest-wins at
@@ -663,23 +665,11 @@ inline bool halAckCommand(const char* device, const char* resultJson) {
 // crash-boot count, reset reason, net, sd, rssi, heap, uptime) even when its SD or
 // app plane is wedged. bodyJson is a compact JSON snapshot. SD-independent.
 inline bool halPostHeartbeat(const char* device, const char* bodyJson) {
-    if (!g_hal || !g_hal->network || !device || !bodyJson) return false;
-    S3Creds creds = loadS3Creds();
-    if (!creds.valid) return false;
-    int bodyLen = (int)strlen(bodyJson);
-    char hdr[512];
-    snprintf(hdr, sizeof(hdr),
-        "POST /prod/command/heartbeat?device=%s HTTP/1.1\r\n"
-        "Host: %s\r\nx-api-key: %s\r\n"
-        "Content-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
-        urlEncode(device).c_str(), creds.apiHost, creds.apiKey, bodyLen);
-    TlsHandle tls = g_hal->network->connect(creds.apiHost);
-    if (!tls) return false;
-    bool ok = g_hal->network->write(tls, hdr, strlen(hdr)) &&
-              g_hal->network->write(tls, bodyJson, (size_t)bodyLen);
-    if (ok) { std::string resp = halHttpReadResponse(tls); ok = resp.find("\"ok\"") != std::string::npos; }
-    g_hal->network->destroy(tls);
-    return ok;
+    if (!device || !bodyJson) return false;
+    char reqLine[300];
+    snprintf(reqLine, sizeof(reqLine),
+             "POST /prod/command/heartbeat?device=%s HTTP/1.1", urlEncode(device).c_str());
+    return halPostJson(reqLine, bodyJson, "\"ok\"");
 }
 
 // Read the .meta sidecar for a .eaofh file and return first_flight.
