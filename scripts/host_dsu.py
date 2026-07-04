@@ -34,6 +34,7 @@ naturally waits out the presentation delay. The host always mounts -> writes -> 
 """
 
 import argparse
+import errno
 import json
 import os
 import subprocess
@@ -250,6 +251,43 @@ def unmount(mnt):
         pass
 
 
+# Transient MSC "medium not present" — the device holds the SD mutex in brief windows
+# (its ~2s sd_health_check f_stat probe, harvest remount, log flush) during which the
+# firmware's MSC read10/write10 callbacks return not-ready, so a host FS operation that
+# spans several I/Os can fail mid-write with EIO even though the SD is perfectly fine
+# (isolated single-sector reads succeed). A real aircraft DSU retries a busy drive — so
+# do we: on EIO/ENODEV, remount (fresh MSC handle + flushed cache) and retry the op.
+_BUSY_ERRNOS = (errno.EIO, errno.ENODEV, errno.EREMOTEIO)  # 5, 19, 121
+
+
+def run_resilient(action, mnt, owns, timeout, tries=10, what="op"):
+    """Run action(mnt); on a transient MSC-busy OSError, remount and retry.
+    Returns (result, mnt) — mnt may change across a remount."""
+    last = None
+    for i in range(tries):
+        try:
+            return action(mnt), mnt
+        except OSError as e:
+            if e.errno not in _BUSY_ERRNOS:
+                raise
+            last = e
+            if i == tries - 1:
+                break
+            sys.stderr.write(
+                f"[host_dsu] MSC busy ({errno.errorcode.get(e.errno, e.errno)}) during "
+                f"{what} — remount+retry {i + 1}/{tries}\n")
+            if owns:
+                try:
+                    unmount(mnt)
+                except Exception:
+                    pass
+                time.sleep(2)
+                mnt, _dev = mount_device(timeout)
+            else:
+                time.sleep(2)
+    raise last
+
+
 # ── Emit modes ──────────────────────────────────────────────────────────────────
 def date_str():
     return time.strftime("%Y%m%d")
@@ -427,25 +465,38 @@ def main():
         ap.error("one of --mount or --mount-find is required")
 
     try:
+        # All SD accesses go through run_resilient: the device's MSC LUN briefly reports
+        # not-ready while it holds the SD mutex, so any single op can hit a transient EIO
+        # that a remount+retry clears (owns=True lets it remount; --mount uses sleep+retry).
         if args.read_cookie:
-            print(read_cookie_flight(mnt))
+            (val, mnt) = run_resilient(lambda m: read_cookie_flight(m), mnt, owns,
+                                       args.mount_timeout, what="read-cookie")
+            print(val)
             return
         if args.plant_cookie is not None:
-            with open(os.path.join(mnt, "dsuCookie.easdf"), "wb") as f:
-                f.write(build_cookie(args.serial, args.plant_cookie))
+            def _plant(m):
+                with open(os.path.join(m, "dsuCookie.easdf"), "wb") as f:
+                    f.write(build_cookie(args.serial, args.plant_cookie))
+            (_, mnt) = run_resilient(_plant, mnt, owns, args.mount_timeout, what="plant-cookie")
             print(f"[host_dsu] planted cookie {args.serial} flight={args.plant_cookie}")
             return
         if args.partial is not None:
-            emit_partial(mnt, args.serial, args.partial, args.partial_preamble_kb)
+            (_, mnt) = run_resilient(
+                lambda m: emit_partial(m, args.serial, args.partial, args.partial_preamble_kb),
+                mnt, owns, args.mount_timeout, what="emit-partial")
             return
         if args.max_flight is None:
             ap.error("--max-flight is required for emit/slice modes")
         if args.mode == "slice":
-            emit_slice(mnt, args.serial, args.max_flight, args.fixture, args.metrics_src)
+            (_, mnt) = run_resilient(
+                lambda m: emit_slice(m, args.serial, args.max_flight, args.fixture, args.metrics_src),
+                mnt, owns, args.mount_timeout, what="emit-slice")
         else:
-            emit_synthetic(mnt, args.serial, args.max_flight, args.size_kb,
-                           args.first_flight, args.metrics_src, args.meta,
-                           args.ignore_cookie, args.compressible)
+            (_, mnt) = run_resilient(
+                lambda m: emit_synthetic(m, args.serial, args.max_flight, args.size_kb,
+                                         args.first_flight, args.metrics_src, args.meta,
+                                         args.ignore_cookie, args.compressible),
+                mnt, owns, args.mount_timeout, what="emit-synthetic")
     finally:
         if owns:
             unmount(mnt)

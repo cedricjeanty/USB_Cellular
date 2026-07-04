@@ -85,6 +85,30 @@ void test_harvest_triggers_with_flags_reset_then_new_write(void) {
     TEST_ASSERT_TRUE(shouldHarvest(false, true, true, 119000, 90000, 15000, 135000));
 }
 
+// ── harvestShouldDeferForHost: don't start a harvest mid-host-transaction ─────
+void test_defer_no_host_io_never_defers(void) {
+    // lastIoMs==0 → host has done no I/O → never defer.
+    TEST_ASSERT_FALSE(harvestShouldDeferForHost(0, 50000, 1500, 0, 30000));
+}
+void test_defer_while_host_active(void) {
+    // Host did I/O 300ms ago (< guard 1500) → defer.
+    TEST_ASSERT_TRUE(harvestShouldDeferForHost(49700, 50000, 1500, 49700, 30000));
+}
+void test_proceed_after_host_quiet(void) {
+    // Last host I/O 2000ms ago (>= guard 1500) → host quiet → proceed.
+    TEST_ASSERT_FALSE(harvestShouldDeferForHost(48000, 50000, 1500, 48000, 30000));
+}
+void test_defer_cap_forces_proceed(void) {
+    // Host still active (I/O 200ms ago) but we've deferred > maxDefer (30s) → proceed.
+    TEST_ASSERT_FALSE(harvestShouldDeferForHost(49800, 50000, 1500, /*deferStart*/ 15000, 30000));
+    // ...one ms before the cap it still defers.
+    TEST_ASSERT_TRUE(harvestShouldDeferForHost(49800, 50000, 1500, /*deferStart*/ 20001, 30000));
+}
+void test_defer_wrap_safe(void) {
+    // millis() wrapped: now just after 0, lastIo just before wrap → small real delta → defer.
+    TEST_ASSERT_TRUE(harvestShouldDeferForHost(0xFFFFFF00u, 200u, 1500, 0xFFFFFF00u, 30000));
+}
+
 // ── Test runner ─────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -104,6 +128,11 @@ int main(int argc, char** argv) {
     RUN_TEST(test_harvest_overflow_guard);
     RUN_TEST(test_harvest_second_trigger_after_first_completes);
     RUN_TEST(test_harvest_triggers_with_flags_reset_then_new_write);
+    RUN_TEST(test_defer_no_host_io_never_defers);
+    RUN_TEST(test_defer_while_host_active);
+    RUN_TEST(test_proceed_after_host_quiet);
+    RUN_TEST(test_defer_cap_forces_proceed);
+    RUN_TEST(test_defer_wrap_safe);
 
     return UNITY_END();
 }

@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260701120000"
+#define FW_VERSION "20260703193000"
 
 #include <cstring>
 #include <ctime>
@@ -3843,13 +3843,29 @@ static void main_loop_task(void* param) {
         uint32_t lastWr = g_lastWriteMs;
         if (shouldHarvest(g_harvesting, g_writeDetected, g_hostWasConnected,
                           lastWr, g_lastHarvestMs, g_harvestCoolMs, now, g_bootHarvestPending)) {
-            if (g_bootHarvestPending) {
-                log_write("Harvest trigger: boot scan (no quiet window)");
-                g_bootRecoveryHarvest = true;   // last flight may be a partial interrupted transfer
-            } else
-                log_write("Harvest trigger: %.1fKB, %us idle", g_hostWrittenMb * 1024.0f, (now - lastWr) / 1000);
-            g_bootHarvestPending = false;
-            if (g_harvest_task) xTaskNotifyGive(g_harvest_task);
+            // Don't START a harvest while the host is actively transacting — its
+            // multi-sector FS op (e.g. a mkdir FAT scan) would collide with the
+            // harvest's SD-mutex hold and fail with MSC EIO. Defer until the host is
+            // quiet (capped so a chatty host can't starve harvest). Boot-scan harvests
+            // run before USB is presented (g_lastIoMs==0) so they never defer.
+            static uint32_t harvestDeferStart = 0;
+            if (harvestShouldDeferForHost(g_lastIoMs, now, HARVEST_HOST_IO_GUARD_MS,
+                                          harvestDeferStart, HARVEST_MAX_DEFER_MS)) {
+                if (harvestDeferStart == 0) {
+                    harvestDeferStart = now;
+                    log_write("Harvest: host I/O active — deferring harvest");
+                }
+                // leave g_writeDetected / g_bootHarvestPending set so it re-fires next loop
+            } else {
+                harvestDeferStart = 0;
+                if (g_bootHarvestPending) {
+                    log_write("Harvest trigger: boot scan (no quiet window)");
+                    g_bootRecoveryHarvest = true;   // last flight may be a partial interrupted transfer
+                } else
+                    log_write("Harvest trigger: %.1fKB, %us idle", g_hostWrittenMb * 1024.0f, (now - lastWr) / 1000);
+                g_bootHarvestPending = false;
+                if (g_harvest_task) xTaskNotifyGive(g_harvest_task);
+            }
         }
         // Periodic STATUS log (every 60s) — replaces CLI STATUS command
         {
