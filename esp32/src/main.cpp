@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260703193000"
+#define FW_VERSION "20260704010000"
 
 #include <cstring>
 #include <ctime>
@@ -703,6 +703,17 @@ void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_siz
     log_write("SCSI: READ_CAPACITY %lu sectors (real=%lu)", (unsigned long)*block_count, (unsigned long)g_card_sectors);
 }
 
+// MSC callbacks contend with the device's own brief SD ops (log flush, ~2s health
+// probe, upload file reads) for g_sd_mutex. The old 100ms acquire timeout was too
+// short: a host readahead burst (e.g. a mkdir FAT scan) that collided with one of
+// those ops had a read10 time out → return -1 → TinyUSB reports SCSI "medium not
+// present" → the whole host FS op fails with EIO (the SD is fine — verified by raw
+// single-sector reads succeeding). A LONGER bounded wait fixes it without reintroducing
+// the [[feedback_msc_stack]] crash: that was about NOT blocking *indefinitely*
+// (portMAX_DELAY), not about the duration — stack usage is identical. And a real harvest
+// returns above via the g_msc_ejected/g_harvesting guard BEFORE the mutex, so this wait
+// only ever applies to the device's SHORT ops (which release in well under a second).
+#define MSC_SD_MUTEX_MS 3000
 static uint32_t g_read10_count = 0;
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                            void *buffer, uint32_t bufsize) {
@@ -711,7 +722,7 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
     if (g_read10_count == 1) log_write("SCSI: first READ10 lba=%lu len=%lu", (unsigned long)lba, (unsigned long)bufsize);
     if (lba + bufsize / 512 > msc_visible_sectors()) return -1;
     if (!g_sd_ready || g_harvesting || g_msc_ejected) return -1;
-    if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return -1;
+    if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(MSC_SD_MUTEX_MS)) != pdTRUE) return -1;
     esp_err_t err = sdmmc_read_sectors(g_card, buffer, lba, bufsize / 512);
     xSemaphoreGive(g_sd_mutex);
     if (err == ESP_OK) g_lastIoMs = millis();
@@ -727,7 +738,7 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
     if (g_msc_write_calls == 1) log_write("SCSI: first WRITE10 lba=%lu len=%lu", (unsigned long)lba, (unsigned long)bufsize);
     if (lba + bufsize / 512 > msc_visible_sectors()) { g_msc_write_reject++; return -1; }
     if (!g_sd_ready || g_harvesting || g_msc_ejected) { g_msc_write_reject++; return -1; }
-    if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return -1;
+    if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(MSC_SD_MUTEX_MS)) != pdTRUE) return -1;
     esp_err_t err = sdmmc_write_sectors(g_card, buffer, lba, bufsize / 512);
     xSemaphoreGive(g_sd_mutex);
     if (err == ESP_OK) {
@@ -1642,8 +1653,15 @@ static bool otaDownloadAndFlash(const char* host, const char* path, uint32_t exp
     const int OTA_MAX_ATTEMPTS = 4;
     uint32_t total = expectedSize;   // full image size (from the version check)
 
-    const esp_partition_t* update_part = esp_ota_get_next_update_partition(NULL);
-    if (!update_part) { log_write("OTA: no partition"); return false; }
+    // Select the OTHER OTA slot relative to the ACTUALLY-running partition — NOT NULL.
+    // NULL makes esp-idf use esp_ota_get_boot_partition() (the ota_data-configured slot);
+    // if ota_data is blank/invalid (seen after a partial/aborted flash) that returns NULL
+    // → "OTA: no partition" and OTA is permanently stuck even though the running app is a
+    // valid OTA slot. esp_ota_get_running_partition() is always valid, so pairing it makes
+    // OTA self-heal through a corrupt ota_data. (The SD-flash path already does this.)
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    const esp_partition_t* update_part = esp_ota_get_next_update_partition(running);
+    if (!update_part) { log_write("OTA: no partition (running=%s)", running ? running->label : "?"); return false; }
 
     esp_ota_handle_t ota_handle;
     esp_err_t err = esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
