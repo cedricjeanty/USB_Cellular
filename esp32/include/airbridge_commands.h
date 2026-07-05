@@ -45,6 +45,7 @@ enum CmdType {
     CMD_SURVEY,      // antenna signal-survey mode (no PPP)     — boot-only (changes duty cycle)
     CMD_COMPRESS,    // gzip .eaofh into the upload queue        — runtime-safe (takes effect next harvest)
     CMD_MODEM_RESET, // full modem factory reset (clear band/operator lock + reboot module) — runtime-safe
+    CMD_FLASH,       // download firmware from S3 to P2 + SD-flash (OTA-independent remote reflash) — runtime-safe
 };
 
 struct Command {
@@ -68,6 +69,7 @@ inline CmdType cmdVerbType(const char* verb, bool* runtimeSafe) {
         { "survey",    CMD_SURVEY,    false },
         { "compress",  CMD_COMPRESS,  true  },
         { "modem_reset", CMD_MODEM_RESET, true },
+        { "flash",     CMD_FLASH,     true  },
         { "modemreset",  CMD_MODEM_RESET, true },
     };
     for (auto& e : table) {
@@ -310,6 +312,7 @@ struct CmdRunResult {
     bool survey;     // a survey directive ran (caller: g_surveyMode=true)
     int  surveyBand; // 0=none, -1=auto, >0=lock LTE band N
     bool modemReset; // a modem_reset directive ran (caller: modemFactoryReset on the modem task)
+    bool flash;      // a flash directive ran (caller: download firmware->P2 + SD-flash reboot)
     int  rewrite;    // 0=no change, 1=write *out, 2=delete file (once-stripping)
 };
 
@@ -351,6 +354,7 @@ inline CmdRunResult runCommandTextBuffer(const char* text, bool runtimeOnly,
             case CMD_REBOOT:    res.reboot = true; break;
             case CMD_FORMAT_SD: res.format = true; break;
             case CMD_MODEM_RESET: res.modemReset = true; break;
+            case CMD_FLASH: res.flash = true; airbridge_log("CMD: flash — reflash from S3 (OTA-independent)"); break;
             case CMD_SURVEY: {
                 res.survey = true;
                 const char* b = strstr(c.args, "band=");

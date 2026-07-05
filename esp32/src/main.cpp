@@ -585,6 +585,12 @@ static volatile bool g_restartRequested = false;
 // factory reset — the modem task owns the UART, so the reset must run there, never from
 // the spawned poll task (two tasks driving AT over the same UART would collide).
 static volatile bool g_modemResetRequested = false;
+// Set by the remote command poll for a `flash` directive: OTA-INDEPENDENT remote reflash.
+// A dedicated 32KB task downloads the staged firmware from S3 into P2 /sdcard/firmware.bin,
+// then reboots — the boot-time SD-flash path writes it to the sibling OTA slot using the
+// running partition (robust against a wedged ota_data that breaks the normal OTA path).
+static volatile bool g_flashRequested = false;
+static volatile bool g_flashRunning   = false;
 
 // ── Cellular modem (SIM7600) ────────────────────────────────────────────────
 static esp_netif_t      *g_ppp_netif    = nullptr;
@@ -1858,6 +1864,86 @@ static int otaCheck() {
     return 1;
 }
 
+// OTA-INDEPENDENT remote reflash (the `flash` command directive). The normal OTA path
+// writes to the sibling slot chosen from ota_data; if ota_data is wedged that path is
+// dead. This one instead downloads the staged firmware into P2 /sdcard/firmware.bin and
+// reboots — the boot-time SD-flash handler then writes it to the sibling of the
+// *running* partition (always valid). So a unit reachable over cellular can always be
+// reflashed from S3 even with a corrupt ota_data / dead OTA slot. Runs in its own 32KB
+// task (TLS + file I/O). Uses the SAME staged firmware/latest.bin as OTA (bump the
+// version to force it, exactly like OTA).
+static void flashViaSdOverCellular() {
+    if (!g_fatfs_mounted) { log_write("FLASH: SD not mounted — cannot stage firmware.bin"); return; }
+    log_write("FLASH: remote reflash — fetching staged firmware from S3");
+    OtaCheckResult ota = halOtaCheck(FW_VERSION);
+    if (ota.status != 1) { log_write("FLASH: no newer firmware staged (status=%d) — bump the version", ota.status); return; }
+
+    char host[128]; static char path[2500];
+    if (!parseUrl(std::string(ota.downloadUrl), host, sizeof(host), path, sizeof(path))) {
+        log_write("FLASH: bad download URL"); return;
+    }
+    char dst[64]; snprintf(dst, sizeof(dst), "%s/firmware.bin", SD_MOUNT);
+    char dtmp[64]; snprintf(dtmp, sizeof(dtmp), "%s/_dl_firmware.bin", SD_MOUNT);
+
+    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+    FILE* f = fopen(dtmp, "wb");
+    xSemaphoreGive(g_sd_mutex);
+    if (!f) { log_write("FLASH: cannot open %s", dtmp); return; }
+
+    uint32_t total = ota.size, received = 0;
+    bool complete = false, hardFail = false;
+    for (int attempt = 0; attempt < 4 && !complete && !hardFail; attempt++) {
+        g_tlsActive = true;
+        esp_tls_t* tls = tls_connect(host);
+        if (!tls) { g_tlsActive = false; vTaskDelay(pdMS_TO_TICKS(3000)); continue; }
+        std::string req = buildRangeGetRequest(host, path, received);   // Range resume
+        if (!tls_write_all(tls, req.c_str(), req.size())) { tls_destroy(tls); g_tlsActive = false; continue; }
+        // headers
+        int status = 0, contentLength = 0; char line[512];
+        while (true) {
+            int pos = 0;
+            while (pos < (int)sizeof(line) - 1) { char c; int r = esp_tls_conn_read(tls, &c, 1); if (r <= 0) goto hdr_done; line[pos++] = c; if (c == '\n') break; }
+            line[pos] = '\0';
+            if (status == 0 && strncmp(line, "HTTP/", 5) == 0) { const char* sp = strchr(line, ' '); if (sp) status = atoi(sp + 1); }
+            if (strncasecmp(line, "Content-Length:", 15) == 0) contentLength = atoi(line + 15);
+            if (pos <= 2 && (line[0] == '\r' || line[0] == '\n')) break;
+        }
+hdr_done:
+        if (received > 0 && status == 200) {   // server ignored Range — restart file
+            xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fseek(f, 0, SEEK_SET); xSemaphoreGive(g_sd_mutex); received = 0;
+        } else if (!(status == 200 || status == 206)) { tls_destroy(tls); g_tlsActive = false; vTaskDelay(pdMS_TO_TICKS(3000)); continue; }
+        if (total == 0 && status == 200 && contentLength > 0) total = (uint32_t)contentLength;
+        char buf[2048];
+        while (total == 0 || received < total) {
+            int len = esp_tls_conn_read(tls, buf, sizeof(buf));
+            if (len > 0) {
+                xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                size_t w = fwrite(buf, 1, len, f);
+                xSemaphoreGive(g_sd_mutex);
+                if (w != (size_t)len) { log_write("FLASH: SD write failed at %lu", (unsigned long)received); hardFail = true; break; }
+                received += (uint32_t)len;
+                if (total > 0 && (received % 65536) < (uint32_t)len)
+                    log_write("FLASH: %lu/%lu bytes", (unsigned long)received, (unsigned long)total);
+            } else break;
+        }
+        tls_destroy(tls); g_tlsActive = false;
+        if (total > 0 && received >= total) complete = true;
+        else if (attempt < 3) vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+    xSemaphoreTake(g_sd_mutex, portMAX_DELAY); fclose(f); xSemaphoreGive(g_sd_mutex);
+
+    if (!complete || (total > 0 && received != total)) {
+        log_write("FLASH: download incomplete %lu/%lu — aborting", (unsigned long)received, (unsigned long)total);
+        xSemaphoreTake(g_sd_mutex, portMAX_DELAY); remove(dtmp); xSemaphoreGive(g_sd_mutex);
+        return;
+    }
+    // Atomic-rename into place so a partial download can never be half-flashed at boot.
+    xSemaphoreTake(g_sd_mutex, portMAX_DELAY); remove(dst); rename(dtmp, dst); xSemaphoreGive(g_sd_mutex);
+    log_write("FLASH: firmware.bin staged on SD (%lu bytes) — rebooting to SD-flash", (unsigned long)received);
+    cdc_printf("FLASH: staged %lu bytes — rebooting to SD-flash\r\n", (unsigned long)received);
+    g_restartRequested = true;   // main_loop reboots → boot-time SD-flash applies it
+}
+
 
 // SKIP_NAMES[], isSkipped() — moved to airbridge_utils.h
 
@@ -2674,10 +2760,10 @@ static void modemTask(void* param) {
                         char ack[320];
                         snprintf(ack, sizeof(ack),
                             "{\"fw\":\"%s\",\"ran\":%s,\"reboot\":%s,\"format\":%s,\"cdc\":%s,"
-                            "\"survey\":%s,\"compress\":%s,\"modem_reset\":%s,\"uptime_s\":%lu}",
+                            "\"survey\":%s,\"compress\":%s,\"modem_reset\":%s,\"flash\":%s,\"uptime_s\":%lu}",
                             FW_VERSION, cr.ran?"true":"false", cr.reboot?"true":"false",
                             cr.format?"true":"false", cr.cdc?"true":"false", cr.survey?"true":"false",
-                            g_compress?"true":"false", cr.modemReset?"true":"false",
+                            g_compress?"true":"false", cr.modemReset?"true":"false", cr.flash?"true":"false",
                             (unsigned long)(millis()/1000));
                         halAckCommand(g_deviceId, ack);
                         if (cr.cdc)     g_msc_only = false;                       // effective next boot
@@ -2685,6 +2771,10 @@ static void modemTask(void* param) {
                         if (cr.modemReset) {                                     // modem task does the reset (owns UART)
                             airbridge_log("CMD: modem_reset — requesting full modem factory reset");
                             g_modemResetRequested = true;
+                        }
+                        if (cr.flash) {                                          // heavy download → dedicated 32KB task
+                            airbridge_log("CMD: flash — requesting OTA-independent reflash from S3");
+                            g_flashRequested = true;
                         }
                         if (cr.format) {
                             airbridge_log("CMD: format_sd — flags set, requesting reboot");
@@ -2845,6 +2935,21 @@ static void modemTask(void* param) {
                 hbRunning = false;
                 vTaskDelete(nullptr);
             }, "heartbeat", 8192, nullptr, 2, nullptr, 1);
+        }
+
+        // ── OTA-independent remote reflash (`flash` command) ──────────────
+        // A dedicated 32KB task (TLS + SD file I/O too heavy for the modem stack)
+        // downloads the staged firmware to P2 firmware.bin then reboots into the
+        // robust SD-flash path. Fires once per request, spawned not inline so it
+        // never blocks the PPP pump.
+        if (g_flashRequested && !g_flashRunning && g_pppConnected && g_deviceId[0]) {
+            g_flashRequested = false;
+            g_flashRunning = true;
+            xTaskCreatePinnedToCore([](void*) {
+                flashViaSdOverCellular();
+                g_flashRunning = false;
+                vTaskDelete(nullptr);
+            }, "reflash", 32768, nullptr, 2, nullptr, 1);
         }
 
         // ── One-shot coredump egress (survival plane) ────────────────────

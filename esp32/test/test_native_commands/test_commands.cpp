@@ -97,6 +97,17 @@ void test_parse_modem_reset(void) {
     TEST_ASSERT_TRUE(r.modemReset);
 }
 
+void test_parse_flash(void) {
+    Command c;
+    TEST_ASSERT_TRUE(cmdParseLine("flash", &c));
+    TEST_ASSERT_EQUAL(CMD_FLASH, c.type);
+    TEST_ASSERT_TRUE(c.runtimeSafe);   // downloads + reboots via SD-flash, no boot gate
+    // Executor sets cr.flash (firmware then downloads firmware->P2 + reboots to SD-flash)
+    CmdRunResult r = runCommandTextBuffer("flash\n", false, "", "", "", nullptr, 0, false);
+    TEST_ASSERT_TRUE(r.ran);
+    TEST_ASSERT_TRUE(r.flash);
+}
+
 void test_parse_unknown_verb(void) {
     Command c;
     TEST_ASSERT_TRUE(cmdParseLine("frobnicate now", &c));
@@ -239,6 +250,7 @@ int main(int, char**) {
     RUN_TEST(test_parse_survey);
     RUN_TEST(test_parse_compress);
     RUN_TEST(test_parse_modem_reset);
+    RUN_TEST(test_parse_flash);
     RUN_TEST(test_parse_unknown_verb);
     RUN_TEST(test_parse_once_not_mistaken_in_args);
     RUN_TEST(test_parse_multiline);
