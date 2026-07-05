@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260704010000"
+#define FW_VERSION "20260704060000"
 
 #include <cstring>
 #include <ctime>
@@ -3058,38 +3058,6 @@ static void uploadProgressCb(uint32_t sent, uint32_t total) {
     g_uploadingMb = g_uploadBaseMb + sent / 1e6f;
 }
 
-// Extract the DSU serial (offset 9, ASCII, trailing non-printables trimmed, ≤42 chars)
-// from a 78-byte cookie into `out`. Caller must have verified the EA1E magic. out must
-// hold outSz≥1 bytes; the write-side inverse is buildDsuCookie() in airbridge_proto.h.
-static void cookieSerial(const uint8_t* ck, char* out, size_t outSz) {
-    size_t n = outSz - 1; if (n > 42) n = 42;
-    memcpy(out, ck + 9, n); out[n] = '\0';
-    for (int j = (int)n - 1; j >= 0; j--) {
-        if ((uint8_t)out[j] < 0x20 || (uint8_t)out[j] > 0x7E) out[j] = '\0';
-        else break;
-    }
-}
-
-// Decode a 156-char hex "cookie" JSON field into 78 bytes; if the EA1E magic matches,
-// write it to the DSU under the SD mutex and set g_s3CookieActive. Returns true iff a
-// valid cookie was applied. A hex string that isn't exactly 156 chars, has bad magic, or
-// whose write fails → false (no state change). Callers gate their "none" logging on
-// hex.size() != 156 to preserve the original "silent on malformed-but-156" behavior.
-static bool applyHexCookie(const std::string& hex) {
-    if (hex.size() != 156) return false;
-    uint8_t cookie[78];
-    for (int i = 0; i < 78; i++) {
-        char h[3] = { hex[i*2], hex[i*2+1], 0 };
-        cookie[i] = (uint8_t)strtoul(h, nullptr, 16);
-    }
-    if (cookie[0] != 0xEA || cookie[1] != 0x1E) return false;
-    bool applied = false;
-    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-    if (write_cookie_to_dsu(cookie, 78)) { g_s3CookieActive = true; applied = true; }
-    xSemaphoreGive(g_sd_mutex);
-    return applied;
-}
-
 // ── Upload task ─────────────────────────────────────────────────────────────
 static void uploadTask(void* param) {
     (void)param;
@@ -3238,10 +3206,24 @@ static void uploadTask(void* param) {
                 std::string resp = httpReadResponse(tls);
                 // Response is JSON: {"cookie":"<hex>","size":78} or {"error":"..."}
                 std::string hexStr = jsonStr(resp, "cookie");
-                if (applyHexCookie(hexStr)) {
-                    log_write("S3 cookie applied (overrides harvest cookie)");
-                    cdc_printf("S3 cookie: applied\r\n");
-                } else if (hexStr.size() != 156) {
+                if (hexStr.size() == 156) {  // 78 bytes × 2 hex chars
+                    // Decode hex to binary
+                    uint8_t cookie[78];
+                    for (int i = 0; i < 78; i++) {
+                        char h[3] = { hexStr[i*2], hexStr[i*2+1], 0 };
+                        cookie[i] = (uint8_t)strtoul(h, nullptr, 16);
+                    }
+                    // Verify magic
+                    if (cookie[0] == 0xEA && cookie[1] == 0x1E) {
+                        xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                        if (write_cookie_to_dsu(cookie, 78)) {
+                            g_s3CookieActive = true;
+                            log_write("S3 cookie applied (overrides harvest cookie)");
+                            cdc_printf("S3 cookie: applied\r\n");
+                        }
+                        xSemaphoreGive(g_sd_mutex);
+                    }
+                } else {
                     cdc_printf("S3 cookie: none\r\n");
                 }
             }
@@ -3265,7 +3247,12 @@ static void uploadTask(void* param) {
             if (cf) {
                 uint8_t ck[78];
                 if (fread(ck, 1, 78, cf) == 78 && ck[0] == 0xEA && ck[1] == 0x1E) {
-                    cookieSerial(ck, acSerial, sizeof(acSerial));
+                    size_t n = sizeof(acSerial) - 1; if (n > 42) n = 42;
+                    memcpy(acSerial, ck + 9, n); acSerial[n] = '\0';
+                    for (int j = (int)n - 1; j >= 0; j--) {
+                        if ((uint8_t)acSerial[j] < 0x20 || (uint8_t)acSerial[j] > 0x7E)
+                            acSerial[j] = '\0'; else break;
+                    }
                 }
                 fclose(cf);
             }
@@ -3289,10 +3276,22 @@ static void uploadTask(void* param) {
                 if (tls_write_all(tls, req, rlen)) {
                     std::string resp = httpReadResponse(tls);
                     std::string hexStr = jsonStr(resp, "cookie");
-                    if (applyHexCookie(hexStr)) {
-                        log_write("Aircraft cookie applied: %s", acSerial);
-                        cdc_printf("Aircraft cookie: applied for %s\r\n", acSerial);
-                    } else if (hexStr.size() != 156 && resp.find("404") == std::string::npos) {
+                    if (hexStr.size() == 156) {
+                        uint8_t cookie[78];
+                        for (int i = 0; i < 78; i++) {
+                            char h[3] = { hexStr[i*2], hexStr[i*2+1], 0 };
+                            cookie[i] = (uint8_t)strtoul(h, nullptr, 16);
+                        }
+                        if (cookie[0] == 0xEA && cookie[1] == 0x1E) {
+                            xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+                            if (write_cookie_to_dsu(cookie, 78)) {
+                                g_s3CookieActive = true;
+                                log_write("Aircraft cookie applied: %s", acSerial);
+                                cdc_printf("Aircraft cookie: applied for %s\r\n", acSerial);
+                            }
+                            xSemaphoreGive(g_sd_mutex);
+                        }
+                    } else if (resp.find("404") == std::string::npos) {
                         log_write("Aircraft cookie: none for %s", acSerial);
                     }
                 }
@@ -3329,7 +3328,15 @@ static void uploadTask(void* param) {
             if (cf) {
                 uint8_t ck[78];
                 if (fread(ck, 1, 78, cf) == 78 && ck[0] == 0xEA && ck[1] == 0x1E) {
-                    cookieSerial(ck, bootSerial, sizeof(bootSerial));
+                    size_t copyLen = sizeof(bootSerial) - 1;
+                    if (copyLen > 42) copyLen = 42;
+                    memcpy(bootSerial, ck + 9, copyLen);
+                    bootSerial[copyLen] = '\0';
+                    for (int j = (int)copyLen - 1; j >= 0; j--) {
+                        if ((uint8_t)bootSerial[j] < 0x20 || (uint8_t)bootSerial[j] > 0x7E)
+                            bootSerial[j] = '\0';
+                        else break;
+                    }
                     bootLocalFlight = ((uint32_t)ck[62] << 24) | ((uint32_t)ck[63] << 16)
                                     | ((uint32_t)ck[64] << 8) | ck[65];
                     if (bootLocalFlight == 0xFFFFFFFF) { bootLocalFlight = 0; bootSerial[0] = '\0'; }
