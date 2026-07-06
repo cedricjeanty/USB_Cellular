@@ -115,7 +115,14 @@ inline std::string buildRangeGetRequest(const char* host, const char* path,
     return std::string(req);
 }
 
+// Last HTTP status code seen by an s3ApiGet*ViaHal call. Lets a caller (the command
+// poll) tell a backend AUTH failure (401/403 — creds are wrong) apart from a network
+// failure or empty body, which is what runtime credential rollback keys on. 0 = no
+// response (connect/read failed) — deliberately NOT treated as an auth failure.
+inline int& halLastApiStatus() { static int s = 0; return s; }
+
 inline std::string s3ApiGetPathViaHal(const char* host, const char* apiKey, const char* path) {
+    halLastApiStatus() = 0;
     if (!g_hal || !g_hal->network) return "";
     TlsHandle tls = g_hal->network->connect(host);
     if (!tls) return "";
@@ -124,7 +131,9 @@ inline std::string s3ApiGetPathViaHal(const char* host, const char* apiKey, cons
         g_hal->network->destroy(tls);
         return "";
     }
-    std::string resp = halHttpReadResponse(tls);
+    int st = 0;
+    std::string resp = halHttpReadResponse(tls, nullptr, 0, &st);
+    halLastApiStatus() = st;
     g_hal->network->destroy(tls);
     return resp;
 }

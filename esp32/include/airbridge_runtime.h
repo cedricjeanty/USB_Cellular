@@ -93,6 +93,17 @@ inline bool credsShouldFallback(uint32_t unconfirmedBoots, bool hasBackup,
     return hasBackup && unconfirmedBoots >= threshold;
 }
 
+// Runtime sibling of credsShouldFallback: the boot version only advances its counter at
+// boot, so a STABLE unit (a bad `s3` command set wrong creds but it never reboots) stays
+// severed from the backend indefinitely — uploads/commands 403 while the cached-globals
+// heartbeat keeps looking alive on stale-good creds. This drives an in-RAM rollback keyed
+// on CONSECUTIVE backend AUTH failures (HTTP 401/403), reset by any confirmed success. Same
+// invariant: only roll back if a previous-known-good backup exists. Pure so it's unit-tested.
+inline bool credsShouldRuntimeRollback(uint32_t consecutiveAuthFails, bool hasBackup,
+                                       uint32_t threshold = 3) {
+    return hasBackup && consecutiveAuthFails >= threshold;
+}
+
 // ── SD-card runtime health / recovery escalation ────────────────────────────
 // A card that goes bad mid-flight (corrupt FAT, SPI flake) must never silently
 // wedge the unit. The firmware probes the SD periodically and feeds the count of

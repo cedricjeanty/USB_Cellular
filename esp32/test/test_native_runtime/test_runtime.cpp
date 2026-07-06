@@ -302,6 +302,22 @@ void test_creds_fallback(void) {
     TEST_ASSERT_TRUE(credsShouldFallback(5, true, 5));
 }
 
+void test_creds_runtime_rollback(void) {
+    // Runtime rollback keyed on consecutive backend AUTH failures (no reboot needed).
+    // Confirmed / no failures → no rollback.
+    TEST_ASSERT_FALSE(credsShouldRuntimeRollback(0, true));
+    // No backup → nowhere to roll back to.
+    TEST_ASSERT_FALSE(credsShouldRuntimeRollback(9, false));
+    // Below threshold → a transient 403 must not trip it.
+    TEST_ASSERT_FALSE(credsShouldRuntimeRollback(2, true));
+    // Sustained auth failures WITH a backup → roll back at runtime.
+    TEST_ASSERT_TRUE(credsShouldRuntimeRollback(3, true));
+    TEST_ASSERT_TRUE(credsShouldRuntimeRollback(7, true));
+    // Configurable threshold.
+    TEST_ASSERT_FALSE(credsShouldRuntimeRollback(4, true, 5));
+    TEST_ASSERT_TRUE(credsShouldRuntimeRollback(5, true, 5));
+}
+
 // ── SD recovery escalation ──────────────────────────────────────────────────
 
 void test_sd_recovery_healthy(void) {
@@ -419,6 +435,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_bootmode_broken_ota_rollback);
     RUN_TEST(test_bootmode_custom_threshold);
     RUN_TEST(test_creds_fallback);
+    RUN_TEST(test_creds_runtime_rollback);
 
     RUN_TEST(test_sd_recovery_healthy);
     RUN_TEST(test_sd_recovery_degrade_band);

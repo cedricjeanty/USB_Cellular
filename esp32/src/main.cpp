@@ -1340,6 +1340,12 @@ static void doUpdateDisplay() {
 static char g_apiHost[128] = "";
 static char g_apiKey[64]   = "";
 static char g_deviceId[24] = "";  // 12-hex MAC id, or "TEST_<12hex>" (17) in e2e builds
+// Runtime credential self-heal (sibling of the boot fallback): a bad `s3` command can
+// sever the backend channel and a STABLE unit never reboots to trigger the boot rollback.
+// Count consecutive backend AUTH failures (401/403); once past the threshold with a
+// known-good backup, roll back to it in RAM+NVS — no reboot. Reset on any confirmed reach.
+static uint32_t g_credAuthFails = 0;
+static bool     g_credsConfirmedThisBoot = false;  // latches s3ConfirmCreds; cleared by rollback
 
 static bool s3LoadCreds() {
     if (g_apiHost[0] && g_apiKey[0] && g_deviceId[0]) return true;
@@ -1379,16 +1385,47 @@ static bool s3LoadCreds() {
 // the unconfirmed-boot counter so credsShouldFallback stops considering a rollback: the
 // creds provably work. Idempotent + cheap (skips after the first confirm this boot).
 static void s3ConfirmCreds() {
-    static bool done = false;
-    if (done) return;
+    g_credAuthFails = 0;   // any confirmed reach clears the runtime auth-failure streak
+    if (g_credsConfirmedThisBoot) return;
     nvs_handle_t h;
     if (nvs_open("s3", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h, "creds_ok", 1);
         nvs_set_u32(h, "cred_boots", 0);
         nvs_commit(h); nvs_close(h);
-        done = true;
+        g_credsConfirmedThisBoot = true;
         log_write("S3 creds confirmed working (backend reached)");
     }
+}
+
+// Runtime credential rollback — the no-reboot sibling of the boot fallback
+// (bootProvisionCreds). Reloads the last known-good creds from api_host_bak/api_key_bak
+// into BOTH the NVS plane (what uploads/commands read via loadS3Creds) AND the cached
+// globals (what the heartbeat reads), so a bad `s3` command that severed the channel is
+// healed WITHOUT waiting for 3 reboots. Leaves creds_ok=0 so the restored set must
+// re-earn confirmation. Returns true if a rollback was performed.
+static bool s3RuntimeRollback() {
+    nvs_handle_t h;
+    if (nvs_open("s3", NVS_READWRITE, &h) != ESP_OK) return false;
+    char bakHost[128] = ""; size_t hl = sizeof(bakHost);
+    char bakKey[64]   = ""; size_t kl = sizeof(bakKey);
+    bool ok = (nvs_get_str(h, "api_host_bak", bakHost, &hl) == ESP_OK && bakHost[0] &&
+               nvs_get_str(h, "api_key_bak",  bakKey,  &kl) == ESP_OK && bakKey[0]);
+    if (ok) {
+        nvs_set_str(h, "api_host", bakHost);
+        nvs_set_str(h, "api_key",  bakKey);
+        nvs_set_u8 (h, "creds_ok", 0);
+        nvs_set_u32(h, "cred_boots", 0);
+        nvs_commit(h);
+    }
+    nvs_close(h);
+    if (!ok) return false;
+    // Sync the cached globals (cliSetS3 never touches them) + re-arm confirmation.
+    strlcpy(g_apiHost, bakHost, sizeof(g_apiHost));
+    strlcpy(g_apiKey,  bakKey,  sizeof(g_apiKey));
+    g_credsConfirmedThisBoot = false;
+    g_credAuthFails = 0;
+    log_write("S3 creds: runtime auth failures — rolled back to previous known-good (%s)", bakHost);
+    return true;
 }
 
 // ── TLS HTTP helpers ────────────────────────────────────────────────────────
@@ -2775,7 +2812,32 @@ static void modemTask(void* param) {
                 xTaskCreatePinnedToCore([](void* arg) {
                     volatile bool* running = (volatile bool*)arg;
                     static char cmdText[1024];
-                    if (halFetchCommands(g_deviceId, cmdText, sizeof(cmdText)) && cmdText[0]) {
+                    bool gotCmd = halFetchCommands(g_deviceId, cmdText, sizeof(cmdText));
+                    // Runtime credential self-heal: the command channel reads the NVS creds
+                    // (loadS3Creds), so a bad `s3` command 403s HERE (while the cached-globals
+                    // heartbeat still looks alive on stale-good creds). A 401/403 means the
+                    // creds are wrong, not that the link is down — count it, and once past the
+                    // threshold roll back to the known-good backup in RAM+NVS, then re-poll.
+                    // 0 status = connect/read failure (network) → NOT counted.
+                    int apiStatus = halLastApiStatus();
+                    if (apiStatus == 401 || apiStatus == 403) {
+                        g_credAuthFails++;
+                        char bh[128] = ""; size_t bl = sizeof(bh);
+                        bool hasBak = false;
+                        nvs_handle_t hb;
+                        if (nvs_open("s3", NVS_READONLY, &hb) == ESP_OK) {
+                            hasBak = (nvs_get_str(hb, "api_host_bak", bh, &bl) == ESP_OK && bh[0]);
+                            nvs_close(hb);
+                        }
+                        airbridge_log("CMD: backend auth failure (HTTP %d), fail #%u", apiStatus, (unsigned)g_credAuthFails);
+                        if (credsShouldRuntimeRollback(g_credAuthFails, hasBak) && s3RuntimeRollback()) {
+                            // rolled back; next 300s poll (or the retry below) uses good creds
+                            if (halFetchCommands(g_deviceId, cmdText, sizeof(cmdText))) gotCmd = true;
+                        }
+                    } else if (apiStatus >= 200 && apiStatus < 300) {
+                        g_credAuthFails = 0;   // backend reached with the active creds
+                    }
+                    if (gotCmd && cmdText[0]) {
                         airbridge_log("CMD: remote command received (%u bytes)", (unsigned)strlen(cmdText));
                         CmdRunResult cr = runCommandTextBuffer(
                             cmdText, /*runtimeOnly=*/false, "/sdcard/diag", "/sdcard/logs",
