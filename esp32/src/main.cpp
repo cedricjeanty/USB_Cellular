@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260704060000"
+#define FW_VERSION "20260706041600"
 
 #include <cstring>
 #include <ctime>
@@ -406,6 +406,14 @@ static uint32_t g_harvestCoolMs  = 30000;
 static TaskHandle_t g_upload_task  = nullptr;
 static TaskHandle_t g_harvest_task = nullptr;
 static uint32_t     g_card_sectors = 0;
+
+// Min free stack (bytes, ESP-IDF units) ever seen for a task — the smoking gun for a
+// stack-overflow crash. Surfaced in STATUS + heartbeat so a LIVE unit (or the next
+// hardware run) self-reports how close the deep upload/multipart-resume path came to
+// blowing the 32KB upload stack, WITHOUT needing a coredump. 0 = handle not yet created.
+static inline uint32_t taskStackFree(TaskHandle_t h) {
+    return h ? (uint32_t)uxTaskGetStackHighWaterMark(h) : 0;
+}
 
 // Cap USB-visible capacity at 8 GB (aircraft expects 4-16 GB FAT32 drive)
 #define MSC_MAX_SECTORS  ((uint32_t)(8ULL * 1024 * 1024 * 1024 / 512))  // 16,777,216
@@ -2899,7 +2907,7 @@ static void modemTask(void* param) {
         // telemetry gap that blinded us when a unit went dark on a stale log.
         static uint32_t lastHbMs = 0;
         static volatile bool hbRunning = false;
-        static char hbBody[384];
+        static char hbBody[512];
         if (g_pppConnected && !hbRunning && g_deviceId[0] &&
             (lastHbMs == 0 || (millis() - lastHbMs) > 60000)) {
             lastHbMs = millis();
@@ -2907,12 +2915,16 @@ static void modemTask(void* param) {
             snprintf(hbBody, sizeof(hbBody),
                 "{\"device\":\"%s\",\"fw\":\"%s\",\"mode\":\"%s\",\"boots\":%lu,"
                 "\"reset_reason\":%d,\"net\":\"%s\",\"sd_mounted\":%s,\"rssi\":%d,"
-                "\"rsrp\":%d,\"sinr\":%d,\"heap\":%lu,\"uptime_s\":%lu}",
+                "\"rsrp\":%d,\"sinr\":%d,\"heap\":%lu,\"uptime_s\":%lu,"
+                "\"up_stk\":%lu,\"hv_stk\":%lu,\"md_stk\":%lu}",
                 g_deviceId, FW_VERSION, g_safe_mode ? "safe" : "healthy",
                 (unsigned long)g_crashBoots, g_resetReason,
                 g_pppConnected ? "ppp" : "none", g_fatfs_mounted ? "true" : "false",
                 g_modemRssi, g_modemRsrp, g_modemSinr,
-                (unsigned long)esp_get_free_heap_size(), (unsigned long)(millis() / 1000));
+                (unsigned long)esp_get_free_heap_size(), (unsigned long)(millis() / 1000),
+                (unsigned long)taskStackFree(g_upload_task),
+                (unsigned long)taskStackFree(g_harvest_task),
+                (unsigned long)taskStackFree(g_modem_task));
             xTaskCreatePinnedToCore([](void*) {
                 do {
                     if (!s3LoadCreds()) break;
@@ -4002,7 +4014,7 @@ static void main_loop_task(void* param) {
             static uint32_t lastStatusMs = 0;
             if (now - lastStatusMs >= 60000) {
                 lastStatusMs = now;
-                airbridge_log("STATUS fw=%s device=%s net=%s rssi=%d rsrp=%d sinr=%d lat=%.0fms(%lus) up=%.0fKB/s q=%u upn=%u mbq=%.1f mbup=%.1f heap=%lu",
+                airbridge_log("STATUS fw=%s device=%s net=%s rssi=%d rsrp=%d sinr=%d lat=%.0fms(%lus) up=%.0fKB/s q=%u upn=%u mbq=%.1f mbup=%.1f heap=%lu stk(up/hv/md)=%lu/%lu/%lu",
                     FW_VERSION, g_deviceId,
                     g_pppConnected ? "ppp" : (g_netConnected ? "wifi" : "none"),
                     g_modemRssi, g_modemRsrp, g_modemSinr,
@@ -4010,7 +4022,10 @@ static void main_loop_task(void* param) {
                     g_lastUploadKBps,
                     g_filesQueued, g_filesUploaded,
                     g_mbQueued, g_mbUploaded,
-                    (unsigned long)esp_get_free_heap_size());
+                    (unsigned long)esp_get_free_heap_size(),
+                    (unsigned long)taskStackFree(g_upload_task),
+                    (unsigned long)taskStackFree(g_harvest_task),
+                    (unsigned long)taskStackFree(g_modem_task));
             }
         }
 
@@ -4810,6 +4825,14 @@ extern "C" void app_main(void) {
     // even if NVS lost the creds this boot.
     s3LoadCreds();
 
+#ifdef SURVIVAL_ONLY
+    // Survival-plane-only build: NEVER touch SD/USB/harvest/upload. Boot straight into
+    // the same survival plane as Safe Mode (modem + C2 + heartbeat + OTA self-heal +
+    // watchdog + coredump egress) so the remote-management path can be proven bulletproof
+    // in isolation, before the application plane is re-added incrementally.
+    g_safe_mode = true;
+#endif
+
     if (g_safe_mode) { bootRunSafeMode(); return; }
 
     disp("Init SD...");
@@ -4852,6 +4875,16 @@ extern "C" void app_main(void) {
 
     // Boot splash is shown later, after file scan
 
+    // ── Deferred SD reformat — MUST precede magic-file/USB processing ─────
+    // A remote `format_sd` (persisted as NVS sys/format) is the ONLY lever to
+    // clear a bad on-SD state — e.g. a P1 file/FAT state that makes
+    // bootProcessMagicFiles() or bootInstallUsb() panic (observed after a test
+    // run wrote CDC_PERSIST/airbridge.cmd to P1 and the unit began crash-looping
+    // at ~918ms). It therefore has to run BEFORE those steps, so a boot that
+    // would otherwise die in the magic-file/USB window is still remotely
+    // recoverable via format_sd. (It blocks app_main and no USB is up yet.)
+    bootRunDeferredFormat();
+
     bootProcessMagicFiles();
 
     // FATFS already mounted by sd_init() — no separate mount needed
@@ -4865,8 +4898,6 @@ extern "C" void app_main(void) {
     // Initialize event loop + netif (needed for PPP even without WiFi)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-
-    bootRunDeferredFormat();
 
     // ── Create tasks ────────────────────────────────────────────────────
     // 32KB stack: the shared upload path (halS3UploadEaofh → halS3UploadFile →
