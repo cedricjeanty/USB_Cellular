@@ -2391,10 +2391,27 @@ static void modemTask(void* param) {
     // host is still at the upgraded baud (3Mbaud), breaking all subsequent AT
     // commands silently. Soft reconnect (deactivate stale context, re-state APN,
     // redial) is sufficient to recover from a failed initial dial.
+    int dialRound = 0;
     while (!connected) {
-        cdc_printf("Modem: PPP dial failed — retrying in 30s\r\n");
-        log_write("Modem: PPP dial failed — retrying");
+        dialRound++;
+        cdc_printf("Modem: PPP dial failed — retrying in 30s (round %d)\r\n", dialRound);
+        log_write("Modem: PPP dial failed — retrying (round %d)", dialRound);
         vTaskDelay(pdMS_TO_TICKS(30000));
+        // ── Stranded-carrier reselection ─────────────────────────────────
+        // Soft redial (CGACT/CGDCONT/ATD below) recovers a transient dial failure,
+        // but if the modem booted registered onto a DEAD carrier — the Hologram
+        // multi-IMSI SIM camped on a no-service PLMN, observed as "T-Mobile, no bars,
+        // no data" that soft-redial could never fix — this loop spins forever with no
+        // escalation and the unit stays dark on cellular. Every 3rd failed round
+        // (~90s+), force AUTOMATIC OPERATOR RESELECTION so the modem drops the dead
+        // PLMN and re-scans. AT+COPS=0 is safe here: non-destructive (no reboot, no
+        // NVS wipe) and — unlike AT+CFUN=0 — has NO baud hazard (CFUN=0 resets the
+        // SIM7600 UART to 115200, see the comment above), so it can't silently wedge
+        // subsequent AT commands at the upgraded baud.
+        if (dialRound % 3 == 0) {
+            log_write("Modem: %d dial rounds, no IP — forcing carrier reselection (AT+COPS=0)", dialRound);
+            modem_at_cmd("AT+COPS=0", resp, sizeof(resp), 60000);
+        }
         // Wait up to 60s for registration before retrying (covers slow re-attach)
         for (int ci = 0; ci < 20; ci++) {
             modem_at_cmd("AT+CEREG?", resp, sizeof(resp), 1000);
@@ -2907,16 +2924,35 @@ static void modemTask(void* param) {
         // telemetry gap that blinded us when a unit went dark on a stale log.
         static uint32_t lastHbMs = 0;
         static volatile bool hbRunning = false;
-        static char hbBody[512];
+        static char hbBody[640];
         if (g_pppConnected && !hbRunning && g_deviceId[0] &&
             (lastHbMs == 0 || (millis() - lastHbMs) > 60000)) {
             lastHbMs = millis();
             hbRunning = true;
+            // Aircraft serial (device→aircraft join for the fleet dashboard) and the
+            // harvest counter (upload progress) both live in NVS and are SD-independent,
+            // so they're reportable even in Safe Mode. Empty serial = not yet associated.
+            static char hbSerial[44];
+            static uint32_t hbHarvest;
+            hbSerial[0] = '\0';
+            hbHarvest = 0;
+            {
+                nvs_handle_t hbnh;
+                if (nvs_open("mfst", NVS_READONLY, &hbnh) == ESP_OK) {
+                    nvs_get_string(hbnh, "serial", hbSerial, sizeof(hbSerial));
+                    nvs_close(hbnh);
+                }
+                if (nvs_open("harvest", NVS_READONLY, &hbnh) == ESP_OK) {
+                    nvs_get_u32(hbnh, "count", &hbHarvest);
+                    nvs_close(hbnh);
+                }
+            }
             snprintf(hbBody, sizeof(hbBody),
                 "{\"device\":\"%s\",\"fw\":\"%s\",\"mode\":\"%s\",\"boots\":%lu,"
                 "\"reset_reason\":%d,\"net\":\"%s\",\"sd_mounted\":%s,\"rssi\":%d,"
                 "\"rsrp\":%d,\"sinr\":%d,\"heap\":%lu,\"uptime_s\":%lu,"
-                "\"up_stk\":%lu,\"hv_stk\":%lu,\"md_stk\":%lu}",
+                "\"up_stk\":%lu,\"hv_stk\":%lu,\"md_stk\":%lu,"
+                "\"serial\":\"%s\",\"harvest\":%lu}",
                 g_deviceId, FW_VERSION, g_safe_mode ? "safe" : "healthy",
                 (unsigned long)g_crashBoots, g_resetReason,
                 g_pppConnected ? "ppp" : "none", g_fatfs_mounted ? "true" : "false",
@@ -2924,7 +2960,8 @@ static void modemTask(void* param) {
                 (unsigned long)esp_get_free_heap_size(), (unsigned long)(millis() / 1000),
                 (unsigned long)taskStackFree(g_upload_task),
                 (unsigned long)taskStackFree(g_harvest_task),
-                (unsigned long)taskStackFree(g_modem_task));
+                (unsigned long)taskStackFree(g_modem_task),
+                hbSerial, (unsigned long)hbHarvest);
             xTaskCreatePinnedToCore([](void*) {
                 do {
                     if (!s3LoadCreds()) break;

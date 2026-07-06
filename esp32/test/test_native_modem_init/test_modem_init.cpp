@@ -283,6 +283,33 @@ void test_reconnect_without_apn_fails(void) {
     TEST_ASSERT_TRUE(strstr(resp, "CONNECT") != nullptr);
 }
 
+// ── Stranded-carrier recovery ────────────────────────────────────────────────
+
+void test_stranded_carrier_recovered_by_cops(void) {
+    // A unit that boots REGISTERED onto a DEAD carrier (the Hologram multi-IMSI SIM
+    // camped on a no-service PLMN — the "T-Mobile, no bars, no data" field failure)
+    // gets NO CARRIER on ATD*99# despite valid registration, and the initial-dial
+    // loop would spin forever. The firmware's remedy is AT+COPS=0 (automatic operator
+    // reselection). Verify the mechanism end-to-end against the sim.
+    s_modem->regStat = 5;         // registered (roaming) …
+    s_modem->stranded = true;     // … but on a dead carrier: no data path
+
+    modemAtSync();
+    ModemInitResult r = modemRunInit();
+    TEST_ASSERT_TRUE(r.registered);    // registration is fine
+    TEST_ASSERT_FALSE(r.connected);    // yet the dial fails (NO CARRIER) — stranded
+
+    // Force automatic operator reselection — drops the dead PLMN.
+    char resp[128];
+    modem_at_cmd("AT+COPS=0", resp, sizeof(resp), 2000);
+    TEST_ASSERT_TRUE(strstr(resp, "OK") != nullptr);
+    TEST_ASSERT_FALSE(s_modem->stranded);   // reselected off the dead carrier
+
+    // A redial now succeeds.
+    ModemReconnectResult rr = modemReconnect();
+    TEST_ASSERT_TRUE(rr.connected);
+}
+
 // ── Signal-gated reconnect wait ──────────────────────────────────────────────
 
 void test_wait_for_signal_returns_when_registered(void) {
@@ -329,6 +356,7 @@ int main(int argc, char** argv) {
     // Reconnect
     RUN_TEST(test_reconnect_sets_apn);
     RUN_TEST(test_reconnect_without_apn_fails);
+    RUN_TEST(test_stranded_carrier_recovered_by_cops);
     RUN_TEST(test_wait_for_signal_returns_when_registered);
     RUN_TEST(test_wait_for_signal_times_out_when_unregistered);
 

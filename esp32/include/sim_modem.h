@@ -41,6 +41,9 @@ public:
     const char* operatorName = "SimCellular";
     bool        echoEnabled = true;
     bool        apnSet = false;    // tracks AT+CGDCONT state (cleared by AT+CFUN=0, set by AT+CGDCONT)
+    bool        stranded = false;  // registered on a DEAD carrier: ATD*99# gives NO CARRIER despite
+                                   // apnSet (the "T-Mobile, no bars, no data" field failure). Cleared
+                                   // by AT+COPS=0 (automatic operator reselection) — the firmware's remedy.
     int         baudRate = 115200;  // tracks actual baud (persisted via AT+IPR, like real SIM7600 NVS)
 
     // Flaky-link injection (marginal-cellular simulation, e.g. an approach window).
@@ -363,8 +366,8 @@ private:
         } else if (upper.find("AT+IFC=") == 0) {
             respond("OK");
         } else if (upper == "ATD*99#") {
-            if (!apnSet) {
-                respond("NO CARRIER");  // PDP context not set — like real SIM7600
+            if (!apnSet || stranded) {
+                respond("NO CARRIER");  // no PDP context, or camped on a dead carrier (stranded)
             } else {
                 respond("CONNECT 921600");
                 dataMode_ = true;
@@ -372,6 +375,12 @@ private:
         } else if (upper == "ATO") {
             respond("CONNECT");
             dataMode_ = true;
+        } else if (upper.find("AT+COPS=0") == 0) {
+            // Automatic operator (re)selection — the firmware's first-line remedy for a
+            // stranded/dead-carrier registration. Model recovery: drop the dead PLMN and
+            // reselect a working carrier so a subsequent ATD*99# succeeds.
+            if (stranded) { stranded = false; operatorName = "SimCellular"; }
+            respond("OK");
         } else if (upper.find("AT") == 0) {
             respond("OK");
         }
