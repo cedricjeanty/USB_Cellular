@@ -1,0 +1,583 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AirBridge Fleet</title>
+<style>
+/* ============================ AirBridge Fleet console ============================
+   Single-file ops dashboard. Talks to the same API Gateway + Lambda the devices use.
+   Mock mode (no apiBase configured) renders demo data so the page is never blank. */
+:root{
+  --ground:#0f1518; --panel:#172025; --panel-2:#1c272d; --line:#273540;
+  --ink:#dbe4e8; --muted:#7d8f99; --faint:#4a5a64;
+  --accent:#58b4c9; --accent-ink:#0f1518;
+  --ok:#54b487; --warn:#e2a838; --crit:#e2685a; --info:#58b4c9;
+  --ok-bg:#16302400; --shadow:0 12px 40px rgba(0,0,0,.45);
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,"Roboto Mono",monospace;
+  --ui:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --radius:9px;
+}
+@media (prefers-color-scheme:light){
+  :root{
+    --ground:#eef1f3; --panel:#ffffff; --panel-2:#f4f6f8; --line:#d3dbe0;
+    --ink:#182228; --muted:#5a6b74; --faint:#9aa8b0;
+    --accent:#2b8698; --accent-ink:#ffffff;
+    --ok:#2f9464; --warn:#b57d10; --crit:#c8483b; --info:#2b8698;
+    --shadow:0 12px 40px rgba(30,50,60,.18);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0f1518; --panel:#172025; --panel-2:#1c272d; --line:#273540;
+  --ink:#dbe4e8; --muted:#7d8f99; --faint:#4a5a64;
+  --accent:#58b4c9; --accent-ink:#0f1518;
+  --ok:#54b487; --warn:#e2a838; --crit:#e2685a; --info:#58b4c9;
+  --shadow:0 12px 40px rgba(0,0,0,.45);
+}
+:root[data-theme="light"]{
+  --ground:#eef1f3; --panel:#ffffff; --panel-2:#f4f6f8; --line:#d3dbe0;
+  --ink:#182228; --muted:#5a6b74; --faint:#9aa8b0;
+  --accent:#2b8698; --accent-ink:#ffffff;
+  --ok:#2f9464; --warn:#b57d10; --crit:#c8483b; --info:#2b8698;
+  --shadow:0 12px 40px rgba(30,50,60,.18);
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{
+  background:var(--ground); color:var(--ink); font-family:var(--ui);
+  font-size:14px; line-height:1.45; -webkit-font-smoothing:antialiased;
+}
+button{font-family:inherit}
+a{color:var(--accent)}
+.mono{font-family:var(--mono); font-variant-numeric:tabular-nums}
+
+/* ── Top bar ─────────────────────────────────────────────────────────────── */
+header{
+  position:sticky; top:0; z-index:20; background:var(--panel);
+  border-bottom:1px solid var(--line); padding:14px 22px;
+  display:flex; align-items:center; gap:20px; flex-wrap:wrap;
+}
+.brand{display:flex; align-items:center; gap:11px; font-weight:640; font-size:16px; letter-spacing:.2px}
+.brand svg{display:block}
+.brand .sub{color:var(--muted); font-weight:500; font-size:12px; letter-spacing:.4px; text-transform:uppercase}
+.summary{display:flex; gap:9px; flex-wrap:wrap; margin-left:auto}
+.chip{
+  display:inline-flex; align-items:center; gap:7px; padding:5px 11px 5px 9px;
+  border:1px solid var(--line); border-radius:99px; background:var(--panel-2);
+  font-size:12.5px; color:var(--muted); white-space:nowrap;
+}
+.chip b{color:var(--ink); font-family:var(--mono); font-variant-numeric:tabular-nums; font-weight:600}
+.chip .dot{width:8px; height:8px; border-radius:99px; background:var(--faint)}
+.chip.ok .dot{background:var(--ok)} .chip.warn .dot{background:var(--warn)}
+.chip.crit .dot{background:var(--crit)} .chip.acc .dot{background:var(--accent)}
+.tools{display:flex; align-items:center; gap:8px}
+.iconbtn{
+  width:34px; height:34px; display:grid; place-items:center; cursor:pointer;
+  background:var(--panel-2); color:var(--muted); border:1px solid var(--line);
+  border-radius:8px;
+}
+.iconbtn:hover{color:var(--ink); border-color:var(--accent)}
+.updated{color:var(--faint); font-size:11.5px; font-family:var(--mono)}
+
+/* ── Fleet table ─────────────────────────────────────────────────────────── */
+main{padding:20px 22px 60px}
+.tablewrap{border:1px solid var(--line); border-radius:12px; overflow:hidden; background:var(--panel)}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse; width:100%; min-width:940px}
+thead th{
+  text-align:left; font-size:10.5px; font-weight:600; letter-spacing:.7px;
+  text-transform:uppercase; color:var(--muted); padding:11px 14px;
+  border-bottom:1px solid var(--line); background:var(--panel-2); white-space:nowrap;
+}
+tbody td{padding:12px 14px; border-bottom:1px solid var(--line); vertical-align:middle}
+tbody tr{cursor:pointer; position:relative}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:var(--panel-2)}
+tbody tr:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
+td.stripe{padding:0; width:4px}
+td.stripe span{display:block; width:4px; height:44px; background:var(--faint)}
+tr[data-sev="ok"] td.stripe span{background:var(--ok)}
+tr[data-sev="warn"] td.stripe span{background:var(--warn)}
+tr[data-sev="crit"] td.stripe span{background:var(--crit)}
+.dev-id{font-family:var(--mono); font-weight:600; letter-spacing:.3px}
+.dev-ac{color:var(--muted); font-size:12px; font-family:var(--mono)}
+.dev-ac.none{color:var(--faint); font-style:italic; font-family:var(--ui)}
+.num{font-family:var(--mono); font-variant-numeric:tabular-nums}
+.muted{color:var(--muted)} .faint{color:var(--faint)}
+
+/* pills */
+.pill{
+  display:inline-flex; align-items:center; gap:5px; padding:3px 9px; border-radius:99px;
+  font-size:11.5px; font-weight:600; letter-spacing:.2px;
+  border:1px solid transparent; white-space:nowrap;
+}
+.pill .d{width:6px;height:6px;border-radius:99px;background:currentColor;opacity:.9}
+.pill.ok{color:var(--ok); background:color-mix(in srgb,var(--ok) 15%,transparent); border-color:color-mix(in srgb,var(--ok) 30%,transparent)}
+.pill.warn{color:var(--warn); background:color-mix(in srgb,var(--warn) 15%,transparent); border-color:color-mix(in srgb,var(--warn) 30%,transparent)}
+.pill.crit{color:var(--crit); background:color-mix(in srgb,var(--crit) 15%,transparent); border-color:color-mix(in srgb,var(--crit) 30%,transparent)}
+.pill.neutral{color:var(--muted); background:var(--panel-2); border-color:var(--line)}
+.pillrow{display:flex; gap:6px; flex-wrap:wrap}
+
+/* signal meter */
+.sig{display:flex; align-items:center; gap:8px}
+.bars{display:flex; align-items:flex-end; gap:2px; height:16px}
+.bars i{width:4px; background:var(--faint); border-radius:1px}
+.bars i.on{background:var(--ok)} .bars.warn i.on{background:var(--warn)} .bars.crit i.on{background:var(--crit)}
+.bars i:nth-child(1){height:5px}.bars i:nth-child(2){height:8px}
+.bars i:nth-child(3){height:11px}.bars i:nth-child(4){height:14px}
+.sig .val{font-family:var(--mono); font-size:11.5px; color:var(--muted)}
+
+/* ── Drawer ──────────────────────────────────────────────────────────────── */
+.scrim{position:fixed; inset:0; background:rgba(6,10,12,.55); opacity:0; pointer-events:none; transition:opacity .18s; z-index:40}
+.scrim.open{opacity:1; pointer-events:auto}
+.drawer{
+  position:fixed; top:0; right:0; height:100%; width:min(560px,100%);
+  background:var(--panel); border-left:1px solid var(--line); box-shadow:var(--shadow);
+  transform:translateX(100%); transition:transform .22s cubic-bezier(.4,0,.2,1);
+  z-index:50; display:flex; flex-direction:column;
+}
+.drawer.open{transform:none}
+.drawer .dhead{padding:18px 20px; border-bottom:1px solid var(--line); display:flex; align-items:flex-start; gap:12px}
+.drawer .dhead h2{margin:0; font-size:17px; font-family:var(--mono); letter-spacing:.3px}
+.drawer .dhead .acx{color:var(--muted); font-size:12.5px; margin-top:3px; font-family:var(--mono)}
+.drawer .dbody{overflow-y:auto; padding:18px 20px 40px; display:flex; flex-direction:column; gap:22px}
+.section h3{
+  margin:0 0 10px; font-size:10.5px; text-transform:uppercase; letter-spacing:.8px;
+  color:var(--muted); font-weight:700;
+}
+.grid{display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line); border:1px solid var(--line); border-radius:9px; overflow:hidden}
+.grid .cell{background:var(--panel); padding:9px 12px}
+.grid .cell .k{font-size:10.5px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted)}
+.grid .cell .v{font-family:var(--mono); font-size:13.5px; margin-top:2px; word-break:break-word}
+.grid .cell .v.big{font-size:15px}
+
+/* command panel */
+.cmdbtns{display:flex; flex-wrap:wrap; gap:8px}
+.cbtn{
+  padding:8px 13px; border-radius:8px; border:1px solid var(--line); cursor:pointer;
+  background:var(--panel-2); color:var(--ink); font-size:12.5px; font-weight:560;
+  display:inline-flex; align-items:center; gap:7px;
+}
+.cbtn:hover{border-color:var(--accent)}
+.cbtn.danger{color:var(--crit); border-color:color-mix(in srgb,var(--crit) 35%,transparent)}
+.cbtn.danger:hover{background:color-mix(in srgb,var(--crit) 12%,transparent)}
+.cbtn:disabled{opacity:.45; cursor:not-allowed}
+textarea,input[type=text],input[type=password]{
+  width:100%; background:var(--ground); color:var(--ink); border:1px solid var(--line);
+  border-radius:8px; padding:9px 11px; font-family:var(--mono); font-size:13px; resize:vertical;
+}
+textarea:focus,input:focus{outline:none; border-color:var(--accent)}
+.primary{
+  background:var(--accent); color:var(--accent-ink); border:none; border-radius:8px;
+  padding:9px 16px; font-weight:640; font-size:13px; cursor:pointer;
+}
+.primary:hover{filter:brightness(1.08)} .primary:disabled{opacity:.5; cursor:not-allowed}
+.ackbox{border:1px solid var(--line); border-radius:8px; padding:11px 13px; background:var(--panel-2); font-family:var(--mono); font-size:12px}
+.logview{background:var(--ground); border:1px solid var(--line); border-radius:8px; padding:12px; max-height:280px; overflow:auto; font-family:var(--mono); font-size:11.5px; white-space:pre-wrap; line-height:1.5; color:var(--muted)}
+select{background:var(--ground); color:var(--ink); border:1px solid var(--line); border-radius:7px; padding:7px 9px; font-family:var(--mono); font-size:12px}
+.row{display:flex; gap:9px; align-items:center; flex-wrap:wrap}
+.hint{color:var(--faint); font-size:11.5px}
+.demo-banner{background:color-mix(in srgb,var(--warn) 14%,transparent); border-bottom:1px solid color-mix(in srgb,var(--warn) 35%,transparent); color:var(--warn); font-size:12.5px; padding:8px 22px; text-align:center}
+.demo-banner b{cursor:pointer; text-decoration:underline}
+.empty{padding:60px 20px; text-align:center; color:var(--muted)}
+
+/* modal */
+.modal{position:fixed; inset:0; z-index:60; display:none; place-items:center; background:rgba(6,10,12,.55)}
+.modal.open{display:grid}
+.modal .card{background:var(--panel); border:1px solid var(--line); border-radius:14px; box-shadow:var(--shadow); width:min(460px,92vw); padding:22px}
+.modal h2{margin:0 0 4px; font-size:16px}
+.modal .field{margin-top:14px}
+.modal label{display:block; font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); margin-bottom:5px}
+.modal .actions{display:flex; justify-content:flex-end; gap:9px; margin-top:20px}
+.ghost{background:transparent; border:1px solid var(--line); color:var(--ink); border-radius:8px; padding:9px 15px; cursor:pointer}
+.toast{position:fixed; bottom:22px; left:50%; transform:translateX(-50%) translateY(20px); background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:11px 18px; box-shadow:var(--shadow); opacity:0; transition:.2s; z-index:70; font-size:13px}
+.toast.show{opacity:1; transform:translateX(-50%) translateY(0)}
+.toast.err{border-color:var(--crit); color:var(--crit)}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+@media (max-width:640px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <svg width="26" height="26" viewBox="0 0 26 26" fill="none" aria-hidden="true">
+      <circle cx="13" cy="13" r="12" stroke="var(--accent)" stroke-width="1.4" opacity=".35"/>
+      <path d="M13 4 L13 22 M6 9 L20 9" stroke="var(--accent)" stroke-width="1.6" stroke-linecap="round"/>
+      <path d="M9 22 L13 18 L17 22" stroke="var(--accent)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="13" cy="13" r="2.1" fill="var(--accent)"/>
+    </svg>
+    <span>AirBridge Fleet<br><span class="sub">telemetry &amp; command</span></span>
+  </div>
+  <div class="summary" id="summary"></div>
+  <div class="tools">
+    <span class="updated" id="updated"></span>
+    <button class="iconbtn" id="btn-refresh" title="Refresh now" aria-label="Refresh">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2v3h-3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <button class="iconbtn" id="btn-theme" title="Toggle theme" aria-label="Toggle theme">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M13 9.2A5.2 5.2 0 0 1 6.8 3a5.2 5.2 0 1 0 6.2 6.2Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
+    </button>
+    <button class="iconbtn" id="btn-config" title="Connection settings" aria-label="Settings">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2.1" stroke="currentColor" stroke-width="1.3"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+</header>
+<div class="demo-banner" id="demo" style="display:none">
+  Demo data — no backend connected. <b id="demo-config">Add your API endpoint</b> to go live.
+</div>
+
+<main>
+  <div class="tablewrap">
+    <div class="scroll">
+      <table>
+        <thead><tr>
+          <th class="stripe"></th>
+          <th>Device</th><th>Aircraft</th><th>State</th><th>Firmware</th>
+          <th>Signal</th><th>Uploads</th><th>Errors</th><th>Last seen</th>
+        </tr></thead>
+        <tbody id="fleet"></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="empty" id="empty" style="display:none"></div>
+</main>
+
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" aria-label="Device detail"></aside>
+
+<div class="modal" id="cfgmodal">
+  <div class="card">
+    <h2>Connection settings</h2>
+    <p class="hint">Stored in this browser only. Because the fleet API is locked to your network (WAF / VPN), the key is safe here.</p>
+    <div class="field"><label for="cfg-base">API base URL</label>
+      <input type="text" id="cfg-base" placeholder="https://xxxx.execute-api.us-west-2.amazonaws.com/prod"></div>
+    <div class="field"><label for="cfg-key">x-api-key</label>
+      <input type="password" id="cfg-key" placeholder="operator API key"></div>
+    <div class="field"><label for="cfg-refresh">Auto-refresh (seconds)</label>
+      <input type="text" id="cfg-refresh" placeholder="30"></div>
+    <div class="actions">
+      <button class="ghost" id="cfg-cancel">Cancel</button>
+      <button class="primary" id="cfg-save">Save</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+/* ============================== config ============================== */
+const CFG_KEY="airbridge_dash_cfg";
+let CONFIG=Object.assign({apiBase:"",apiKey:"",refreshMs:30000},
+  JSON.parse(localStorage.getItem(CFG_KEY)||"{}"));
+const MOCK=()=>CONFIG.apiBase.trim()==="";
+
+/* directive catalog — mirrors airbridge_commands.h verbs */
+const DIRECTIVES=[
+  {label:"Dump logs",    cmd:"dump_logs once", desc:"Copy logs to USB drive"},
+  {label:"Reboot",       cmd:"reboot once",    desc:"Restart the unit"},
+  {label:"Compress on",  cmd:"compress on",    desc:"gzip flight logs before upload"},
+  {label:"Modem reset",  cmd:"modem_reset once", desc:"Re-init the cellular modem"},
+  {label:"Reflash (OTA-independent)", cmd:"flash", desc:"Download staged firmware & reflash", danger:true},
+  {label:"Format SD",    cmd:"format_sd once", desc:"Reformat SD — DESTRUCTIVE", danger:true},
+];
+
+/* ============================== helpers ============================== */
+const $=(s,r=document)=>r.querySelector(s);
+const el=(t,c,h)=>{const e=document.createElement(t); if(c)e.className=c; if(h!=null)e.innerHTML=h; return e;};
+function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+function ago(iso){
+  if(!iso)return "—";
+  const s=Math.max(0,(Date.now()-new Date(iso).getTime())/1000);
+  if(s<60)return Math.floor(s)+"s ago";
+  if(s<3600)return Math.floor(s/60)+"m ago";
+  if(s<86400)return Math.floor(s/3600)+"h ago";
+  return Math.floor(s/86400)+"d ago";
+}
+function dur(s){s=+s||0; if(s<3600)return Math.floor(s/60)+"m"; if(s<86400)return (s/3600).toFixed(1)+"h"; return (s/86400).toFixed(1)+"d";}
+const RESET_REASON={1:"POWERON",3:"SW",4:"PANIC",5:"INT_WDT",6:"TASK_WDT",7:"WDT",8:"DEEPSLEEP",9:"BROWNOUT",12:"USB"};
+function toast(msg,err){const t=$("#toast"); t.textContent=msg; t.className="toast show"+(err?" err":""); setTimeout(()=>t.className="toast",2600);}
+
+/* severity: worst-status-first so the eye lands on trouble */
+function severity(d){
+  if(d.coredump || d.mode==="safe" || (d.boots||0)>=3) return "crit";
+  if(!d.online || d.sd_mounted===false || d.fw_current===false || d.cmd_pending) return "warn";
+  return "ok";
+}
+/* signal quality from RSRP (dBm) — LTE coverage metric */
+function sigLevel(rsrp){
+  if(rsrp==null||rsrp>=9999)return {n:0,cls:"crit"};
+  if(rsrp>=-90)return {n:4,cls:""}; if(rsrp>=-100)return {n:3,cls:""};
+  if(rsrp>=-110)return {n:2,cls:"warn"}; if(rsrp>=-118)return {n:1,cls:"warn"};
+  return {n:0,cls:"crit"};
+}
+
+/* ============================== API ============================== */
+async function api(path,opts={}){
+  if(MOCK()) return mockApi(path,opts);
+  const url=CONFIG.apiBase.replace(/\/$/,"")+path;
+  const r=await fetch(url,Object.assign({headers:{"x-api-key":CONFIG.apiKey,"Content-Type":"application/json"}},opts));
+  if(!r.ok){let e; try{e=(await r.json()).error;}catch{} throw new Error(e||("HTTP "+r.status));}
+  return r.json();
+}
+
+/* ============================== fleet render ============================== */
+let TIMER=null;
+async function loadFleet(){
+  try{
+    const data=await api("/fleet");
+    renderFleet(data); $("#empty").style.display="none";
+  }catch(e){
+    $("#fleet").innerHTML=""; const em=$("#empty"); em.style.display="block";
+    em.textContent="Could not reach the fleet API: "+e.message;
+  }
+}
+function renderFleet(data){
+  $("#demo").style.display=MOCK()?"block":"none";
+  const devs=data.devices||[];
+  // summary chips
+  const online=devs.filter(d=>d.online).length;
+  const errs=devs.filter(d=>severity(d)==="crit").length;
+  const pend=devs.filter(d=>d.cmd_pending).length;
+  $("#summary").innerHTML=
+    `<span class="chip ok"><span class="dot"></span><b>${online}</b> online</span>`+
+    `<span class="chip ${devs.length-online?'warn':''}"><span class="dot"></span><b>${devs.length-online}</b> offline</span>`+
+    `<span class="chip ${errs?'crit':''}"><span class="dot"></span><b>${errs}</b> errors</span>`+
+    `<span class="chip ${pend?'acc':''}"><span class="dot"></span><b>${pend}</b> cmd pending</span>`+
+    (data.latest_fw?`<span class="chip"><span class="dot"></span>latest&nbsp;<b>${esc(data.latest_fw)}</b></span>`:"");
+  $("#updated").textContent="updated "+ago(data.generated||new Date().toISOString());
+
+  const tb=$("#fleet"); tb.innerHTML="";
+  if(!devs.length){$("#empty").style.display="block"; $("#empty").textContent="No devices have reported yet."; return;}
+  for(const d of devs){
+    const sev=severity(d), sig=sigLevel(d.rsrp);
+    const tr=el("tr"); tr.dataset.sev=sev; tr.tabIndex=0;
+    tr.dataset.device=d.device;
+    const modePill = d.mode==="safe"
+      ? `<span class="pill crit"><span class="d"></span>SAFE MODE</span>`
+      : d.online ? `<span class="pill ok"><span class="d"></span>healthy</span>`
+                 : `<span class="pill neutral">offline</span>`;
+    const netPill = d.net==="ppp" ? `<span class="pill ok">cell</span>` : `<span class="pill warn">no net</span>`;
+    const sdPill  = d.sd_mounted===false ? `<span class="pill crit">SD fault</span>` : "";
+    const errbits=[];
+    if(d.coredump) errbits.push(`<span class="pill crit">coredump</span>`);
+    if((d.boots||0)>=3) errbits.push(`<span class="pill crit">crash×${d.boots}</span>`);
+    const rr=d.reset_reason; if(rr===4||rr===5||rr===6||rr===9) errbits.push(`<span class="pill warn">${RESET_REASON[rr]||rr}</span>`);
+    const bars=[1,2,3,4].map(i=>`<i class="${i<=sig.n?'on':''}"></i>`).join("");
+    tr.innerHTML=
+      `<td class="stripe"><span></span></td>`+
+      `<td><div class="dev-id">${esc(d.device)}</div></td>`+
+      `<td>${d.serial?`<span class="dev-ac">${esc(d.serial)}</span>`:`<span class="dev-ac none">unassigned</span>`}</td>`+
+      `<td><div class="pillrow">${modePill}${netPill}${sdPill}</div></td>`+
+      `<td><span class="num">${esc(d.fw||"—")}</span> ${d.fw_current===false?`<span class="pill warn" title="update available">update</span>`:d.fw_current?`<span class="pill ok">current</span>`:""}</td>`+
+      `<td><div class="sig"><div class="bars ${sig.cls}">${bars}</div><span class="val">${d.rsrp!=null&&d.rsrp<9999?d.rsrp+"dBm":"—"}</span></div></td>`+
+      `<td class="num">${d.harvest!=null?d.harvest:"—"}</td>`+
+      `<td><div class="pillrow">${errbits.join("")||'<span class="faint">—</span>'}</div></td>`+
+      `<td><span class="num ${d.online?'':'muted'}">${ago(d.last_seen)}</span>${d.cmd_pending?' <span class="pill neutral" title="command queued">queued</span>':''}</td>`;
+    tr.addEventListener("click",()=>openDrawer(d.device));
+    tr.addEventListener("keydown",e=>{if(e.key==="Enter")openDrawer(d.device);});
+    tb.appendChild(tr);
+  }
+}
+
+/* ============================== device drawer ============================== */
+async function openDrawer(device){
+  const dr=$("#drawer"); $("#scrim").classList.add("open"); dr.classList.add("open");
+  dr.innerHTML=`<div class="dhead"><div style="flex:1"><h2>${esc(device)}</h2></div>
+    <button class="iconbtn" id="dr-close" aria-label="Close">✕</button></div>
+    <div class="dbody"><p class="muted">Loading…</p></div>`;
+  $("#dr-close").onclick=closeDrawer;
+  let det;
+  try{ det=await api("/admin/device?device="+encodeURIComponent(device)); }
+  catch(e){ $(".dbody",dr).innerHTML=`<p class="pill crit">Failed: ${esc(e.message)}</p>`; return; }
+  renderDrawer(dr,device,det);
+}
+function closeDrawer(){$("#drawer").classList.remove("open"); $("#scrim").classList.remove("open");}
+
+function renderDrawer(dr,device,det){
+  const hb=det.heartbeat||{};
+  const cell=(k,v,big)=>`<div class="cell"><div class="k">${k}</div><div class="v ${big?'big':''}">${v}</div></div>`;
+  const mode=hb.mode==="safe"?`<span class="pill crit">SAFE MODE</span>`:`<span class="pill ok">healthy</span>`;
+  const rr=hb.reset_reason;
+  const m=det.manifest;
+  const core=det.coredump;
+
+  dr.querySelector(".dbody").innerHTML=`
+    <div class="section">
+      <h3>Status</h3>
+      <div class="grid">
+        ${cell("Mode",mode,true)}
+        ${cell("Uptime",dur(hb.uptime_s),true)}
+        ${cell("Firmware",esc(hb.fw||"—"))}
+        ${cell("Network",hb.net==="ppp"?"cellular (PPP)":"—")}
+        ${cell("Signal",(hb.rsrp!=null&&hb.rsrp<9999?hb.rsrp+" dBm":"—")+" &nbsp; "+(hb.sinr!=null&&hb.sinr<9999?"SINR "+hb.sinr:""))}
+        ${cell("RSSI",hb.rssi!=null?hb.rssi+"/31":"—")}
+        ${cell("SD card",hb.sd_mounted===false?'<span style="color:var(--crit)">unmounted</span>':"mounted")}
+        ${cell("Free heap",hb.heap!=null?(hb.heap/1024).toFixed(0)+" KB":"—")}
+        ${cell("Reset reason",(RESET_REASON[rr]||rr||"—"))}
+        ${cell("Crash boots",(hb.boots||0)>=3?`<span style="color:var(--crit)">${hb.boots}</span>`:(hb.boots||0))}
+      </div>
+    </div>
+    <div class="section">
+      <h3>Aircraft &amp; uploads</h3>
+      <div class="grid">
+        ${cell("Aircraft serial",det.serial?esc(det.serial):'<span class="faint">unassigned</span>',true)}
+        ${cell("Harvest count",hb.harvest!=null?hb.harvest:"—",true)}
+        ${cell("Manifest HWM",m?("flight "+(m.high_water_mark||0)):"—")}
+        ${cell("Files uploaded",m&&m.files?m.files.length:"—")}
+      </div>
+    </div>
+    ${core?`<div class="section"><h3>Coredump</h3>
+      <div class="ackbox"><span class="pill crit">panic captured</span> &nbsp; ${(core.bytes/1024).toFixed(0)} KB &nbsp;·&nbsp; ${ago(core.last_modified)}
+      <div class="hint" style="margin-top:6px">Decode with <span class="mono">scripts/read_coredump.py</span> (S3 key <span class="mono">coredump/${esc(device)}.elf</span>).</div></div></div>`:""}
+    <div class="section">
+      <h3>Logs</h3>
+      <div class="row"><select id="logsel"><option>loading…</option></select>
+        <button class="cbtn" id="logload">View tail</button></div>
+      <div class="logview" id="logview" style="display:none"></div>
+    </div>
+    <div class="section">
+      <h3>Queue command</h3>
+      <div class="cmdbtns" id="cmdbtns"></div>
+      <div style="margin-top:10px"><textarea id="cmdtext" rows="2" placeholder="airbridge.cmd directives — one per line"></textarea></div>
+      <div class="row" style="margin-top:9px"><button class="primary" id="cmdsend">Queue for ${esc(device)}</button>
+        <span class="hint">Applied on the device's next poll (~5&nbsp;min).</span></div>
+      <div id="ackwrap" style="margin-top:12px"></div>
+    </div>`;
+
+  // directive buttons
+  const cb=$("#cmdbtns",dr);
+  DIRECTIVES.forEach(d=>{
+    const b=el("button","cbtn"+(d.danger?" danger":""),esc(d.label));
+    b.title=d.desc;
+    b.onclick=()=>{const t=$("#cmdtext",dr); t.value=(t.value.trim()?t.value.trim()+"\n":"")+d.cmd;};
+    cb.appendChild(b);
+  });
+  $("#cmdsend",dr).onclick=()=>sendCommand(device,dr);
+
+  // pending command → show as ack-in-progress
+  renderAck(dr,device,det.ack,det.pending_cmd);
+
+  // logs
+  loadLogSessions(device,dr);
+}
+
+async function loadLogSessions(device,dr){
+  const sel=$("#logsel",dr);
+  try{
+    const r=await api("/admin/logs?device="+encodeURIComponent(device));
+    sel.innerHTML="";
+    if(!r.sessions||!r.sessions.length){sel.innerHTML='<option>no logs</option>'; return;}
+    r.sessions.forEach(s=>{const o=el("option",null,`${s.session} · ${(s.size/1024).toFixed(0)}KB · ${ago(s.last_modified)}`); o.value=s.session; sel.appendChild(o);});
+  }catch(e){sel.innerHTML='<option>logs unavailable</option>';}
+  $("#logload",dr).onclick=async()=>{
+    const s=sel.value; if(!s||s==="no logs")return;
+    const v=$("#logview",dr); v.style.display="block"; v.textContent="loading…";
+    try{const r=await api(`/admin/logs?device=${encodeURIComponent(device)}&session=${encodeURIComponent(s)}&tail=40000`);
+      v.textContent=r.text||"(empty)"; v.scrollTop=v.scrollHeight;
+    }catch(e){v.textContent="failed: "+e.message;}
+  };
+}
+
+async function sendCommand(device,dr){
+  const t=$("#cmdtext",dr), cmd=t.value.trim();
+  if(!cmd){toast("Enter a directive first",true);return;}
+  const danger=/\b(format_sd|flash|s3|cdc)\b/i.test(cmd);
+  if(danger && !confirm(`This queues a state-changing command for ${device}:\n\n${cmd}\n\nProceed?`))return;
+  const btn=$("#cmdsend",dr); btn.disabled=true; btn.textContent="Queuing…";
+  try{
+    await api("/admin/command",{method:"POST",body:JSON.stringify({device,cmd})});
+    toast("Command queued for "+device);
+    t.value="";
+    // begin polling ack
+    pollAck(device,dr);
+  }catch(e){toast("Queue failed: "+e.message,true);}
+  btn.disabled=false; btn.textContent="Queue for "+device;
+}
+function renderAck(dr,device,ack,pending){
+  const w=$("#ackwrap",dr); if(!w)return;
+  if(pending){
+    w.innerHTML=`<div class="ackbox"><span class="pill neutral">pending</span> queued, awaiting device poll
+      <div class="hint" style="margin-top:5px">${esc(pending.trim())}</div></div>`;
+  }else if(ack&&Object.keys(ack).length){
+    w.innerHTML=`<div class="ackbox"><span class="pill ok">executed</span>
+      &nbsp; fw ${esc(ack.fw||"?")} · uptime ${dur(ack.uptime_s)}
+      <div class="hint" style="margin-top:5px">${esc(JSON.stringify(ack))}</div></div>`;
+  }else w.innerHTML="";
+}
+async function pollAck(device,dr){
+  for(let i=0;i<20;i++){
+    await new Promise(r=>setTimeout(r,MOCK()?900:8000));
+    if(!$("#drawer").classList.contains("open"))return;
+    try{const det=await api("/admin/device?device="+encodeURIComponent(device));
+      renderAck(dr,device,det.ack,det.pending_cmd);
+      if(!det.pending_cmd && det.ack)return;
+    }catch{}
+  }
+}
+
+/* ============================== config modal ============================== */
+function openCfg(){$("#cfg-base").value=CONFIG.apiBase; $("#cfg-key").value=CONFIG.apiKey;
+  $("#cfg-refresh").value=(CONFIG.refreshMs/1000); $("#cfgmodal").classList.add("open");}
+$("#btn-config").onclick=openCfg; $("#demo-config").onclick=openCfg;
+$("#cfg-cancel").onclick=()=>$("#cfgmodal").classList.remove("open");
+$("#cfg-save").onclick=()=>{
+  CONFIG.apiBase=$("#cfg-base").value.trim();
+  CONFIG.apiKey=$("#cfg-key").value.trim();
+  CONFIG.refreshMs=Math.max(5,parseInt($("#cfg-refresh").value)||30)*1000;
+  localStorage.setItem(CFG_KEY,JSON.stringify(CONFIG));
+  $("#cfgmodal").classList.remove("open");
+  startPolling();
+};
+
+/* ============================== theme ============================== */
+$("#btn-theme").onclick=()=>{
+  const cur=document.documentElement.getAttribute("data-theme")
+    || (matchMedia("(prefers-color-scheme:dark)").matches?"dark":"light");
+  document.documentElement.setAttribute("data-theme",cur==="dark"?"light":"dark");
+};
+$("#btn-refresh").onclick=loadFleet;
+$("#scrim").onclick=closeDrawer;
+document.addEventListener("keydown",e=>{if(e.key==="Escape"){closeDrawer(); $("#cfgmodal").classList.remove("open");}});
+
+/* ============================== polling loop ============================== */
+function startPolling(){ if(TIMER)clearInterval(TIMER); loadFleet(); TIMER=setInterval(loadFleet,CONFIG.refreshMs); }
+
+/* ============================== mock backend ============================== */
+const MOCK_DB={
+  devices:[
+    {device:"9C139EF3D3D8",serial:"EA500.N802XA",fw:"20260706.1",mode:"healthy",net:"ppp",sd_mounted:true,rssi:22,rsrp:-89,sinr:14,heap:118000,uptime_s:41200,boots:0,reset_reason:1,harvest:342,coredump:false,cmd_pending:false,fw_current:true,online:true,last_seen:new Date(Date.now()-38000).toISOString()},
+    {device:"9C139EF40188",serial:"EA500.N551GT",fw:"20260701.2",mode:"healthy",net:"ppp",sd_mounted:true,rssi:14,rsrp:-108,sinr:6,heap:96000,uptime_s:9800,boots:0,reset_reason:1,harvest:87,coredump:false,cmd_pending:true,fw_current:false,online:true,last_seen:new Date(Date.now()-52000).toISOString()},
+    {device:"7C2C6776A80C",serial:"",fw:"20260701.2",mode:"safe",net:"ppp",sd_mounted:false,rssi:9,rsrp:-116,sinr:2,heap:74000,uptime_s:640,boots:5,reset_reason:4,harvest:0,coredump:true,cmd_pending:false,fw_current:false,online:true,last_seen:new Date(Date.now()-71000).toISOString()},
+    {device:"A0B7659C1D44",serial:"EA500.N118PW",fw:"20260620.0",mode:"healthy",net:"none",sd_mounted:true,rssi:0,rsrp:9999,sinr:9999,heap:110000,uptime_s:0,boots:0,reset_reason:1,harvest:210,coredump:false,cmd_pending:false,fw_current:false,online:false,last_seen:new Date(Date.now()-1000*60*47).toISOString()},
+  ],
+  latest_fw:"20260706.1",
+};
+function mockApi(path){
+  return new Promise(res=>setTimeout(()=>{
+    const u=new URL("http://x"+path); const p=u.pathname, q=u.searchParams;
+    if(p==="/fleet") return res({...MOCK_DB,count:MOCK_DB.devices.length,generated:new Date().toISOString()});
+    if(p==="/admin/device"){
+      const d=MOCK_DB.devices.find(x=>x.device===q.get("device"))||{};
+      const det={device:d.device,serial:d.serial||null,heartbeat:d,coredump:d.coredump?{bytes:196608,last_modified:d.last_seen}:null,
+        pending_cmd:d.cmd_pending?"dump_logs once\n":null,ack:(!d.cmd_pending&&d.device==="9C139EF3D3D8")?{fw:d.fw,ran:true,reboot:false,uptime_s:d.uptime_s}:null,
+        manifest:d.serial?{serial:d.serial,high_water_mark:1837,files:new Array(23)}:null};
+      return res(det);
+    }
+    if(p==="/admin/logs"){
+      if(!q.get("session")) return res({sessions:[
+        {session:"boot_0342",size:48210,last_modified:new Date(Date.now()-40000).toISOString()},
+        {session:"boot_0341",size:91050,last_modified:new Date(Date.now()-1000*3600*3).toISOString()}]});
+      return res({text:`[boot_0342] AirBridge fw=20260706.1\n[modem] PPP up, IP assigned\n[modem] rsrp=-89 sinr=14 band=BAND13\n[harvest] 3 files → /harvested/0342/\n[upload] EA500.N802XA flight 1837 → S3 (single PUT, 412KB)\n[heartbeat] mode=healthy heap=118K\n… demo log tail …`});
+    }
+    if(p==="/admin/command"){
+      const d=MOCK_DB.devices.find(x=>x.device===q.get("device"));
+      return res({ok:true});
+    }
+    res({});
+  },MOCK()?260:0));
+}
+
+/* boot */
+startPolling();
+</script>
+</body>
+</html>

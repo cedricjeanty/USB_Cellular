@@ -56,6 +56,44 @@ def respond(status, body):
     }
 
 
+# ── Fleet dashboard support ──────────────────────────────────────────────────
+# The airbridge.cmd verb whitelist, mirrored from esp32/include/airbridge_commands.h.
+# The dashboard validates every enqueued directive against this so an operator typo
+# can't write a garbage command a field unit would fetch and choke on. Keep in sync
+# with the firmware parser (test_native_commands covers the device side).
+_CMD_VERBS = {
+    "cdc", "dump_logs", "dumplogs", "reboot", "format_sd",
+    "wifi", "s3", "survey", "compress", "modem_reset", "modemreset", "flash",
+}
+# Directives that mutate/erase or need USB re-enumeration — surfaced to the UI so the
+# operator gets a confirm prompt. Not a security boundary (WAF/IP is), just guardrails.
+_CMD_DESTRUCTIVE = {"format_sd", "flash", "s3", "cdc"}
+
+
+def _validate_cmd(text):
+    """Return (ok, error, destructive_verbs) for an airbridge.cmd body."""
+    saw = False
+    destructive = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line[0] in "#;":
+            continue
+        parts = line.split()
+        verb = parts[0].lower()
+        if verb not in _CMD_VERBS:
+            return False, f"unknown directive: {parts[0]}", []
+        if verb in _CMD_DESTRUCTIVE:
+            destructive.append(verb)
+        saw = True
+    if not saw:
+        return False, "no directives", []
+    return True, "", destructive
+
+
+def _iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def handler(event, context):
     method = event.get("httpMethod", "")
     path = event.get("path", "")
@@ -462,5 +500,190 @@ def handler(event, context):
         s3.put_object(Bucket=bucket, Key=mkey, Body=json.dumps(manifest),
                       ContentType="application/json")
         return respond(200, {"high_water_mark": hwm})
+
+    # ── Fleet dashboard endpoints ────────────────────────────────────────────
+    elif path == "/fleet" and method == "GET":
+        # Home page of the fleet dashboard: one call returns every device's latest
+        # heartbeat plus derived health (staleness, fw-vs-latest, coredump present,
+        # command pending). Devices are pull-based, so "online" == a recent heartbeat.
+        # Query: ?stale_s=180 (age above which a unit is considered offline).
+        try:
+            stale_s = int(params.get("stale_s", "180"))
+        except ValueError:
+            stale_s = 180
+        try:
+            latest_fw = ""
+            try:
+                meta = s3.get_object(Bucket=bucket, Key="firmware/latest.json")
+                latest_fw = json.loads(meta["Body"].read()).get("version", "")
+            except Exception:
+                pass
+            paginator = s3.get_paginator("list_objects_v2")
+            # One list each for coredumps + pending commands (avoids N head calls).
+            cores = set()
+            for page in paginator.paginate(Bucket=bucket, Prefix="coredump/"):
+                for o in page.get("Contents", []):
+                    k = o["Key"]
+                    if k.endswith(".elf"):
+                        cores.add(k[len("coredump/"):-len(".elf")])
+            pending = set()
+            for page in paginator.paginate(Bucket=bucket, Prefix="commands/"):
+                for o in page.get("Contents", []):
+                    k = o["Key"]
+                    if k.endswith("/airbridge.cmd"):
+                        pending.add(k[len("commands/"):-len("/airbridge.cmd")])
+            now = datetime.now(timezone.utc)
+            devices = []
+            for page in paginator.paginate(Bucket=bucket, Prefix="heartbeat/"):
+                for o in page.get("Contents", []):
+                    key = o["Key"]
+                    if not key.endswith(".json"):
+                        continue
+                    try:
+                        hb = json.loads(
+                            s3.get_object(Bucket=bucket, Key=key)["Body"].read() or b"{}")
+                    except Exception:
+                        hb = {}
+                    dev = hb.get("device") or key[len("heartbeat/"):-len(".json")]
+                    age = int((now - o["LastModified"]).total_seconds())
+                    hb["device"] = dev
+                    hb["last_seen"] = _iso(o["LastModified"])
+                    hb["age_s"] = age
+                    hb["online"] = age <= stale_s
+                    hb["coredump"] = dev in cores
+                    hb["cmd_pending"] = dev in pending
+                    hb["fw_current"] = bool(latest_fw) and hb.get("fw") == latest_fw
+                    devices.append(hb)
+            devices.sort(key=lambda d: d.get("age_s", 1 << 30))
+            return respond(200, {
+                "latest_fw": latest_fw,
+                "count": len(devices),
+                "generated": _iso(now),
+                "devices": devices,
+            })
+        except Exception as e:
+            return respond(500, {"error": str(e)})
+
+    elif path == "/admin/device" and method == "GET":
+        # Aggregate detail for one device: heartbeat + last ack + pending command +
+        # coredump presence + (if the heartbeat carries a serial) the aircraft manifest.
+        device = params.get("device", "")
+        if not device:
+            return respond(400, {"error": "device required"})
+
+        def _get_json(k):
+            try:
+                return json.loads(s3.get_object(Bucket=bucket, Key=k)["Body"].read() or b"{}")
+            except Exception:
+                return None
+
+        out = {"device": device}
+        out["heartbeat"] = _get_json(f"heartbeat/{device}.json")
+        out["ack"] = _get_json(f"commands/{device}/ack.json")
+        try:
+            out["pending_cmd"] = s3.get_object(
+                Bucket=bucket, Key=f"commands/{device}/airbridge.cmd"
+            )["Body"].read().decode("utf-8", "replace")
+        except Exception:
+            out["pending_cmd"] = None
+        try:
+            h = s3.head_object(Bucket=bucket, Key=f"coredump/{device}.elf")
+            out["coredump"] = {"bytes": h["ContentLength"],
+                               "last_modified": _iso(h["LastModified"])}
+        except Exception:
+            out["coredump"] = None
+        serial = (out.get("heartbeat") or {}).get("serial", "")
+        out["serial"] = serial or None
+        if serial and re.match(r'^[\w.\-]+$', serial):
+            out["manifest"] = _get_json(f"aircraft/{serial}/manifest.json")
+        return respond(200, out)
+
+    elif path == "/admin/logs" and method == "GET":
+        # List a device's log sessions, or (with &session=) return the tail of one.
+        # Query: device=X [&session=boot_NNNN] [&tail=65536]
+        device = params.get("device", "")
+        if not device:
+            return respond(400, {"error": "device required"})
+        session = params.get("session", "")
+        if not session:
+            sessions = []
+            paginator = s3.get_paginator("list_objects_v2")
+            prefix = f"{device}/logs/"
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                for o in page.get("Contents", []):
+                    k = o["Key"]
+                    if k.endswith(".log"):
+                        sessions.append({
+                            "session": k[len(prefix):-len(".log")],
+                            "size": o["Size"],
+                            "last_modified": _iso(o["LastModified"]),
+                        })
+            sessions.sort(key=lambda s: s["last_modified"], reverse=True)
+            return respond(200, {"device": device, "sessions": sessions})
+        if not re.match(r'^[\w.\-]+$', session):
+            return respond(400, {"error": "invalid session"})
+        try:
+            tail = int(params.get("tail", "65536"))
+        except ValueError:
+            tail = 65536
+        key = f"{device}/logs/{session}.log"
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            data = obj["Body"].read()
+            truncated = tail > 0 and len(data) > tail
+            if truncated:
+                data = data[-tail:]
+            return respond(200, {
+                "device": device, "session": session,
+                "size": obj["ContentLength"], "truncated": truncated,
+                "text": data.decode("utf-8", "replace"),
+            })
+        except Exception as e:
+            err = str(e)
+            if "NoSuchKey" in err or "404" in err or "AccessDenied" in err:
+                return respond(404, {"error": "no log"})
+            return respond(500, {"error": err})
+
+    elif path == "/admin/command" and method == "POST":
+        # Operator enqueues an airbridge.cmd for a device from the dashboard. Every
+        # directive is validated against _CMD_VERBS first so a typo can't strand a
+        # field unit. Writes commands/{device}/airbridge.cmd (picked up on the device's
+        # next ~5-min poll) and clears any stale ack so /command/status reflects THIS
+        # command: no ack yet == still pending, ack present == executed.
+        try:
+            body = json.loads(event.get("body") or "{}")
+        except Exception:
+            return respond(400, {"error": "invalid JSON body"})
+        device = body.get("device", "")
+        cmd = body.get("cmd", "")
+        if not device or not cmd:
+            return respond(400, {"error": "device and cmd required"})
+        ok, err, destructive = _validate_cmd(cmd)
+        if not ok:
+            return respond(400, {"error": err})
+        if not cmd.endswith("\n"):
+            cmd += "\n"
+        try:
+            try:
+                s3.delete_object(Bucket=bucket, Key=f"commands/{device}/ack.json")
+            except Exception:
+                pass
+            s3.put_object(Bucket=bucket, Key=f"commands/{device}/airbridge.cmd",
+                          Body=cmd.encode("utf-8"), ContentType="text/plain")
+            return respond(200, {"ok": True, "device": device,
+                                 "queued": cmd, "destructive": destructive})
+        except Exception as e:
+            return respond(500, {"error": str(e)})
+
+    elif path == "/admin/command" and method == "DELETE":
+        # Cancel a not-yet-fetched command (delete the pending .cmd).
+        device = params.get("device", "")
+        if not device:
+            return respond(400, {"error": "device required"})
+        try:
+            s3.delete_object(Bucket=bucket, Key=f"commands/{device}/airbridge.cmd")
+            return respond(200, {"ok": True, "device": device})
+        except Exception as e:
+            return respond(500, {"error": str(e)})
 
     return respond(404, {"error": "not found"})
