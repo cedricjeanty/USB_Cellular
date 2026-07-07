@@ -331,8 +331,17 @@ inline CmdRunResult runCommandTextBuffer(const char* text, bool runtimeOnly,
                                          char* out = nullptr, size_t outSz = 0,
                                          bool allowSdOps = true) {
     CmdRunResult res = {};
-    Command cmds[16];
-    int n = parseCommands(text, cmds, 16);
+    // cmds[16] on the HEAP, not the stack: 16 * sizeof(Command) ≈ 2.4 KB would overflow
+    // the small main task stack (CONFIG_ESP_MAIN_TASK_STACK_SIZE=3584) when this runs deep
+    // in the boot chain (app_main → bootProcessMagicFiles → check_p1_magic → run_command_file),
+    // smashing adjacent .data (the app_main HAL struct etc.) → an intermittent
+    // find_desc_for_source crash. (run_command_file already made its text/out buffers static
+    // for the same stack; this array was the missed one.) Heap, not static, because
+    // runCommandTextBuffer is also called off the C2/modem task — static would race.
+    const int MAXCMD = 16;
+    Command* cmds = (Command*)malloc(MAXCMD * sizeof(Command));
+    if (!cmds) return res;
+    int n = parseCommands(text, cmds, MAXCMD);
     bool anyConsumed = false;
     for (int i = 0; i < n; i++) {
         Command& c = cmds[i];
@@ -373,6 +382,7 @@ inline CmdRunResult runCommandTextBuffer(const char* text, bool runtimeOnly,
         }
         if (c.once) anyConsumed = true;
     }
+    free(cmds);
     if (anyConsumed && out && outSz) {
         res.rewrite = emitPersistent(text, runtimeOnly, out, outSz) ? 1 : 2;
     }
