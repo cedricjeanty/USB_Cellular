@@ -4,6 +4,7 @@
 
 #include "hal/hal.h"
 #include "airbridge_utils.h"
+#include "airbridge_synoptic.h"
 #include <cstdio>
 
 // State snapshot passed to updateDisplay (replaces direct global reads)
@@ -11,6 +12,8 @@ struct DisplayState {
     bool     pppConnected;
     bool     netConnected;
     bool     modemReady;
+    bool     usbHostConnected; // an active host has enumerated our MSC volume
+                               // (tud_mounted). false = powered but no host → USB link ✕.
     int      modemRssi;
     float    linkLatencyMs; // windowed-best request round-trip (ms) — connection-quality signal
     uint32_t linkAgeMs;     // ms since the last successful request (liveness)
@@ -78,10 +81,60 @@ inline int linkQualityBarsLatency(float rttMs, uint32_t ageMs) {
     return 0;                                       // very poor / near-timeout
 }
 
+// Format a cumulative-MB value to a compact ~3-significant-figure string for a
+// synoptic node ("0.9", "15.6", "123", "1.2G"). Kept short so the 2x-font value
+// stays within its column even at large sizes.
+inline void synopticFmtMb(char* buf, size_t n, float mb) {
+    if (mb < 0) mb = 0;
+    if (mb >= 1000.0f)     snprintf(buf, n, "%.1fG", mb / 1000.0f);   // >= 1 GB
+    else if (mb >= 100.0f) snprintf(buf, n, "%.0f", mb);              // 100-999 MB
+    else                   snprintf(buf, n, "%.1f", mb);              // < 100 MB (0.0-99.9)
+}
+
+// Map the rich DisplayState onto the synoptic AirbridgeState. Value buffers are
+// caller-owned (live for the render call). Cumulative-MB node values:
+//   USB = written this session, SD = queued on card, Cloud = uploaded.
+inline void buildSynopticState(const DisplayState& ds, AirbridgeState& s,
+                               char uv[8], char sv[8], char cv[8]) {
+    // USB link, three states:
+    //   no host connected (powered only) → LINK_DOWN → ✕ on the USB icon
+    //   host connected + writing          → LINK_XFER → marching ants
+    //   host connected + MSC active, idle → LINK_IDLE → solid line + keep-alive ping
+    s.usb      = !ds.usbHostConnected ? LINK_DOWN
+               : (ds.usbWriteKBps > 0.5f ? LINK_XFER : LINK_IDLE);
+    s.usbRetry = false;                       // USB is physical: no retry animation
+
+    // Net link: idle when connected, ants while uploading, down otherwise.
+    bool netUp = ds.pppConnected || ds.netConnected;
+    s.net      = netUp ? (ds.uploadKBps > 0.5f ? LINK_XFER : LINK_IDLE) : LINK_DOWN;
+    s.netRetry = true;                        // internet is expected to retry forever
+
+    synopticFmtMb(uv, 8, ds.hostWrittenMb);
+    synopticFmtMb(sv, 8, ds.mbQueued);
+    synopticFmtMb(cv, 8, ds.mbUploaded + ds.uploadingMb);
+    s.usbVal = uv; s.sdVal = sv; s.cloudVal = cv;
+
+    // Marching-ant speed tracks live throughput: fast link → fast ants.
+    s.usbAntStepMs = synopticAntStepMs(ds.usbWriteKBps);
+    s.netAntStepMs = synopticAntStepMs(ds.uploadKBps);
+
+    // ETE (shown only while net==LINK_XFER): remaining queued / current rate.
+    float remaining = (ds.mbQueued > ds.uploadingMb) ? ds.mbQueued - ds.uploadingMb : 0;
+    if (s.net == LINK_XFER && ds.uploadKBps > 0.5f && remaining > 0.001f) {
+        int etaSec = (int)(remaining * 1024.0f / ds.uploadKBps);
+        s.eteSecs = etaSec > 5999 ? 5999 : (uint16_t)etaSec;   // cap at 99:59
+    } else {
+        s.eteSecs = 0;
+    }
+}
+
 // Render the main operational display
 inline void updateDisplay(DisplayState& ds) {
     g_hal->display->clear();
 
+    // The top connection bar is drawn only for the OTA / SD-fault overlays (the
+    // synoptic normal view owns the whole screen and encodes link state itself).
+    if (ds.otaActive || ds.sdError)
     // Row 0: Connection status + signal bars
     {
         char label[18];
@@ -106,8 +159,8 @@ inline void updateDisplay(DisplayState& ds) {
         for (int i = 0; i < bars; i++) {
             g_hal->display->rect(xs[i], 8-hs[i], 3, hs[i], true);
         }
+        g_hal->display->hline(0, 127, 9);
     }
-    g_hal->display->hline(0, 127, 9);
 
     if (ds.otaActive) {
         // ── OTA overlay (below connection bar) ─────────────────────────
@@ -158,71 +211,11 @@ inline void updateDisplay(DisplayState& ds) {
             g_hal->display->text((128 - w) / 2, 44, sub);
         }
     } else {
-        // ── Normal operational display ──────────────────────────────────
-        float uploaded  = ds.mbUploaded + ds.uploadingMb;
-        float remaining = (ds.mbQueued > ds.uploadingMb) ? ds.mbQueued - ds.uploadingMb : 0;
-        float usbSessionMb = ds.hostWrittenMb;
-
-        // Row 11: labels
-        g_hal->display->text(13, 11, "USB IN");
-        g_hal->display->text(78, 11, "UPLOAD");
-        for (int y = 11; y < 48; y += 2) g_hal->display->rect(63, y, 1, 1, true);
-
-        // Row 20: speeds
-        {
-            char usbSpd[12], upSpd[12];
-            if (ds.usbWriteKBps > 0.5f)
-                snprintf(usbSpd, sizeof(usbSpd), "%dKB/s", (int)ds.usbWriteKBps);
-            else
-                strlcpy(usbSpd, "0KB/s", sizeof(usbSpd));
-            if (ds.uploadKBps > 0.5f)
-                snprintf(upSpd, sizeof(upSpd), "%dKB/s", (int)ds.uploadKBps);
-            else
-                strlcpy(upSpd, "0KB/s", sizeof(upSpd));
-            int usbW = strlen(usbSpd) * 6;
-            int upW  = strlen(upSpd) * 6;
-            g_hal->display->text((62 - usbW) / 2, 20, usbSpd);
-            g_hal->display->text(65 + (62 - upW) / 2, 20, upSpd);
-        }
-
-        // Row 30: totals (size 2)
-        {
-            char usbTot[12], upTot[12];
-            _fmtSizeShort(usbTot, sizeof(usbTot), usbSessionMb);
-            _fmtSizeShort(upTot, sizeof(upTot), uploaded);
-            int usbW = g_hal->display->text_width(usbTot, 2);
-            int upW  = g_hal->display->text_width(upTot, 2);
-            g_hal->display->text((62 - usbW) / 2, 30, usbTot, 2);
-            g_hal->display->text(65 + (62 - upW) / 2, 30, upTot, 2);
-        }
-
-        // Row 50: progress bar
-        {
-            float totalMb = uploaded + remaining;
-            g_hal->display->rect(0, 50, 128, 5, false);
-            if (totalMb > 0.001f) {
-                int fill = (int)(uploaded / totalMb * 126);
-                if (fill > 126) fill = 126;
-                if (fill > 0) g_hal->display->rect(1, 51, fill, 3, true);
-            }
-        }
-
-        // Row 57: remaining + ETA
-        {
-            char remStr[14], etaStr[14];
-            snprintf(remStr, sizeof(remStr), "REM:"); _fmtSize(remStr + 4, sizeof(remStr) - 4, remaining);
-            g_hal->display->text(0, 57, remStr);
-            if (ds.uploadKBps > 0.5f && remaining > 0.001f) {
-                int etaSec = (int)(remaining * 1024.0f / ds.uploadKBps);
-                int mm = etaSec / 60, ss = etaSec % 60;
-                if (mm > 99) snprintf(etaStr, sizeof(etaStr), "ETA %dh%02d", mm / 60, mm % 60);
-                else         snprintf(etaStr, sizeof(etaStr), "ETA %d:%02d", mm, ss);
-            } else {
-                strlcpy(etaStr, "ETA --:--", sizeof(etaStr));
-            }
-            int etaW = strlen(etaStr) * 6;
-            g_hal->display->text(128 - etaW, 57, etaStr);
-        }
+        // ── Normal operational display: USB → SD → Cloud synoptic ────────
+        AirbridgeState s;
+        char uv[8], sv[8], cv[8];
+        buildSynopticState(ds, s, uv, sv, cv);
+        synopticRender(s, g_hal->clock->millis());
     }
 
     g_hal->display->flush();
@@ -260,12 +253,13 @@ inline void dispBootSplash(const char* fwVersion, const char* deviceId,
     g_hal->display->flush();
 }
 
-// Simple two-line splash/status display
+// Simple two-line splash/status display — all lines horizontally centered.
 inline void dispSplash(const char* line1, const char* line2 = nullptr) {
-    g_hal->display->clear();
-    g_hal->display->text(14, 6, "AirBridge", 2);
-    g_hal->display->hline(0, 127, 26);
-    g_hal->display->text(0, 32, line1);
-    if (line2) g_hal->display->text(0, 48, line2);
-    g_hal->display->flush();
+    IDisplay* d = g_hal->display;
+    d->clear();
+    d->text((SCREEN_W - d->text_width("AirBridge", 2)) / 2, 6, "AirBridge", 2);
+    d->hline(0, 127, 26);
+    if (line1) d->text((SCREEN_W - d->text_width(line1, 1)) / 2, 32, line1);
+    if (line2) d->text((SCREEN_W - d->text_width(line2, 1)) / 2, 48, line2);
+    d->flush();
 }

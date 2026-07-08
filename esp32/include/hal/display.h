@@ -55,6 +55,25 @@ public:
         }
     }
 
+    // Blit a 1-bpp bitmap in Adafruit_GFX drawBitmap format: rows top-to-bottom,
+    // each row MSB-first and padded to a whole byte. Set bits draw as `on`; clear
+    // bits are left untouched (transparent). Used by the synoptic renderer to draw
+    // the USB/SD/Cloud icon sprites.
+    void bitmap(int x, int y, const uint8_t* bmp, int w, int h, bool on = true) {
+        int bytes_per_row = (w + 7) / 8;
+        for (int j = 0; j < h; j++)
+            for (int i = 0; i < w; i++)
+                if (bmp[j * bytes_per_row + (i >> 3)] & (0x80 >> (i & 7)))
+                    pixel(x + i, y + j, on);
+    }
+
+    // Read a single bit from a bitmap in the same format (for effects that need to
+    // know where the icon's solid pixels are, e.g. the X-through-icon overlay).
+    static bool bitmap_bit(const uint8_t* bmp, int w, int x, int y) {
+        int bytes_per_row = (w + 7) / 8;
+        return (bmp[y * bytes_per_row + (x >> 3)] & (0x80 >> (x & 7))) != 0;
+    }
+
     inline void draw_char(int x, int y, char c, int size);
     inline void text(int x, int y, const char* str, int size = 1);
     inline int  text_width(const char* str, int size = 1);

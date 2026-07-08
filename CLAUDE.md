@@ -403,7 +403,11 @@ esp32/
 │   ├── Runtime & UI
 │   │   ├── airbridge_log.h      #   Ring buffer + serial + SD flush logging
 │   │   ├── airbridge_runtime.h  #   OTA version check, speed calc, STATUS formatting
-│   │   ├── airbridge_display.h  #   SSD1306 page rendering (via HAL display)
+│   │   ├── airbridge_display.h  #   SSD1306 page rendering (via HAL display): OTA/SD/boot overlays +
+│   │   │                        #   DisplayState→synoptic mapper for the normal operating screen
+│   │   ├── airbridge_synoptic.h #   USB→SD→Cloud synoptic view: animated links (ants/keep-alive/retry) +
+│   │   │                        #   ✕-on-dead-endpoint icons + per-node MB values (ported design)
+│   │   ├── airbridge_display_assets.h # Icon sprites (USB/SD/Cloud) + layout consts + baked frame (from PNG)
 │   │   ├── airbridge_triggers.h #   Harvest trigger logic (15s quiet window)
 │   │   ├── airbridge_commands.h #   Unified airbridge.cmd parse + persist-rewrite + dump_logs (once modifier)
 │   │   └── airbridge_utils.h    #   JSON helpers, URL encode/decode, version compare, skip list
@@ -419,9 +423,9 @@ esp32/
 │                                #   .part+rename, rate-limited — used by the emulator's DSU backlog thread)
 │
 ├── lib/fatfs_native/            # Standalone FatFs for native tests (no ESP-IDF/FreeRTOS)
-├── test/test_native_*/          # 22 Unity test suites (proto, dsu, harvest, modem, modem_init, http,
-│                                #   s3, ppp, nvs, cli, display, runtime, triggers, utils, sd_block, sd_format,
-│                                #   commands, command_fetch, compress, fatfsfs, log, net_util)
+├── test/test_native_*/          # 23 Unity test suites (proto, dsu, harvest, modem, modem_init, http,
+│                                #   s3, ppp, nvs, cli, display, synoptic, runtime, triggers, utils, sd_block,
+│                                #   sd_format, commands, command_fetch, compress, fatfsfs, log, net_util)
 ├── test/fixtures/               # Real .eaofh flight + metrics/ DSU fixtures for sim_dsu
 │
 ├── platformio.ini               # Build config (Arduino on esp32-s3, ESP-IDF on esp32-idf)
