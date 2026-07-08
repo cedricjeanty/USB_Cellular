@@ -23,6 +23,44 @@ extern int mdm_read(void* buf, size_t len, uint32_t timeout_ms);
 extern void mdm_flush();
 extern void mdm_set_baudrate(uint32_t baud);
 
+// ── Bounded UART TX ──────────────────────────────────────────────────────────
+// A UART TX with hardware flow control can block FOREVER if the modem holds CTS
+// low — seen on hardware 2026-07-07: a carrier drop mid-OTA left the SIM7600 in
+// a dead PPP session with CTS deasserted; the reconnect's first mdm_write("+++")
+// never returned, the modem task wedged, and the device was dark (no heartbeats)
+// until a power cycle. No watchdog covered a wedged-but-alive task. All modem TX
+// therefore goes through this bounded loop: push what the FIFO accepts, give up
+// at the deadline and report — the caller escalates (drop flow control so the
+// FIFO drains; the modem-task progress watchdog is the net behind that).
+struct ModemTxOps {
+    // Non-blocking push: accept up to n bytes, return bytes accepted (0 = full,
+    // <0 = error). Firmware backs this with uart_tx_chars() (FIFO push, never
+    // blocks); tests back it with a scriptable fake.
+    int (*push)(const void* p, size_t n, void* ctx);
+    void* ctx;
+};
+struct ModemTxResult {
+    size_t written;
+    bool   timedOut;   // deadline hit with bytes still unwritten
+};
+inline ModemTxResult modemBoundedTx(const ModemTxOps& ops, const void* data,
+                                    size_t len, uint32_t deadlineMs) {
+    ModemTxResult r = {0, false};
+    const uint8_t* p = (const uint8_t*)data;
+    uint32_t t0 = g_hal->clock->millis();
+    while (r.written < len) {
+        int n = ops.push(p + r.written, len - r.written, ops.ctx);
+        if (n < 0) { r.timedOut = true; break; }
+        if (n > 0) { r.written += (size_t)n; continue; }
+        if ((uint32_t)(g_hal->clock->millis() - t0) >= deadlineMs) {
+            r.timedOut = true;
+            break;
+        }
+        g_hal->clock->delay_ms(5);
+    }
+    return r;
+}
+
 // Result of modem reconnect
 struct ModemReconnectResult {
     bool connected;

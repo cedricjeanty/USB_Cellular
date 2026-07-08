@@ -4,7 +4,14 @@
 #include <unistd.h>
 #include "sim_modem.h"
 #include "hal/uart_pty.h"
-#include "airbridge_modem.h"   // modemReconnectPlan
+#include "hal/test_impls.h"
+#include "airbridge_modem.h"   // modemReconnectPlan, modemBoundedTx
+
+// modemBoundedTx uses g_hal->clock; give this TU a controllable one.
+static StubDisplay s_btxDisplay;
+static TestClock   s_btxClock;
+static HAL         s_btxHal = { &s_btxDisplay, &s_btxClock, nullptr, nullptr, nullptr, nullptr };
+HAL* g_hal = nullptr;
 
 static SimModem* s_modem = nullptr;
 static PtyUart   s_uart;
@@ -306,6 +313,73 @@ void test_flaky_clamps_range(void) {
     m.setFlaky(250); TEST_ASSERT_EQUAL_INT(100, m.flakyDropPct.load());
 }
 
+// ── Bounded TX (modemBoundedTx) ─────────────────────────────────────────────
+// The 2026-07-07 hardware wedge: uart_write_bytes blocked forever on a CTS-
+// stalled UART during reconnect. modemBoundedTx is the replacement: push what
+// the FIFO accepts, give up at the deadline, report a timeout for escalation.
+
+struct PushScript {
+    size_t capTotal;      // accept at most this many bytes total (SIZE_MAX = all)
+    int    zerosFirst;    // return 0 (FIFO full) this many calls before accepting
+    bool   error;         // return -1 always
+    size_t accepted = 0;
+};
+static int scriptedPush(const void* p, size_t n, void* ctx) {
+    (void)p;
+    PushScript* s = (PushScript*)ctx;
+    if (s->error) return -1;
+    if (s->zerosFirst > 0) { s->zerosFirst--; return 0; }
+    size_t room = (s->capTotal > s->accepted) ? s->capTotal - s->accepted : 0;
+    size_t take = (n < room) ? n : room;
+    s->accepted += take;
+    return (int)take;
+}
+
+void test_bounded_tx_fast_path(void) {
+    g_hal = &s_btxHal; s_btxClock.now_ms = 1000;
+    PushScript s = { SIZE_MAX, 0, false };
+    ModemTxOps ops = { scriptedPush, &s };
+    ModemTxResult r = modemBoundedTx(ops, "ATD*99#\r", 8, 2000);
+    TEST_ASSERT_FALSE(r.timedOut);
+    TEST_ASSERT_EQUAL_UINT32(8, (uint32_t)r.written);
+    TEST_ASSERT_EQUAL_UINT32(1000, s_btxClock.now_ms);  // no waiting on the fast path
+}
+
+void test_bounded_tx_stalled_fifo_times_out(void) {
+    // FIFO accepts 7 bytes then never drains (CTS held low) — must return at
+    // the deadline with a timeout flag, never block forever.
+    g_hal = &s_btxHal; s_btxClock.now_ms = 0;
+    PushScript s = { 7, 0, false };
+    ModemTxOps ops = { scriptedPush, &s };
+    uint8_t frame[64] = {0};
+    ModemTxResult r = modemBoundedTx(ops, frame, sizeof(frame), 2000);
+    TEST_ASSERT_TRUE(r.timedOut);
+    TEST_ASSERT_EQUAL_UINT32(7, (uint32_t)r.written);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(2000, s_btxClock.now_ms);   // gave it the full deadline
+    TEST_ASSERT_LESS_THAN_UINT32(2100, s_btxClock.now_ms);          // ...but not much more
+}
+
+void test_bounded_tx_recovers_after_brief_stall(void) {
+    // FIFO full for a few polls, then drains — completes without a timeout.
+    g_hal = &s_btxHal; s_btxClock.now_ms = 0;
+    PushScript s = { SIZE_MAX, 3, false };
+    ModemTxOps ops = { scriptedPush, &s };
+    uint8_t frame[64] = {0};
+    ModemTxResult r = modemBoundedTx(ops, frame, sizeof(frame), 2000);
+    TEST_ASSERT_FALSE(r.timedOut);
+    TEST_ASSERT_EQUAL_UINT32(sizeof(frame), (uint32_t)r.written);
+}
+
+void test_bounded_tx_push_error_aborts(void) {
+    g_hal = &s_btxHal; s_btxClock.now_ms = 0;
+    PushScript s = { 0, 0, true };
+    ModemTxOps ops = { scriptedPush, &s };
+    ModemTxResult r = modemBoundedTx(ops, "AT\r", 3, 2000);
+    TEST_ASSERT_TRUE(r.timedOut);
+    TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)r.written);
+    TEST_ASSERT_EQUAL_UINT32(0, s_btxClock.now_ms);  // immediate, no deadline burn
+}
+
 // ── Test runner ─────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -345,6 +419,12 @@ int main(int argc, char** argv) {
     RUN_TEST(test_flaky_full_drops_all_ip);
     RUN_TEST(test_flaky_partial_drops_roughly_half);
     RUN_TEST(test_flaky_clamps_range);
+
+    // Bounded TX (CTS-stall wedge fix)
+    RUN_TEST(test_bounded_tx_fast_path);
+    RUN_TEST(test_bounded_tx_stalled_fifo_times_out);
+    RUN_TEST(test_bounded_tx_recovers_after_brief_stall);
+    RUN_TEST(test_bounded_tx_push_error_aborts);
 
     return UNITY_END();
 }

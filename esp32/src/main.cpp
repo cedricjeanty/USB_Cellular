@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260706220000"
+#define FW_VERSION "20260707013000"
 
 #include <cstring>
 #include <ctime>
@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <algorithm>
+#include <atomic>
 #include <string>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -1994,10 +1995,67 @@ hdr_done:
 
 // ── Cellular modem task (SIM7600 via raw UART + PPPoS) ──────────────────────
 
-// UART helpers — route through HAL when available, else use raw ESP-IDF
+// Modem-task progress stamp — advanced by every modem TX and every pump-loop
+// iteration. The main_loop modem watchdog force-restarts the modem task if this
+// goes stale (MODEM_WEDGE_STALL_MS): the task-death check alone cannot see a
+// task that is alive but wedged inside a blocking call (2026-07-07: reconnect
+// hung 10+ min in uart_write_bytes with the modem's CTS stuck low — device dark
+// until power cycle).
+volatile uint32_t g_modemProgressMs = 0;
+#define MDM_TX_DEADLINE_MS    2000     // bound for any single modem TX
+#define MODEM_WEDGE_STALL_MS  120000   // no TX/pump progress for 2 min = wedged
+
+// UART helpers — route through HAL when available, else use raw ESP-IDF.
+//
+// TX is BOUNDED (modemBoundedTx over uart_tx_chars). uart_write_bytes() with our
+// 0-size TX ring blocks with portMAX_DELAY until the HW FIFO drains — and with
+// HW flow control a SIM7600 holding CTS low on a dead PPP session blocks it
+// FOREVER (both the modem task's AT writes and lwIP's PPP transmit). On a TX
+// deadline we drop HW flow control so the FIFO drains to the wire — the bytes
+// are for a dead session anyway; FC is re-enabled by the next full modem init.
+// TX serialization: uart_tx_chars has no internal lock (uart_write_bytes' mutex
+// is what we're replacing), and both the modem task (AT commands) and the lwIP
+// tcpip thread (PPP frames) write here. An atomic busy-flag instead of a FreeRTOS
+// mutex so the wedge watchdog can forcibly clear it after deleting a stuck holder
+// (deleting a mutex with a dead owner/live waiters is UB).
+static std::atomic<bool> s_mdmTxBusy{false};
+static int mdm_push_fifo(const void* p, size_t n, void*) {
+    int pushed = uart_tx_chars(UART_NUM_1, (const char*)p, (uint32_t)n);
+    if (pushed != 0) return pushed;
+    // FIFO full: wait interrupt-driven for drain (sub-ms on a healthy 3 Mbaud
+    // link — keeps PPP TX at wire speed), but BOUNDED so a CTS stall can't hold
+    // us; the outer modemBoundedTx enforces the overall deadline.
+    uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(20));
+    return uart_tx_chars(UART_NUM_1, (const char*)p, (uint32_t)n);
+}
 int mdm_write(const void* data, size_t len) {
+    // Progress stamp counts MODEM-TASK work only — PPP frames pushed here by the
+    // lwIP tcpip thread must not feed the wedge watchdog for a stuck modem task.
+    bool modemTaskCtx = (xTaskGetCurrentTaskHandle() == g_modem_task);
+    if (modemTaskCtx) g_modemProgressMs = millis();
     if (g_hal && g_hal->uart) return g_hal->uart->write(data, len);
-    return uart_write_bytes(UART_NUM_1, data, len);
+    // Acquire the TX slot (bounded — never wedge a caller on a stuck writer).
+    uint32_t t0 = millis();
+    bool expected = false;
+    while (!s_mdmTxBusy.compare_exchange_strong(expected, true)) {
+        expected = false;
+        if (millis() - t0 >= MDM_TX_DEADLINE_MS) return 0;  // holder stuck; it self-heals
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    ModemTxOps ops = { mdm_push_fifo, nullptr };
+    ModemTxResult r = modemBoundedTx(ops, data, len, MDM_TX_DEADLINE_MS);
+    if (r.timedOut) {
+        uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_DISABLE, 0);
+        log_write("Modem: UART TX blocked %u/%u bytes — HW flow control dropped (CTS stuck?)",
+                  (unsigned)r.written, (unsigned)len);
+        // FIFO now drains at wire speed; push the remainder briefly.
+        ModemTxResult r2 = modemBoundedTx(ops, (const uint8_t*)data + r.written,
+                                          len - r.written, 500);
+        r.written += r2.written;
+    }
+    if (modemTaskCtx) g_modemProgressMs = millis();
+    s_mdmTxBusy.store(false);
+    return (int)r.written;
 }
 int mdm_read(void* buf, size_t len, uint32_t timeout_ms) {
     if (g_hal && g_hal->uart) return g_hal->uart->read(buf, len, timeout_ms);
@@ -2130,6 +2188,7 @@ static void modemHealthProbe() {
 
 static void modemTask(void* param) {
     (void)param;
+    g_modemProgressMs = millis();    // arm the wedge watchdog from task birth
     vTaskDelay(pdMS_TO_TICKS(500));  // brief settle for UART pins
 
     // ── Init UART ────────────────────────────────────────────────────────
@@ -2526,6 +2585,7 @@ static void modemTask(void* param) {
     static int urcLen = 0;
 
     while (true) {
+        g_modemProgressMs = millis();   // pump alive — modem wedge watchdog feed
         uint8_t buf[1024];
         int len = mdm_read(buf, sizeof(buf), 20);
         if (len > 0) {
@@ -2709,7 +2769,13 @@ static void modemTask(void* param) {
                 log_write("Modem: backoff %lus before radio reset (failure #%d)",
                           (unsigned long)plan.backoffSeconds, s_reconnect_failures);
                 cdc_printf("Modem: backoff %lus before radio reset\r\n", (unsigned long)plan.backoffSeconds);
-                vTaskDelay(pdMS_TO_TICKS(plan.backoffSeconds * 1000));
+                // Chunked so the wedge watchdog sees progress through a long
+                // (up to 300s) deliberate backoff.
+                for (uint32_t s = 0; s < plan.backoffSeconds; s += 10) {
+                    g_modemProgressMs = millis();
+                    uint32_t slice = (plan.backoffSeconds - s > 10) ? 10 : plan.backoffSeconds - s;
+                    vTaskDelay(pdMS_TO_TICKS(slice * 1000));
+                }
             }
             log_write("Modem: reconnect attempt %d (%s)",
                       s_reconnect_failures + 1, doRadioReset ? "full reset" : "soft");
@@ -3998,6 +4064,27 @@ static void main_loop_task(void* param) {
             }
         }
 
+        // Watchdog: force-restart the modem task if it is alive but WEDGED — no
+        // TX/pump progress for MODEM_WEDGE_STALL_MS. The death check below can't
+        // see this (2026-07-07: reconnect blocked in a CTS-stalled UART write for
+        // 10+ min; heartbeats stopped; only a power cycle recovered). Drop HW flow
+        // control first so any writer stuck on the FIFO drains and returns, then
+        // delete the task; the death check right below recreates it (its re-init
+        // reinstalls the UART driver and re-enables flow control).
+        if (g_modem_task != nullptr &&
+            watchdogShouldReboot(g_modemProgressMs, millis(), MODEM_WEDGE_STALL_MS)) {
+            log_write("Modem: task wedged — no progress for %us; force-restarting task",
+                      (unsigned)(MODEM_WEDGE_STALL_MS / 1000));
+            cdc_printf("Modem: task wedged — restarting task...\r\n");
+            uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_DISABLE, 0);
+            vTaskDelay(pdMS_TO_TICKS(200));    // let a FIFO-blocked writer drain out
+            TaskHandle_t t = g_modem_task;
+            g_modem_task = nullptr;
+            g_modemProgressMs = 0;             // disarm until the new task stamps
+            vTaskDelete(t);
+            s_mdmTxBusy.store(false);          // release the TX slot if the dead task held it
+        }
+
         // Watchdog: restart modem task if it died (init failure OR runtime crash)
         if (g_modem_task == nullptr) {
             log_write("Modem: task died — restarting");
@@ -4006,6 +4093,7 @@ static void main_loop_task(void* param) {
             g_pppConnected = false;
             g_modemRssi = 99;
             g_modemOp[0] = '\0';
+            g_modemProgressMs = millis();
             xTaskCreatePinnedToCore(modemTask, "modem", 16384, nullptr, 2, &g_modem_task, 0);
             vTaskDelay(pdMS_TO_TICKS(30000));  // 30s cooldown for modem cold boot
         }
