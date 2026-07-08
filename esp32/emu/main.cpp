@@ -774,6 +774,7 @@ int main(int argc, char* argv[]) {
 
     // Launch modem init in background (same AT sequence as real device)
     DisplayState ds = {};
+    ds.usbHostConnected = true;   // emulator default: host attached (overridable via 'U' toggle)
     strlcpy(ds.modemOp, "Booting...", sizeof(ds.modemOp));
     std::thread modemThread(modemInitThread, &ds);
 

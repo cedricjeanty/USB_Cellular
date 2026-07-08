@@ -29,7 +29,7 @@ Raspberry Pi Zero 2 W variant is legacy (docs/pi-legacy.md).
 
 - Build firmware: `cd esp32 && ~/.local/bin/pio run -e esp32s3`
 - Build emulator: `cd esp32 && ~/.local/bin/pio run -e emulator` → `.pio/build/emulator/program`
-- Unit tests (22 suites, no hardware): `cd esp32 && ~/.local/bin/pio test -e native`
+- Unit tests (23 suites, no hardware): `cd esp32 && ~/.local/bin/pio test -e native`
 - E2E suite: `scripts/e2e_unified.sh --target emulator` (or `device`)
 - Flash: docs/deployment.md (1200-baud touch; `scripts/jtag_flash.py` for button-free recovery)
 

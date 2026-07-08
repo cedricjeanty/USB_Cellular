@@ -123,9 +123,8 @@ void test_updateDisplay_no_network(void) {
 
 void test_updateDisplay_cellular_connected(void) {
     DisplayState ds = make_default_state();
-    ds.pppConnected = true;
-    // Bars now reflect request latency (not RSSI). Low RTT + fresh → 4 bars.
-    ds.linkLatencyMs = 200.0f; ds.linkAgeMs = 1000;
+    ds.usbHostConnected = true;
+    ds.pppConnected = true;   // net link up → SD→Cloud line drawn (idle, solid)
     strlcpy(ds.modemOp, "T-Mobile", sizeof(ds.modemOp));
     ds.mbQueued = 100.0f;
     ds.mbUploaded = 50.0f;
@@ -133,8 +132,11 @@ void test_updateDisplay_cellular_connected(void) {
     updateDisplay(ds);
     TEST_ASSERT_EQUAL_INT(1, s_display.flush_count);
 
-    // 4 bars (100% of peak): bar 4 at x=123, height 8 → pixel at (123,0)
-    TEST_ASSERT_TRUE(s_display.pixel_at(123, 0));  // top of tallest bar
+    // Normal view is the synoptic USB→SD→Cloud display: the top-bar signal bars
+    // are NOT drawn here (they belong to the OTA/SD overlays only)...
+    TEST_ASSERT_FALSE(s_display.pixel_at(123, 0));
+    // ...and the net link (SD→Cloud, x78-94 @ y20) renders as a solid idle line.
+    TEST_ASSERT_TRUE(s_display.pixel_at(80, 20));
 }
 
 void test_link_quality_bars_latency(void) {
@@ -173,49 +175,15 @@ void test_link_window_ring_wrap(void) {
 }
 
 void test_updateDisplay_wifi_connected(void) {
+    // WiFi up maps the same as PPP up: the synoptic net link is up. No signal
+    // bars in the normal view (those are overlay-only now).
     DisplayState ds = make_default_state();
+    ds.usbHostConnected = true;
     ds.netConnected = true;
-    strlcpy(ds.wifiLabel, "MyWiFi", sizeof(ds.wifiLabel));
-    ds.wifiBars = 3;
-
     updateDisplay(ds);
     TEST_ASSERT_EQUAL_INT(1, s_display.flush_count);
-    // 3 bars: bars 0,1,2 drawn; bar 3 (index 3) not drawn
-    // Bar 2 at x=118, h=6, drawn at y=8-6=2 to y=7
-    TEST_ASSERT_TRUE(s_display.pixel_at(118, 2));
-    // Bar 3 at x=123 should NOT be drawn (only 3 bars, index 0-2)
-    TEST_ASSERT_FALSE(s_display.pixel_at(123, 0));
-}
-
-void test_updateDisplay_progress_bar_half(void) {
-    DisplayState ds = make_default_state();
-    ds.mbUploaded = 50.0f;
-    ds.mbQueued = 50.0f;  // remaining = 50 - 0 = 50, uploaded = 50+0 = 50
-    // total = 50 + 50 = 100, fill = 50/100 * 126 = 63
-
-    updateDisplay(ds);
-    // Progress bar outline at y=50, h=5 (rows 50-54)
-    TEST_ASSERT_TRUE(s_display.pixel_at(0, 50));    // top-left corner
-    TEST_ASSERT_TRUE(s_display.pixel_at(127, 50));  // top-right corner
-    // Fill at y=51, from x=1
-    TEST_ASSERT_TRUE(s_display.pixel_at(1, 51));    // filled region
-    TEST_ASSERT_TRUE(s_display.pixel_at(50, 51));   // still filled
-}
-
-void test_updateDisplay_eta_shown(void) {
-    DisplayState ds = make_default_state();
-    ds.uploadKBps = 100.0f;
-    ds.mbQueued = 10.0f;
-    updateDisplay(ds);
-    // ETA uses uploadKBps directly (smoothed by SpeedTracker in main loop)
-    // remaining=10MB, speed=100KB/s → etaSec = 10*1024/100 = 102s → 1:42
-    // "ETA 1:42" rendered at bottom-right
-    TEST_ASSERT_EQUAL_INT(1, s_display.flush_count);
-    // Just verify something was drawn in the ETA row area (y=52-58)
-    bool eta_drawn = false;
-    for (int x = 64; x < 128; x++)
-        if (s_display.pixel_at(x, 57)) { eta_drawn = true; break; }
-    TEST_ASSERT_TRUE(eta_drawn);
+    TEST_ASSERT_FALSE(s_display.pixel_at(123, 0));   // no top-bar signal bars
+    TEST_ASSERT_TRUE(s_display.pixel_at(80, 20));     // net link (idle) drawn
 }
 
 void test_updateDisplay_modem_connecting(void) {
@@ -246,18 +214,21 @@ void test_updateDisplay_sd_error(void) {
     TEST_ASSERT_EQUAL_INT(1, s_display.flush_count);
     // The SD-fault overlay renders the big "SD ERROR" text...
     TEST_ASSERT_TRUE(s_display.pixel_count() > 100);
-    // ...and REPLACES the normal gauges: the USB/UPLOAD column divider drawn at
-    // x=63 only in the normal operational layout must be absent here.
-    TEST_ASSERT_FALSE(s_display.pixel_at(63, 11));
+    // ...and REPLACES the synoptic view: the USB icon (drawn at USB_X=9 in the
+    // normal view; sets pixel (15,10)) must be absent under the overlay.
+    TEST_ASSERT_FALSE(s_display.pixel_at(15, 10));
 }
 
-void test_updateDisplay_normal_has_divider(void) {
-    // Counterpart to the SD-error test: the normal layout DOES draw the x=63
-    // divider, so the discriminator above is meaningful.
+void test_updateDisplay_normal_draws_synoptic(void) {
+    // Counterpart to the SD-error test: the normal layout IS the synoptic view,
+    // which draws the USB icon (pixel (15,10) set), so the discriminator above is
+    // meaningful. Also confirms the top-bar divider hline (y=9) is NOT drawn.
     DisplayState ds = make_default_state();
+    ds.usbHostConnected = true;
     ds.mbQueued = 10.0f;
     updateDisplay(ds);
-    TEST_ASSERT_TRUE(s_display.pixel_at(63, 11));
+    TEST_ASSERT_TRUE(s_display.pixel_at(15, 10));   // USB icon present
+    TEST_ASSERT_FALSE(s_display.pixel_at(0, 9));     // no overlay top-bar divider
 }
 
 void test_updateDisplay_ota_precedence_over_sd_error(void) {
@@ -299,8 +270,9 @@ void test_dispSplash_two_lines(void) {
 
 void test_consecutive_displays_independent(void) {
     DisplayState ds1 = make_default_state();
+    ds1.usbHostConnected = true;
     ds1.pppConnected = true;
-    ds1.modemRssi = 25;
+    ds1.mbUploaded = 50.0f;   // distinct node values + net-up line vs the default
     updateDisplay(ds1);
     int pixels1 = s_display.pixel_count();
 
@@ -337,12 +309,10 @@ int main(int argc, char** argv) {
     RUN_TEST(test_link_window_min_hold);
     RUN_TEST(test_link_window_ring_wrap);
     RUN_TEST(test_updateDisplay_wifi_connected);
-    RUN_TEST(test_updateDisplay_progress_bar_half);
-    RUN_TEST(test_updateDisplay_eta_shown);
     RUN_TEST(test_updateDisplay_modem_connecting);
     RUN_TEST(test_updateDisplay_no_signal);
     RUN_TEST(test_updateDisplay_sd_error);
-    RUN_TEST(test_updateDisplay_normal_has_divider);
+    RUN_TEST(test_updateDisplay_normal_draws_synoptic);
     RUN_TEST(test_updateDisplay_ota_precedence_over_sd_error);
 
     // dispSplash

@@ -349,7 +349,9 @@ static BYTE g_fatfs_pdrv = 0xFF;  // FATFS drive number, persists across mount/u
 
 // ── Harvest timing ──────────────────────────────────────────────────────────
 // QUIET_WINDOW_MS defined in airbridge_triggers.h
-#define DISPLAY_INTERVAL_MS  1000UL
+// 4 Hz: fast enough for the synoptic view's marching-ants / keep-alive pip to
+// read as motion, slow enough to leave the OLED I2C bus (~23ms/flush) idle.
+#define DISPLAY_INTERVAL_MS  250UL
 
 static volatile bool     g_hostConnected    = false;
 static volatile bool     g_hostWasConnected = false;
@@ -1314,6 +1316,8 @@ static void doUpdateDisplay() {
     g_displayState.pppConnected  = g_pppConnected;
     g_displayState.netConnected  = g_netConnected;
     g_displayState.modemReady    = g_modemReady;
+    g_displayState.usbHostConnected = tud_mounted(); // active host enumerated MSC → USB link up
+
     g_displayState.modemRssi     = g_modemRssi;
     strlcpy(g_displayState.modemOp, g_modemOp, sizeof(g_displayState.modemOp));
     strlcpy(g_displayState.wifiLabel, g_wifiLabel, sizeof(g_displayState.wifiLabel));
