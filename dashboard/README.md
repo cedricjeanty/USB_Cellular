@@ -35,6 +35,9 @@ Browser (index.html) ──x-api-key──► API Gateway /prod ──► presig
 | GET  | `/admin/logs?device=X&session=boot_NNNN&tail=N` | Tail one log session. |
 | POST | `/admin/command` | Validate directives against the verb whitelist, then write `commands/{device}/airbridge.cmd` and clear the stale ack. Body: `{"device","cmd"}`. |
 | DELETE | `/admin/command?device=X` | Cancel a not-yet-fetched command. |
+| POST | `/admin/cookie` | Build + stage a one-shot DSU cookie (sets where an aircraft's DSU resumes the flight download). Body: `{"device","serial","mode":"flight"\|"date","flight":N\|"date":"YYYY-MM-DD"}`. Server-side byte-exact port of the firmware's `buildDsuCookie(Date)`; written to `firmware/cookies/{device}/dsuCookie.easdf`, fetched by the device at its **next boot** (queue a `reboot` to apply sooner). |
+| GET | `/admin/cookie?device=X` | Read back a staged-but-not-yet-fetched cookie (decoded). |
+| DELETE | `/admin/cookie?device=X` | Cancel a staged cookie. |
 
 Device→aircraft mapping relies on the **`serial` field added to the heartbeat**
 (`main.cpp`, from NVS `mfst/serial`). Until a device ships that firmware, its aircraft

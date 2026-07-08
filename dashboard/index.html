@@ -162,10 +162,11 @@ tr[data-sev="crit"] td.stripe span{background:var(--crit)}
 .cbtn.danger{color:var(--crit); border-color:color-mix(in srgb,var(--crit) 35%,transparent)}
 .cbtn.danger:hover{background:color-mix(in srgb,var(--crit) 12%,transparent)}
 .cbtn:disabled{opacity:.45; cursor:not-allowed}
-textarea,input[type=text],input[type=password]{
+textarea,input[type=text],input[type=password],input[type=date],input[type=number]{
   width:100%; background:var(--ground); color:var(--ink); border:1px solid var(--line);
   border-radius:8px; padding:9px 11px; font-family:var(--mono); font-size:13px; resize:vertical;
 }
+.row input[type=text],.row input[type=date],.row input[type=number]{width:auto}
 textarea:focus,input:focus{outline:none; border-color:var(--accent)}
 .primary{
   background:var(--accent); color:var(--accent-ink); border:none; border-radius:8px;
@@ -425,6 +426,23 @@ function renderDrawer(dr,device,det){
         ${cell("Files uploaded",m&&m.files?m.files.length:"—")}
       </div>
     </div>
+    <div class="section">
+      <h3>DSU cookie <span class="faint" style="font-weight:400">— download resume point</span></h3>
+      <div class="row">
+        <input id="ck-serial" type="text" placeholder="aircraft serial" style="width:180px" value="${det.serial?esc(det.serial):""}">
+        <select id="ck-mode">
+          <option value="all">everything (from flight 0)</option>
+          <option value="date">flights since date…</option>
+          <option value="flight">after flight number…</option>
+        </select>
+        <input id="ck-date" type="date" style="display:none">
+        <input id="ck-flight" type="number" min="0" placeholder="flight #" style="display:none;width:110px">
+        <button class="cbtn" id="ck-stage">Stage cookie</button>
+      </div>
+      <div class="hint" style="margin-top:6px">One-shot: written to the SD at the device's <b>next boot</b>, before USB is presented —
+        queue a <span class="mono">reboot</span> below to apply it now. Tells the aircraft's DSU which flights to send.</div>
+      <div id="ckwrap" style="margin-top:10px"></div>
+    </div>
     ${core?`<div class="section"><h3>Coredump</h3>
       <div class="ackbox"><span class="pill crit">panic captured</span> &nbsp; ${(core.bytes/1024).toFixed(0)} KB &nbsp;·&nbsp; ${ago(core.last_modified)}
       <div class="hint" style="margin-top:6px">Decode with <span class="mono">scripts/read_coredump.py</span> (S3 key <span class="mono">coredump/${esc(device)}.elf</span>).</div></div></div>`:""}
@@ -456,8 +474,65 @@ function renderDrawer(dr,device,det){
   // pending command → show as ack-in-progress
   renderAck(dr,device,det.ack,det.pending_cmd);
 
+  // DSU cookie staging
+  $("#ck-mode",dr).onchange=()=>{
+    const m=$("#ck-mode",dr).value;
+    $("#ck-date",dr).style.display=m==="date"?"":"none";
+    $("#ck-flight",dr).style.display=m==="flight"?"":"none";
+  };
+  $("#ck-stage",dr).onclick=()=>stageCookie(device,dr);
+  loadCookie(device,dr);
+
   // logs
   loadLogSessions(device,dr);
+}
+
+/* ---- DSU cookie staging ---- */
+function renderCookie(dr,device,staged,lastModified){
+  const w=$("#ckwrap",dr); if(!w)return;
+  if(!staged){w.innerHTML=""; return;}
+  const what=staged.mode==="date"?`flights since <b>${esc(staged.date)}</b>`
+                                 :(staged.flight===0?"<b>everything</b> (from flight 0)":`flights after <b>#${staged.flight}</b>`);
+  w.innerHTML=`<div class="ackbox"><span class="pill neutral">staged</span>
+    &nbsp; ${esc(staged.serial)} · ${what} &nbsp;·&nbsp; ${lastModified?ago(lastModified):""}
+    <button class="cbtn" id="ck-cancel" style="float:right">Cancel</button>
+    <div class="hint" style="margin-top:5px">Waiting for the device's next boot to fetch it (one-shot).</div></div>`;
+  $("#ck-cancel",dr).onclick=async()=>{
+    try{await api("/admin/cookie?device="+encodeURIComponent(device),{method:"DELETE"});
+      toast("Staged cookie cancelled"); renderCookie(dr,device,null);
+    }catch(e){toast("Cancel failed: "+e.message,true);}
+  };
+}
+async function loadCookie(device,dr){
+  try{const r=await api("/admin/cookie?device="+encodeURIComponent(device));
+    renderCookie(dr,device,r.staged,r.last_modified);
+  }catch{renderCookie(dr,device,null);}  // 404 = nothing staged
+}
+async function stageCookie(device,dr){
+  const serial=$("#ck-serial",dr).value.trim();
+  const m=$("#ck-mode",dr).value;
+  if(!serial){toast("Enter the aircraft serial",true);return;}
+  const body={device,serial};
+  let what;
+  if(m==="date"){
+    const d=$("#ck-date",dr).value;
+    if(!d){toast("Pick a start date",true);return;}
+    body.mode="date"; body.date=d; what=`flights since ${d}`;
+  }else if(m==="flight"){
+    const f=parseInt($("#ck-flight",dr).value,10);
+    if(!(f>=0)){toast("Enter a flight number",true);return;}
+    body.mode="flight"; body.flight=f; what=`flights after #${f}`;
+  }else{
+    body.mode="flight"; body.flight=0; what="EVERYTHING the DSU retains";
+  }
+  if(!confirm(`Stage DSU cookie for ${device}:\n\naircraft ${serial} — download ${what}\n\nThe device writes it at its next boot; the aircraft's DSU then sends those flights (they will all be uploaded). Proceed?`))return;
+  const btn=$("#ck-stage",dr); btn.disabled=true; btn.textContent="Staging…";
+  try{
+    const r=await api("/admin/cookie",{method:"POST",body:JSON.stringify(body)});
+    toast("Cookie staged for "+device);
+    renderCookie(dr,device,r.staged,new Date().toISOString());
+  }catch(e){toast("Stage failed: "+e.message,true);}
+  btn.disabled=false; btn.textContent="Stage cookie";
 }
 
 async function loadLogSessions(device,dr){
@@ -551,8 +626,9 @@ const MOCK_DB={
   ],
   latest_fw:"20260706.1",
 };
-function mockApi(path){
-  return new Promise(res=>setTimeout(()=>{
+const MOCK_COOKIES={};
+function mockApi(path,opts={}){
+  return new Promise((res,rej)=>setTimeout(()=>{
     const u=new URL("http://x"+path); const p=u.pathname, q=u.searchParams;
     if(p==="/fleet") return res({...MOCK_DB,count:MOCK_DB.devices.length,generated:new Date().toISOString()});
     if(p==="/admin/device"){
@@ -571,6 +647,13 @@ function mockApi(path){
     if(p==="/admin/command"){
       const d=MOCK_DB.devices.find(x=>x.device===q.get("device"));
       return res({ok:true});
+    }
+    if(p==="/admin/cookie"){
+      const dev=q.get("device")||"";
+      if(opts&&opts.method==="POST"){const b=JSON.parse(opts.body); MOCK_COOKIES[b.device]={staged:{serial:b.serial,mode:b.mode,flight:b.flight,date:b.date},last_modified:new Date().toISOString()}; return res({ok:true,staged:MOCK_COOKIES[b.device].staged});}
+      if(opts&&opts.method==="DELETE"){delete MOCK_COOKIES[dev]; return res({ok:true});}
+      if(MOCK_COOKIES[dev]) return res({device:dev,...MOCK_COOKIES[dev]});
+      return rej(new Error("no staged cookie"));
     }
     res({});
   },MOCK()?260:0));

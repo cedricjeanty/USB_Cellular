@@ -112,6 +112,76 @@ def _iso(dt):
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# ── DSU cookie builder ───────────────────────────────────────────────────────
+# Byte-for-byte Python port of buildDsuCookie / buildDsuCookieDate
+# (esp32/include/airbridge_proto.h) — keep in lockstep with the firmware; parity
+# is pinned by golden vectors generated from the C builder. The dashboard stages
+# the result at firmware/cookies/{device}/dsuCookie.easdf, which the device
+# fetches ONE-SHOT at its next boot (pre-USB) and writes to SD for the DSU.
+
+def _crc16_8005(data):
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x8005) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+
+def _rev8(v):
+    r = 0
+    for i in range(8):
+        r = (r << 1) | ((v >> i) & 1)
+    return r
+
+
+def _encode_arinc_date(year, month, day):
+    bcd = lambda v: ((v // 10) << 4) | (v % 10)
+    y, m, d = bcd(year - 2000), bcd(month), bcd(day)
+    b2 = _rev8((y << 2) & 0xFF)
+    b3 = _rev8(((d & 1) << 7) | ((m << 2) & 0x7F))
+    b4 = _rev8((d >> 1) & 0x1F)
+    ones = bin(0x90).count("1") + bin(b2).count("1") + bin(b3).count("1") + bin(b4).count("1")
+    if ones % 2 == 0:
+        b4 |= 0x01  # ARINC-429 odd parity
+    return b2, b3, b4
+
+
+def _build_dsu_cookie(serial, flight=None, date=None):
+    """78-byte DSU cookie. Exactly one of flight (int) / date ((y,m,d)) is set."""
+    out = bytearray(78)
+    out[0], out[1], out[3], out[4] = 0xEA, 0x1E, 78, 0xD1
+    s = serial.encode("ascii")[:42]  # strlcpy(&out[9], .., 43): 42 chars + NUL
+    out[9:9 + len(s)] = s
+    out[60] = 0x01
+    if date is not None:
+        b2, b3, b4 = _encode_arinc_date(*date)
+        out[52:56] = bytes([0x90, b2, b3, b4])
+        out[62:66] = b"\xFF\xFF\xFF\xFF"
+    else:
+        out[62:66] = int(flight).to_bytes(4, "big")
+    crc = _crc16_8005(out[:76])
+    out[76], out[77] = crc >> 8, crc & 0xFF
+    return bytes(out)
+
+
+def _parse_dsu_cookie(data):
+    """Decode a staged cookie for display: {serial, mode, flight|date}."""
+    if len(data) != 78 or data[0] != 0xEA or data[1] != 0x1E:
+        return None
+    serial = data[9:51].split(b"\0", 1)[0].decode("ascii", "replace")
+    flight = int.from_bytes(data[62:66], "big")
+    if flight == 0xFFFFFFFF and data[52] == 0x90:
+        unbcd = lambda v: ((v >> 4) & 0xF) * 10 + (v & 0xF)
+        b2r, b3r, b4r = _rev8(data[53]), _rev8(data[54]), _rev8(data[55])
+        year = 2000 + unbcd((b2r >> 2) & 0x3F)
+        month = unbcd((b3r & 0x7F) >> 2)
+        day = unbcd(((b4r & 0x1F) << 1) | ((b3r >> 7) & 1))
+        return {"serial": serial, "mode": "date",
+                "date": f"{year:04d}-{month:02d}-{day:02d}"}
+    return {"serial": serial, "mode": "flight", "flight": flight}
+
+
 def handler(event, context):
     method = event.get("httpMethod", "")
     path = event.get("path", "")
@@ -708,6 +778,84 @@ def handler(event, context):
             return respond(400, {"error": "device required"})
         try:
             s3.delete_object(Bucket=bucket, Key=f"commands/{device}/airbridge.cmd")
+            return respond(200, {"ok": True, "device": device})
+        except Exception as e:
+            return respond(500, {"error": str(e)})
+
+    elif path == "/admin/cookie" and method == "POST":
+        # Stage a one-shot DSU cookie for a device: sets where the aircraft's DSU
+        # resumes the flight download (per-aircraft serial + flight number or date).
+        # The device fetches firmware/cookies/{device}/dsuCookie.easdf at its NEXT
+        # BOOT (pre-USB) and writes it to SD — queue a reboot to apply it sooner.
+        # Body: {device, serial, mode: "flight"|"date", flight: N | date: "YYYY-MM-DD"}
+        try:
+            body = json.loads(event.get("body") or "{}")
+        except Exception:
+            return respond(400, {"error": "invalid JSON body"})
+        device = body.get("device", "")
+        serial = body.get("serial", "")
+        mode = body.get("mode", "flight")
+        if not device or not serial:
+            return respond(400, {"error": "device and serial required"})
+        if not re.match(r'^[\w.\-]{1,42}$', serial):
+            return respond(400, {"error": "invalid serial (1-42 chars, [A-Za-z0-9._-])"})
+        if mode == "flight":
+            try:
+                flight = int(body.get("flight", 0))
+            except (TypeError, ValueError):
+                return respond(400, {"error": "flight must be an integer"})
+            if not 0 <= flight <= 0xFFFFFFFE:
+                return respond(400, {"error": "flight out of range"})
+            cookie = _build_dsu_cookie(serial, flight=flight)
+            staged = {"serial": serial, "mode": "flight", "flight": flight}
+        elif mode == "date":
+            m = re.match(r'^(\d{4})-(\d{2})-(\d{2})$', str(body.get("date", "")))
+            if not m:
+                return respond(400, {"error": "date must be YYYY-MM-DD"})
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if not (2000 <= y <= 2099 and 1 <= mo <= 12 and 1 <= d <= 31):
+                return respond(400, {"error": "date out of range"})
+            cookie = _build_dsu_cookie(serial, date=(y, mo, d))
+            staged = {"serial": serial, "mode": "date", "date": f"{y:04d}-{mo:02d}-{d:02d}"}
+        else:
+            return respond(400, {"error": "mode must be 'flight' or 'date'"})
+        # Route by DEVICE only: the aircraft serial in the body must not steer the
+        # bucket (an EA500.E2E* serial would file the cookie where the device's
+        # /firmware/cookie fetch — device-keyed — would never look).
+        bucket = _pick_bucket(event, device_only=True)
+        try:
+            s3.put_object(Bucket=bucket, Key=f"firmware/cookies/{device}/dsuCookie.easdf",
+                          Body=cookie, ContentType="application/octet-stream")
+            return respond(200, {"ok": True, "device": device, "staged": staged,
+                                 "applies": "next boot (one-shot)"})
+        except Exception as e:
+            return respond(500, {"error": str(e)})
+
+    elif path == "/admin/cookie" and method == "GET":
+        # Read back a staged-but-not-yet-fetched cookie (decoded for display).
+        device = params.get("device", "")
+        if not device:
+            return respond(400, {"error": "device required"})
+        key = f"firmware/cookies/{device}/dsuCookie.easdf"
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            data = obj["Body"].read()
+            staged = _parse_dsu_cookie(data)
+            return respond(200, {"device": device, "staged": staged,
+                                 "last_modified": _iso(obj["LastModified"])})
+        except Exception as e:
+            err = str(e)
+            if "NoSuchKey" in err or "404" in err or "AccessDenied" in err:
+                return respond(404, {"error": "no staged cookie"})
+            return respond(500, {"error": err})
+
+    elif path == "/admin/cookie" and method == "DELETE":
+        # Cancel a staged cookie before the device's next boot fetches it.
+        device = params.get("device", "")
+        if not device:
+            return respond(400, {"error": "device required"})
+        try:
+            s3.delete_object(Bucket=bucket, Key=f"firmware/cookies/{device}/dsuCookie.easdf")
             return respond(200, {"ok": True, "device": device})
         except Exception as e:
             return respond(500, {"error": str(e)})
