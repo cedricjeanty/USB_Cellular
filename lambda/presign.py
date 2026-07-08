@@ -55,10 +55,21 @@ def _pick_bucket(event, device_only=False):
     return BUCKET
 
 
+# CORS: the fleet dashboard is a browser SPA on a different origin; its x-api-key
+# header forces a preflight. Devices ignore these headers. Allow-Origin * is safe
+# here because the key never leaves the operator's browser and the real access
+# boundary is the WAF/IP allowlist (see dashboard/README.md).
+_CORS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "content-type,x-api-key",
+    "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
+}
+
+
 def respond(status, body):
     return {
         "statusCode": status,
-        "headers": {"Content-Type": "application/json"},
+        "headers": {"Content-Type": "application/json", **_CORS},
         "body": json.dumps(body),
     }
 
@@ -105,6 +116,12 @@ def handler(event, context):
     method = event.get("httpMethod", "")
     path = event.get("path", "")
     params = event.get("queryStringParameters") or {}
+
+    if method == "OPTIONS":
+        # Browser CORS preflight (dashboard). No API key on preflights, so the
+        # API Gateway OPTIONS methods are configured without apiKeyRequired.
+        return {"statusCode": 204, "headers": dict(_CORS), "body": ""}
+
     bucket = _pick_bucket(event)
 
     if path == "/presign" and method == "GET":
