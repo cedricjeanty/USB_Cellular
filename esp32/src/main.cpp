@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260707013000"
+#define FW_VERSION "20260707200000"
 
 #include <cstring>
 #include <ctime>
