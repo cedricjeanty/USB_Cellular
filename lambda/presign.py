@@ -33,8 +33,15 @@ CHUNK = 5 * 1024 * 1024  # 5 MB — S3 multipart minimum for non-final parts
 URL_EXPIRY = 3600  # 1 hour
 
 
-def _pick_bucket(event):
-    """Return prod or test bucket based on device ID / DSU serial in the request."""
+def _pick_bucket(event, device_only=False):
+    """Return prod or test bucket based on device ID / DSU serial in the request.
+
+    device_only: route by device ID alone. Heartbeats carry the last-harvested
+    aircraft `serial` in the body purely as the device→aircraft JOIN for the
+    dashboard — it must not steer routing, or a prod device that last harvested
+    a test aircraft (e.g. a bench unit with EA500.E2E* in NVS) silently files
+    its heartbeats in the test bucket and vanishes from the prod fleet view.
+    """
     params = event.get("queryStringParameters") or {}
     body = {}
     try:
@@ -42,7 +49,7 @@ def _pick_bucket(event):
     except Exception:
         pass
     device = params.get("device", "") or body.get("device", "")
-    serial = params.get("serial", "") or body.get("serial", "")
+    serial = "" if device_only else (params.get("serial", "") or body.get("serial", ""))
     if device.startswith(("EMU_", "TEST_")) or serial.startswith(("TEST.", "EA500.E2E")):
         return BUCKET_TEST
     return BUCKET
@@ -265,6 +272,7 @@ def handler(event, context):
         device = params.get("device", "")
         if not device:
             return respond(400, {"error": "device required"})
+        bucket = _pick_bucket(event, device_only=True)
         body = event.get("body", "") or ""
         key = f"heartbeat/{device}.json"
         try:
@@ -298,6 +306,7 @@ def handler(event, context):
         device = params.get("device", "")
         if not device:
             return respond(400, {"error": "device required"})
+        bucket = _pick_bucket(event, device_only=True)
         key = f"heartbeat/{device}.json"
         try:
             obj = s3.get_object(Bucket=bucket, Key=key)
