@@ -429,7 +429,8 @@ function renderDrawer(dr,device,det){
     <div class="section">
       <h3>DSU cookie <span class="faint" style="font-weight:400">— download resume point</span></h3>
       <div class="row">
-        <input id="ck-serial" type="text" placeholder="aircraft serial" style="width:180px" value="${det.serial?esc(det.serial):""}">
+        <select id="ck-serial" style="min-width:210px"></select>
+        <input id="ck-serial-custom" type="text" placeholder="custom serial" style="display:none;width:160px">
         <select id="ck-mode">
           <option value="all">everything (from flight 0)</option>
           <option value="date">flights since date…</option>
@@ -474,7 +475,21 @@ function renderDrawer(dr,device,det){
   // pending command → show as ack-in-progress
   renderAck(dr,device,det.ack,det.pending_cmd);
 
-  // DSU cookie staging
+  // DSU cookie staging — serials auto-populated: the EA500 fleet is SN 1-260 and the
+  // DSU writes them as EA500.%06d (verified against real logs from SN179/214/243).
+  {
+    const sel=$("#ck-serial",dr);
+    const std=n=>"EA500."+String(n).padStart(6,"0");
+    const isStd=s=>/^EA500\.\d{6}$/.test(s||"");
+    let opts="";
+    if(det.serial&&!isStd(det.serial))
+      opts+=`<option value="${esc(det.serial)}">${esc(det.serial)} · current (non-fleet)</option>`;
+    for(let n=1;n<=260;n++) opts+=`<option value="${std(n)}">SN ${n} · ${std(n)}</option>`;
+    opts+=`<option value="__custom">custom serial…</option>`;
+    sel.innerHTML=opts;
+    if(det.serial) sel.value=det.serial;   // preselect the device's current aircraft
+    sel.onchange=()=>{$("#ck-serial-custom",dr).style.display=sel.value==="__custom"?"":"none";};
+  }
   $("#ck-mode",dr).onchange=()=>{
     const m=$("#ck-mode",dr).value;
     $("#ck-date",dr).style.display=m==="date"?"":"none";
@@ -509,7 +524,8 @@ async function loadCookie(device,dr){
   }catch{renderCookie(dr,device,null);}  // 404 = nothing staged
 }
 async function stageCookie(device,dr){
-  const serial=$("#ck-serial",dr).value.trim();
+  let serial=$("#ck-serial",dr).value;
+  if(serial==="__custom") serial=$("#ck-serial-custom",dr).value.trim();
   const m=$("#ck-mode",dr).value;
   if(!serial){toast("Enter the aircraft serial",true);return;}
   const body={device,serial};
