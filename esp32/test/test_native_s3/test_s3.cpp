@@ -410,6 +410,74 @@ void test_presign_feeds_link_rtt(void) {
         "presign GET must report its RTT to keep the connection bars live");
 }
 
+// ── Multipart progress is FILE-cumulative ───────────────────────────────────
+// Found live 2026-07-09 on a 162 MB flight upload: the OLED Cloud counter
+// climbed to ~5 MB and snapped back to 0 once per part, because the multipart
+// loop passed the raw per-part stream progress to the display callback. The
+// contract: progress(sent,total) is file-cumulative — monotonic across parts,
+// part N starting at (N-1)*5MB, ending at fileSize — including on NVS resume.
+
+static std::vector<uint32_t> s_progLog;
+static uint32_t s_progTotal = 0;
+static void recordProgress(uint32_t sent, uint32_t total) {
+    s_progLog.push_back(sent);
+    s_progTotal = total;
+}
+static const char* s_bigPath = "/sd/upload/0001/big.bin";
+static void seedCredsAndBigFile(uint32_t size) {
+    s_nvs.set_str("s3", "api_host", "api.ex.com");
+    s_nvs.set_str("s3", "api_key", "key");
+    s_nvs.set_str("s3", "device_id", "D1");
+    s_fs.add_dir("/sd/upload"); s_fs.add_dir("/sd/upload/0001");
+    std::string big(size, 'x');
+    s_fs.add_file(s_bigPath, big.data(), big.size());
+}
+static const char* MP_INIT =
+    "HTTP/1.1 200 OK\r\n\r\n"
+    "{\"upload_id\":\"U1\",\"key\":\"D1/big.bin\",\"parts\":2}";
+static const char* MP_PART_URL =
+    "HTTP/1.1 200 OK\r\n\r\n{\"url\":\"https://s3.aws.com/b/big.bin?p=x\"}";
+
+void test_multipart_progress_cumulative(void) {
+    const uint32_t SZ = 5u*1024*1024 + 2048;      // 2 parts: 5 MB + 2 KB
+    seedCredsAndBigFile(SZ);
+    s_net.push_response(MP_INIT);
+    s_net.push_response(MP_PART_URL);
+    s_net.push_response("HTTP/1.1 200 OK\r\nETag: \"e1\"\r\n\r\n");   // part 1 PUT
+    s_net.push_response(MP_PART_URL);
+    s_net.push_response("HTTP/1.1 200 OK\r\nETag: \"e2\"\r\n\r\n");   // part 2 PUT
+    s_net.push_response("HTTP/1.1 200 OK\r\n\r\n{\"ok\":true}");      // complete
+    s_progLog.clear(); s_progTotal = 0;
+    UploadResult r = halS3UploadFile(s_bigPath, "0001/big.bin", recordProgress);
+    TEST_ASSERT_TRUE_MESSAGE(r.success, r.error);
+    TEST_ASSERT_FALSE(s_progLog.empty());
+    for (size_t i = 1; i < s_progLog.size(); i++)
+        TEST_ASSERT_TRUE_MESSAGE(s_progLog[i] >= s_progLog[i-1],
+            "progress must never go backward across parts (Cloud MB sawtooth)");
+    TEST_ASSERT_EQUAL_UINT32(SZ, s_progLog.back());     // ends at whole-file size
+    TEST_ASSERT_EQUAL_UINT32(SZ, s_progTotal);          // total is whole-file size
+}
+
+void test_multipart_progress_resume_starts_at_base(void) {
+    const uint32_t SZ = 5u*1024*1024 + 2048;
+    seedCredsAndBigFile(SZ);
+    // Simulate: part 1 finished in a previous boot, then power cut. The session
+    // is keyed by the same relPath the upload task passes as `filename`.
+    saveMultipartSession("0001/big.bin", "U1", "D1/big.bin", 2, SZ);
+    savePartProgress(1, "e1");
+    s_net.push_response(MP_INIT);                                     // presign (still called)
+    s_net.push_response(MP_PART_URL);
+    s_net.push_response("HTTP/1.1 200 OK\r\nETag: \"e2\"\r\n\r\n");   // part 2 PUT
+    s_net.push_response("HTTP/1.1 200 OK\r\n\r\n{\"ok\":true}");      // complete
+    s_progLog.clear();
+    UploadResult r = halS3UploadFile(s_bigPath, "0001/big.bin", recordProgress);
+    TEST_ASSERT_TRUE_MESSAGE(r.success, r.error);
+    TEST_ASSERT_FALSE(s_progLog.empty());
+    TEST_ASSERT_TRUE_MESSAGE(s_progLog.front() > 5u*1024*1024,
+        "resumed upload must report progress from the completed-parts base, not 0");
+    TEST_ASSERT_EQUAL_UINT32(SZ, s_progLog.back());
+}
+
 // ── findNextUploadFile tests ────────────────────────────────────────────────
 
 void test_find_next_empty(void) {
@@ -620,6 +688,8 @@ int main(int argc, char** argv) {
 
     // findNextUploadFile
     RUN_TEST(test_find_next_empty);
+    RUN_TEST(test_multipart_progress_cumulative);
+    RUN_TEST(test_multipart_progress_resume_starts_at_base);
     RUN_TEST(test_find_next_in_subfolder);
     RUN_TEST(test_find_next_oldest_subfolder_first);
     RUN_TEST(test_find_next_skips_empty_subfolder);

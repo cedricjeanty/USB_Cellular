@@ -126,8 +126,23 @@ inline void clearMultipartSession() {
     g_hal->nvs->erase_key("s3up", "retries");
 }
 
-// Upload progress callback: called with bytes sent so far
+// Upload progress callback: called with bytes sent so far.
+// For multipart uploads the values are FILE-cumulative (completed parts + the
+// in-flight part), not per-part — the OLED Cloud counter reads this directly,
+// and per-part values made it saw-tooth 0→5MB once per part (found live on a
+// 162 MB flight upload, 2026-07-09).
 typedef void (*UploadProgressFn)(uint32_t bytesSent, uint32_t totalBytes);
+
+// Adapter state translating per-part stream progress into file-cumulative
+// progress. Plain function pointers can't capture, so the multipart loop
+// parks the caller's callback + offsets here and passes the adapter down.
+static UploadProgressFn s_partProgressUser  = nullptr;
+static uint32_t         s_partProgressBase  = 0;   // bytes in completed parts before this one
+static uint32_t         s_partProgressTotal = 0;   // whole-file size
+static void partProgressAdapter(uint32_t sent, uint32_t) {
+    if (s_partProgressUser)
+        s_partProgressUser(s_partProgressBase + sent, s_partProgressTotal);
+}
 
 // ── Find next file to upload ─────────────────────────────────────────────────
 
@@ -467,10 +482,13 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
 
     ULDBG("ULDBG multipart: %d parts from part %u uploadId=[%.40s] key=%s",
           totalParts, startPart, uploadId.c_str(), s3Key.c_str());
+    s_partProgressUser  = progress;
+    s_partProgressTotal = fileSize;
     for (uint32_t partNum = startPart; partNum <= (uint32_t)totalParts; partNum++) {
         uint32_t offset = (partNum - 1) * S3_CHUNK_SIZE;
         uint32_t chunkSize = fileSize - offset;
         if (chunkSize > S3_CHUNK_SIZE) chunkSize = S3_CHUNK_SIZE;
+        s_partProgressBase = offset;  // display: completed-parts bytes (resume-aware)
 
         // Upload this part with retries. A part is only "done" once S3 returns a
         // non-empty ETag — on a flaky cellular link the PUT can stream fully yet
@@ -510,7 +528,7 @@ inline UploadResult halS3UploadFile(const char* filepath, const char* filename,
                 "PUT %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
                 s3Path, s3Host, chunkSize);
             if (!g_hal->network->write(tls, hdr, strlen(hdr)) ||
-                !halStreamFile(tls, f, chunkSize, progress)) {
+                !halStreamFile(tls, f, chunkSize, progress ? partProgressAdapter : nullptr)) {
                 g_hal->network->destroy(tls);
                 ULDBG("ULDBG part %u stream failed, retry", partNum);
                 continue;

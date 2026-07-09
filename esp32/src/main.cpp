@@ -383,7 +383,6 @@ static bool          g_s3CookieActive = false; // S3 cookie overrides harvest co
 static volatile bool g_preUsbDone   = false; // upload task signals OTA+cookie done → present USB
 static float    g_uploadingMb    = 0.0f; // live progress of current file upload
 // g_tlsActive declared earlier (needed by the Esp32Network HAL impl).
-static float    g_uploadBaseMb   = 0.0f; // base offset for multipart (completed parts)
 static float    g_usbWriteKBps   = 0.0f; // live USB write speed for display
 static float    g_uploadKBps     = 0.0f; // live upload speed for display
 // Connection quality from the data path (no AT/+++ needed). Bandwidth is set by
@@ -3233,10 +3232,11 @@ static void modemTask(void* param) {
 }
 
 // Progress callback for the shared upload code (airbridge_s3.h) — drives the
-// OLED upload-progress field. sent/total are per-PUT (single or per-part).
+// OLED upload-progress field. sent is FILE-cumulative (multipart parts are
+// translated by partProgressAdapter), so this maps straight to the Cloud MB.
 static void uploadProgressCb(uint32_t sent, uint32_t total) {
     (void)total;
-    g_uploadingMb = g_uploadBaseMb + sent / 1e6f;
+    g_uploadingMb = sent / 1e6f;
 }
 
 // ── Upload task ─────────────────────────────────────────────────────────────
@@ -3625,7 +3625,7 @@ static void uploadTask(void* param) {
             cdc_printf("Uploading: %s (%.1f MB) heap=%lu min=%lu\r\n", relPath, fileMb,
                        (unsigned long)esp_get_free_heap_size(),
                        (unsigned long)esp_get_minimum_free_heap_size());
-            g_uploadingMb = 0.0f; g_uploadBaseMb = 0.0f;
+            g_uploadingMb = 0.0f;
 
             // Upload via the shared code path — identical to what the emulator runs.
             // .eaofh files go through fleet-aware manifest/delta logic; others are
@@ -3636,7 +3636,7 @@ static void uploadTask(void* param) {
                 : halS3UploadFile(path, relPath, uploadProgressCb);
 
             g_tlsActive = false;  // re-enable +++ after upload
-            g_uploadingMb = 0.0f; g_uploadBaseMb = 0.0f;
+            g_uploadingMb = 0.0f;
 
             if (!ur.success) {
                 cdc_printf("Upload failed for %s: %s — retrying in 30s\r\n", relPath, ur.error);
