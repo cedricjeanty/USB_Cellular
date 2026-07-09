@@ -194,11 +194,26 @@ void test_mapper_values_and_ete(void) {
     AirbridgeState s;
     buildSynopticState(ds, s, uv, sv, cv);
     TEST_ASSERT_EQUAL_STRING("15.6", s.usbVal);
-    TEST_ASSERT_EQUAL_STRING("8.0", s.sdVal);
+    // SD drains with the in-flight upload: queued 8.0 − uploading 1.0 = 7.0
+    // (it must NOT sit at 8.0 until the file completes — the card value should
+    // fall in lockstep as Cloud rises).
+    TEST_ASSERT_EQUAL_STRING("7.0", s.sdVal);
     TEST_ASSERT_EQUAL_STRING("4.0", s.cloudVal);
     // remaining = mbQueued - uploadingMb = 8 - 1 = 7 MB @ 100KB/s → 7*1024/100 = 71s
     TEST_ASSERT_EQUAL_INT(71, s.eteSecs);
     TEST_ASSERT_EQUAL_INT(LINK_XFER, s.net);
+}
+
+void test_mapper_sd_drain_clamps_at_zero(void) {
+    // uploadingMb can momentarily exceed mbQueued (accounting refresh lag while
+    // a file completes) — the SD value must clamp to 0, never underflow.
+    DisplayState ds = {};
+    ds.mbQueued = 1.0f; ds.uploadingMb = 1.4f;
+    ds.pppConnected = true;
+    char uv[8], sv[8], cv[8];
+    AirbridgeState s;
+    buildSynopticState(ds, s, uv, sv, cv);
+    TEST_ASSERT_EQUAL_STRING("0.0", s.sdVal);
 }
 
 void test_mapper_ete_capped(void) {
@@ -289,6 +304,7 @@ int main(void) {
     RUN_TEST(test_fmt_mb);
     RUN_TEST(test_mapper_links);
     RUN_TEST(test_mapper_values_and_ete);
+    RUN_TEST(test_mapper_sd_drain_clamps_at_zero);
     RUN_TEST(test_mapper_ete_capped);
     return UNITY_END();
 }

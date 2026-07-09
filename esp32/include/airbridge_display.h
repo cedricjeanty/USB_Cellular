@@ -110,7 +110,12 @@ inline void buildSynopticState(const DisplayState& ds, AirbridgeState& s,
     s.netRetry = true;                        // internet is expected to retry forever
 
     synopticFmtMb(uv, 8, ds.hostWrittenMb);
-    synopticFmtMb(sv, 8, ds.mbQueued);
+    // SD shows what's LEFT to move: queued minus the in-flight file's progress,
+    // so it drains smoothly as Cloud fills instead of dropping in whole-file
+    // steps (mbQueued itself only shrinks when a file completes). Conservation
+    // reads correctly on the face: SD remaining + Cloud done ≈ total queued.
+    float sdLeft = ds.mbQueued - ds.uploadingMb;
+    synopticFmtMb(sv, 8, sdLeft > 0 ? sdLeft : 0);
     synopticFmtMb(cv, 8, ds.mbUploaded + ds.uploadingMb);
     s.usbVal = uv; s.sdVal = sv; s.cloudVal = cv;
 
