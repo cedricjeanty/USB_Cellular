@@ -21,9 +21,11 @@ struct DisplayState {
     char     wifiLabel[22];
     int8_t   wifiBars;
     float    hostWrittenMb;
-    float    mbUploaded;
-    float    mbQueued;
-    float    uploadingMb;
+    float    mbUploaded;       // completed THIS power session (per-boot, like hostWrittenMb)
+    float    mbQueued;         // total bytes of files on the card awaiting upload
+    float    uploadingMb;      // in-flight file: bytes moved THIS power session
+    float    uploadFileDoneMb; // in-flight file: FILE-cumulative bytes (incl. prior boots'
+                               // resumed parts) — drives the SD what's-left drain
     float    usbWriteKBps;
     float    uploadKBps;
     // OTA overlay (shown instead of USB/UPLOAD gauges when active)
@@ -91,6 +93,35 @@ inline void synopticFmtMb(char* buf, size_t n, float mb) {
     else                   snprintf(buf, n, "%.1f", mb);              // < 100 MB (0.0-99.9)
 }
 
+// ── Per-power-session upload accounting ──────────────────────────────────────
+// The Cloud value counts bytes moved THIS power session (like the USB value) —
+// it must read 0 after a power cycle even when a multipart resumes mid-file.
+// Shared upload code reports FILE-cumulative bytes (resumed parts included), so
+// latch each file's first-seen position — snapped down to the 5MB part boundary
+// a resume restarts from — as the session base and subtract it. RAM-only: a
+// power cycle zeroes the tracker, which is exactly the reset the face wants.
+// Retries of the same file within a boot keep their base, so the session count
+// keeps climbing instead of sawtoothing.
+struct UploadSessionTracker {
+    char     file[128];
+    uint32_t baseBytes;
+    bool     latched;
+};
+inline float uploadSessionMb(UploadSessionTracker& t, const char* file,
+                             uint32_t cumulativeBytes,
+                             uint32_t partBytes = 5UL * 1024 * 1024) {
+    if (strncmp(t.file, file, sizeof(t.file)) != 0) {
+        strlcpy(t.file, file, sizeof(t.file));
+        t.latched = false;
+    }
+    if (!t.latched) {
+        t.baseBytes = (cumulativeBytes / partBytes) * partBytes;
+        t.latched = true;
+    }
+    return (cumulativeBytes > t.baseBytes)
+         ? (cumulativeBytes - t.baseBytes) / 1e6f : 0.0f;
+}
+
 // Map the rich DisplayState onto the synoptic AirbridgeState. Value buffers are
 // caller-owned (live for the render call). Cumulative-MB node values:
 //   USB = written this session, SD = queued on card, Cloud = uploaded.
@@ -110,11 +141,12 @@ inline void buildSynopticState(const DisplayState& ds, AirbridgeState& s,
     s.netRetry = true;                        // internet is expected to retry forever
 
     synopticFmtMb(uv, 8, ds.hostWrittenMb);
-    // SD shows what's LEFT to move: queued minus the in-flight file's progress,
-    // so it drains smoothly as Cloud fills instead of dropping in whole-file
-    // steps (mbQueued itself only shrinks when a file completes). Conservation
-    // reads correctly on the face: SD remaining + Cloud done ≈ total queued.
-    float sdLeft = ds.mbQueued - ds.uploadingMb;
+    // SD shows what's LEFT to move: queued minus the in-flight file's
+    // FILE-cumulative progress (a resumed multipart's earlier-boot parts have
+    // already left the card), so it drains smoothly instead of dropping in
+    // whole-file steps. Cloud counts THIS power session only (uploadingMb is
+    // session-relative), matching the USB value's per-session semantics.
+    float sdLeft = ds.mbQueued - ds.uploadFileDoneMb;
     synopticFmtMb(sv, 8, sdLeft > 0 ? sdLeft : 0);
     synopticFmtMb(cv, 8, ds.mbUploaded + ds.uploadingMb);
     s.usbVal = uv; s.sdVal = sv; s.cloudVal = cv;
@@ -124,7 +156,7 @@ inline void buildSynopticState(const DisplayState& ds, AirbridgeState& s,
     s.netAntStepMs = synopticAntStepMs(ds.uploadKBps);
 
     // ETE (shown only while net==LINK_XFER): remaining queued / current rate.
-    float remaining = (ds.mbQueued > ds.uploadingMb) ? ds.mbQueued - ds.uploadingMb : 0;
+    float remaining = (ds.mbQueued > ds.uploadFileDoneMb) ? ds.mbQueued - ds.uploadFileDoneMb : 0;
     if (s.net == LINK_XFER && ds.uploadKBps > 0.5f && remaining > 0.001f) {
         int etaSec = (int)(remaining * 1024.0f / ds.uploadKBps);
         s.eteSecs = etaSec > 5999 ? 5999 : (uint16_t)etaSec;   // cap at 99:59

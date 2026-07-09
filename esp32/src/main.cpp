@@ -381,7 +381,10 @@ static volatile bool g_splashActive = true; // hold splash screen on boot
 static volatile bool g_otaActive    = false; // suppress display during OTA download
 static bool          g_s3CookieActive = false; // S3 cookie overrides harvest cookie this session
 static volatile bool g_preUsbDone   = false; // upload task signals OTA+cookie done → present USB
-static float    g_uploadingMb    = 0.0f; // live progress of current file upload
+static float    g_uploadingMb    = 0.0f; // in-flight file: bytes moved THIS power session
+static float    g_uploadFileDoneMb = 0.0f; // in-flight file: FILE-cumulative bytes (drives SD drain)
+static UploadSessionTracker g_upTracker = {}; // latches per-file session base (RAM → power cycle resets)
+static char     g_upFile[128]    = "";   // file the progress callback is reporting on
 // g_tlsActive declared earlier (needed by the Esp32Network HAL impl).
 static float    g_usbWriteKBps   = 0.0f; // live USB write speed for display
 static float    g_uploadKBps     = 0.0f; // live upload speed for display
@@ -1325,6 +1328,7 @@ static void doUpdateDisplay() {
     g_displayState.mbUploaded    = g_mbUploaded;
     g_displayState.mbQueued      = g_mbQueued;
     g_displayState.uploadingMb   = g_uploadingMb;
+    g_displayState.uploadFileDoneMb = g_uploadFileDoneMb;
     g_displayState.usbWriteKBps  = g_usbWriteKBps;
     g_displayState.uploadKBps    = g_uploadKBps;
     g_displayState.linkLatencyMs = linkLatencyNow();
@@ -3231,12 +3235,15 @@ static void modemTask(void* param) {
     }
 }
 
-// Progress callback for the shared upload code (airbridge_s3.h) — drives the
-// OLED upload-progress field. sent is FILE-cumulative (multipart parts are
-// translated by partProgressAdapter), so this maps straight to the Cloud MB.
+// Progress callback for the shared upload code (airbridge_s3.h). sent is
+// FILE-cumulative (multipart parts translated by partProgressAdapter):
+//   uploadFileDoneMb — raw cumulative, drives the SD what's-left drain;
+//   uploadingMb      — session-relative via the tracker, drives Cloud (the
+//                      Cloud value counts THIS power session only).
 static void uploadProgressCb(uint32_t sent, uint32_t total) {
     (void)total;
-    g_uploadingMb = sent / 1e6f;
+    g_uploadFileDoneMb = sent / 1e6f;
+    g_uploadingMb = uploadSessionMb(g_upTracker, g_upFile, sent);
 }
 
 // ── Upload task ─────────────────────────────────────────────────────────────
@@ -3625,7 +3632,8 @@ static void uploadTask(void* param) {
             cdc_printf("Uploading: %s (%.1f MB) heap=%lu min=%lu\r\n", relPath, fileMb,
                        (unsigned long)esp_get_free_heap_size(),
                        (unsigned long)esp_get_minimum_free_heap_size());
-            g_uploadingMb = 0.0f;
+            strlcpy(g_upFile, relPath, sizeof(g_upFile));
+            g_uploadingMb = 0.0f; g_uploadFileDoneMb = 0.0f;
 
             // Upload via the shared code path — identical to what the emulator runs.
             // .eaofh files go through fleet-aware manifest/delta logic; others are
@@ -3636,7 +3644,11 @@ static void uploadTask(void* param) {
                 : halS3UploadFile(path, relPath, uploadProgressCb);
 
             g_tlsActive = false;  // re-enable +++ after upload
-            g_uploadingMb = 0.0f;
+            // Session-shipped bytes for this file (0 for a manifest-skip, delta
+            // size for a delta upload, resumed-part bytes only after a reboot) —
+            // credited to the per-session Cloud total below on success.
+            float sessionShippedMb = g_uploadingMb;
+            g_uploadingMb = 0.0f; g_uploadFileDoneMb = 0.0f;
 
             if (!ur.success) {
                 cdc_printf("Upload failed for %s: %s — retrying in 30s\r\n", relPath, ur.error);
@@ -3674,7 +3686,7 @@ static void uploadTask(void* param) {
             if (g_filesQueued > 0) g_filesQueued--;
             g_filesUploaded++;
             uploadedThisPass++;
-            g_mbUploaded += fileMb;
+            g_mbUploaded += sessionShippedMb;  // Cloud counts this session's bytes, not file size
             if (g_mbQueued >= fileMb) g_mbQueued -= fileMb; else g_mbQueued = 0.0f;
         }
         if (g_filesQueued > 0 && !g_harvesting) {

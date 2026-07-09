@@ -376,10 +376,13 @@ static void otaProgressCb(uint32_t sent, uint32_t total) {
 static std::atomic<bool> s_uploading{false};
 
 static DisplayState* s_uploadDs = nullptr;
+static UploadSessionTracker s_upTracker = {};  // per-session Cloud base (same as firmware)
+static char s_upFile[128] = "";
 
 static void uploadProgressCb(uint32_t bytesSent, uint32_t totalBytes) {
     if (s_uploadDs) {
-        s_uploadDs->uploadingMb = bytesSent / 1e6f;
+        s_uploadDs->uploadFileDoneMb = bytesSent / 1e6f;                       // SD drain
+        s_uploadDs->uploadingMb = uploadSessionMb(s_upTracker, s_upFile, bytesSent);  // Cloud
     }
 }
 
@@ -397,7 +400,8 @@ static void uploadThread(DisplayState* ds) {
         g_hal->filesys->stat(fullpath, &sz, &isDir);
         float fileMb = sz / 1e6f;
         printf("[S3] Uploading %s (%.1f MB)...\n", relPath, fileMb);
-        ds->uploadingMb = 0;
+        strlcpy(s_upFile, relPath, sizeof(s_upFile));
+        ds->uploadingMb = 0; ds->uploadFileDoneMb = 0;
 
         // Route .eaofh files through fleet-aware upload (manifest check + aircraft path)
         const char* fname = strrchr(relPath, '/');
@@ -411,7 +415,8 @@ static void uploadThread(DisplayState* ds) {
         UploadResult r = isEaofh
             ? halS3UploadEaofh(harvestDir, relPath, uploadProgressCb)
             : halS3UploadFile(fullpath, relPath, uploadProgressCb);
-        ds->uploadingMb = 0;
+        float sessionShippedMb = ds->uploadingMb;   // this session's bytes for this file
+        ds->uploadingMb = 0; ds->uploadFileDoneMb = 0;
         if (r.success) {
             printf("[S3] Upload complete: %.0f KB/s (%s)\n", r.kbps, r.error);
             markFileUploaded(harvestDir, relPath);
@@ -419,7 +424,7 @@ static void uploadThread(DisplayState* ds) {
             char metaPath[272];
             snprintf(metaPath, sizeof(metaPath), "%s.meta", fullpath);
             g_hal->filesys->remove(metaPath);
-            ds->mbUploaded += fileMb;
+            ds->mbUploaded += sessionShippedMb;  // Cloud counts this session's bytes
             if (ds->mbQueued >= fileMb) ds->mbQueued -= fileMb; else ds->mbQueued = 0;
             s_log.write(g_hal->clock->millis(), "Uploaded %s %.0f KB/s", relPath, r.kbps);
         } else {

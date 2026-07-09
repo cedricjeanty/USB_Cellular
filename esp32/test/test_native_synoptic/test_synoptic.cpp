@@ -188,32 +188,90 @@ void test_mapper_values_and_ete(void) {
     DisplayState ds = {};
     ds.hostWrittenMb = 15.6f;
     ds.mbQueued = 8.0f;
-    ds.mbUploaded = 3.0f; ds.uploadingMb = 1.0f;   // cloud = 4.0
+    ds.mbUploaded = 3.0f;
+    ds.uploadingMb = 1.0f;      // this session's bytes → Cloud = 3 + 1 = 4.0
+    ds.uploadFileDoneMb = 1.0f; // file-cumulative (fresh file: same) → SD = 8 − 1
     ds.pppConnected = true; ds.uploadKBps = 100.0f; // → XFER, ETE from remaining
     char uv[8], sv[8], cv[8];
     AirbridgeState s;
     buildSynopticState(ds, s, uv, sv, cv);
     TEST_ASSERT_EQUAL_STRING("15.6", s.usbVal);
-    // SD drains with the in-flight upload: queued 8.0 − uploading 1.0 = 7.0
+    // SD drains with the in-flight upload: queued 8.0 − file-done 1.0 = 7.0
     // (it must NOT sit at 8.0 until the file completes — the card value should
-    // fall in lockstep as Cloud rises).
+    // fall in lockstep as bytes leave).
     TEST_ASSERT_EQUAL_STRING("7.0", s.sdVal);
     TEST_ASSERT_EQUAL_STRING("4.0", s.cloudVal);
-    // remaining = mbQueued - uploadingMb = 8 - 1 = 7 MB @ 100KB/s → 7*1024/100 = 71s
+    // remaining = mbQueued - uploadFileDoneMb = 8 - 1 = 7 MB @ 100KB/s → 71s
     TEST_ASSERT_EQUAL_INT(71, s.eteSecs);
     TEST_ASSERT_EQUAL_INT(LINK_XFER, s.net);
 }
 
-void test_mapper_sd_drain_clamps_at_zero(void) {
-    // uploadingMb can momentarily exceed mbQueued (accounting refresh lag while
-    // a file completes) — the SD value must clamp to 0, never underflow.
+void test_mapper_resumed_file_splits_sd_and_cloud(void) {
+    // Power cycle mid-multipart: 60MB of the file left the card in EARLIER
+    // sessions. Cloud counts only THIS session (per-boot, like USB); the SD
+    // what's-left drain uses the file-cumulative position.
     DisplayState ds = {};
-    ds.mbQueued = 1.0f; ds.uploadingMb = 1.4f;
+    ds.mbQueued = 162.0f;
+    ds.mbUploaded = 0.0f;
+    ds.uploadingMb = 2.0f;        // shipped since this boot
+    ds.uploadFileDoneMb = 62.0f;  // file position incl. prior boots' parts
+    ds.pppConnected = true; ds.uploadKBps = 100.0f;
+    char uv[8], sv[8], cv[8];
+    AirbridgeState s;
+    buildSynopticState(ds, s, uv, sv, cv);
+    TEST_ASSERT_EQUAL_STRING("100", s.sdVal);   // 162 − 62 left on the card
+    TEST_ASSERT_EQUAL_STRING("2.0", s.cloudVal); // this session only
+}
+
+void test_mapper_sd_drain_clamps_at_zero(void) {
+    // uploadFileDoneMb can momentarily exceed mbQueued (accounting refresh lag
+    // while a file completes) — the SD value must clamp to 0, never underflow.
+    DisplayState ds = {};
+    ds.mbQueued = 1.0f; ds.uploadFileDoneMb = 1.4f;
     ds.pppConnected = true;
     char uv[8], sv[8], cv[8];
     AirbridgeState s;
     buildSynopticState(ds, s, uv, sv, cv);
     TEST_ASSERT_EQUAL_STRING("0.0", s.sdVal);
+}
+
+// ── uploadSessionMb: the per-power-session Cloud base tracker ────────────────
+void test_session_tracker_fresh_file_counts_from_zero(void) {
+    UploadSessionTracker t = {};
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.008f, uploadSessionMb(t, "a/f1.eaofh", 8192));
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 10.0f, uploadSessionMb(t, "a/f1.eaofh", 10000000));
+}
+
+void test_session_tracker_resume_latches_part_base(void) {
+    // New boot resumes at part 13: first callback is 60MB(+first chunk). The
+    // base snaps DOWN to the 5MB part boundary, so session counts from ~0.
+    UploadSessionTracker t = {};
+    const uint32_t PART = 5u*1024*1024;
+    float first = uploadSessionMb(t, "a/f1.eaofh", 12*PART + 8192);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.008f, first);
+    // ...and climbs session-relative from there.
+    float later = uploadSessionMb(t, "a/f1.eaofh", 14*PART);
+    TEST_ASSERT_FLOAT_WITHIN(0.02f, (2*PART)/1e6f, later);
+}
+
+void test_session_tracker_retry_same_file_keeps_base(void) {
+    // A failed part retries from its own boundary: cumulative DIPS briefly but
+    // the base must not re-latch (that was the 5MB sawtooth). Never negative.
+    UploadSessionTracker t = {};
+    const uint32_t PART = 5u*1024*1024;
+    uploadSessionMb(t, "a/f1.eaofh", 8192);            // latch base 0
+    uploadSessionMb(t, "a/f1.eaofh", 2*PART + 100000); // mid part 3
+    float dip = uploadSessionMb(t, "a/f1.eaofh", 2*PART + 8192); // part-3 retry
+    TEST_ASSERT_FLOAT_WITHIN(0.02f, (2*PART)/1e6f, dip);
+    TEST_ASSERT_TRUE(dip >= 0.0f);
+}
+
+void test_session_tracker_new_file_relatches(void) {
+    UploadSessionTracker t = {};
+    uploadSessionMb(t, "a/f1.eaofh", 10000000);
+    // Next file starts its own base — no carry-over from the previous file.
+    float fresh = uploadSessionMb(t, "a/f2.eaofh", 8192);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.008f, fresh);
 }
 
 void test_mapper_ete_capped(void) {
@@ -305,6 +363,11 @@ int main(void) {
     RUN_TEST(test_mapper_links);
     RUN_TEST(test_mapper_values_and_ete);
     RUN_TEST(test_mapper_sd_drain_clamps_at_zero);
+    RUN_TEST(test_mapper_resumed_file_splits_sd_and_cloud);
+    RUN_TEST(test_session_tracker_fresh_file_counts_from_zero);
+    RUN_TEST(test_session_tracker_resume_latches_part_base);
+    RUN_TEST(test_session_tracker_retry_same_file_keeps_base);
+    RUN_TEST(test_session_tracker_new_file_relatches);
     RUN_TEST(test_mapper_ete_capped);
     return UNITY_END();
 }
