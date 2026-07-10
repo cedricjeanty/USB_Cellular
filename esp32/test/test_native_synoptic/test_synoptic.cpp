@@ -345,8 +345,44 @@ void test_ant_step_affects_render(void) {
     TEST_ASSERT_NOT_EQUAL(a, b);
 }
 
+// ── Speed smoother (upload rate + ETE stability) ────────────────────────────
+void test_speed_ema_smooths_noise(void) {
+    // A noisy alternating signal must converge near the mean, not swing tick-to-tick.
+    SpeedEma s = {};
+    uint32_t t = 0;
+    float last = 0;
+    for (int i = 0; i < 60; i++) { last = speedEmaUpdate(s, (i % 2) ? 60.0f : 100.0f, t); t += 250; }
+    TEST_ASSERT_FLOAT_WITHIN(15.0f, 80.0f, last);   // near the 80 mean
+    float before = last;
+    float after = speedEmaUpdate(s, 100.0f, t);     // one tick barely moves it
+    TEST_ASSERT_TRUE((after - before) < 5.0f);
+}
+
+void test_speed_ema_holds_across_gap(void) {
+    // Multipart inter-part gap: several zero-progress ticks must HOLD the rate,
+    // not collapse it to 0 (which would spike the ETE).
+    SpeedEma s = {};
+    uint32_t t = 0;
+    for (int i = 0; i < 20; i++) { speedEmaUpdate(s, 90.0f, t); t += 250; }
+    float held = s.kbps;
+    for (int i = 0; i < 10; i++) { float r = speedEmaUpdate(s, 0.0f, t); TEST_ASSERT_FLOAT_WITHIN(0.001f, held, r); t += 250; }
+    TEST_ASSERT_TRUE(s.kbps > 50.0f);   // 2.5s gap < 6s stall → held
+}
+
+void test_speed_ema_clears_on_real_stall(void) {
+    // No progress beyond stallMs → rate falls to 0 so a dead upload doesn't
+    // display a stale ETE forever.
+    SpeedEma s = {};
+    speedEmaUpdate(s, 90.0f, 0);
+    float r = speedEmaUpdate(s, 0.0f, 7000);   // > 6000ms stall window
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, r);
+}
+
 int main(void) {
     UNITY_BEGIN();
+    RUN_TEST(test_speed_ema_smooths_noise);
+    RUN_TEST(test_speed_ema_holds_across_gap);
+    RUN_TEST(test_speed_ema_clears_on_real_stall);
     RUN_TEST(test_values_no_edge_clip);
     RUN_TEST(test_ant_step_from_rate);
     RUN_TEST(test_mapper_sets_ant_steps);

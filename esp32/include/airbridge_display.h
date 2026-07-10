@@ -122,6 +122,33 @@ inline float uploadSessionMb(UploadSessionTracker& t, const char* file,
          ? (cumulativeBytes - t.baseBytes) / 1e6f : 0.0f;
 }
 
+// ── Display speed smoother (drives the upload rate + ETE) ────────────────────
+// The raw per-tick delta is noisy at the 250ms display tick, and a multipart
+// upload has brief ZERO-progress gaps between parts (presign + TLS reconnect)
+// that would collapse the rate to 0 and spike the ETE. Feed an EWMA only on
+// POSITIVE progress and HOLD the last rate across short gaps; after a real
+// stall (no progress for stallMs) let the rate fall to 0 so a dead upload
+// doesn't show a stale ETE forever. Restores the smoothing the 1Hz display used
+// to provide implicitly before it went to 4Hz.
+struct SpeedEma {
+    float    kbps;
+    uint32_t lastProgMs;
+    bool     seeded;
+};
+inline float speedEmaUpdate(SpeedEma& s, float instantKBps, uint32_t nowMs,
+                            float alpha = 0.18f, uint32_t stallMs = 6000) {
+    if (instantKBps > 0.0f) {
+        s.kbps = s.seeded ? (alpha * instantKBps + (1.0f - alpha) * s.kbps) : instantKBps;
+        s.seeded = true;
+        s.lastProgMs = nowMs;
+    } else if (s.seeded && (uint32_t)(nowMs - s.lastProgMs) > stallMs) {
+        s.kbps = 0.0f;      // genuine stall — drop the rate so the ETE clears
+        s.seeded = false;
+    }
+    // else: brief inter-part gap — hold the last smoothed rate
+    return s.kbps;
+}
+
 // Map the rich DisplayState onto the synoptic AirbridgeState. Value buffers are
 // caller-owned (live for the render call). Cumulative-MB node values:
 //   USB = written this session, SD = queued on card, Cloud = uploaded.

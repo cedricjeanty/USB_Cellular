@@ -4145,12 +4145,16 @@ static void main_loop_task(void* param) {
                 static float    prevUsbMb = 0;
                 static float    prevUpMb  = 0;
                 static uint32_t prevMs    = 0;
+                static SpeedEma usbEma    = {};
+                static SpeedEma upEma     = {};
                 float dt = (prevMs > 0) ? (now - prevMs) / 1000.0f : 1.0f;
                 if (dt > 0.1f) {
                     float usbDelta = g_hostWrittenMb - prevUsbMb;
                     float upDelta  = (g_mbUploaded + g_uploadingMb) - prevUpMb;
-                    g_usbWriteKBps = (usbDelta > 0) ? (usbDelta * 1024.0f / dt) : 0;
-                    g_uploadKBps   = (upDelta > 0)  ? (upDelta  * 1024.0f / dt) : 0;
+                    // Smooth both: raw per-tick deltas are noisy and multipart
+                    // gaps zero the upload rate → jumpy ETE without this.
+                    g_usbWriteKBps = speedEmaUpdate(usbEma, usbDelta > 0 ? usbDelta * 1024.0f / dt : 0, now);
+                    g_uploadKBps   = speedEmaUpdate(upEma,  upDelta  > 0 ? upDelta  * 1024.0f / dt : 0, now);
                     prevUsbMb = g_hostWrittenMb;
                     prevUpMb  = g_mbUploaded + g_uploadingMb;
                     prevMs    = now;
