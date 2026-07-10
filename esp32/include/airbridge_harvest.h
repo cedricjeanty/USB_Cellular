@@ -59,6 +59,21 @@ inline uint32_t recoveryCookieFlight(uint32_t maxFlight, bool bootRecovery) {
     return maxFlight;
 }
 
+// Whether a completed harvest should advance the DSU cookie forward. Once real
+// flights are safely on the SD, the cookie MUST move past them so the aircraft
+// doesn't re-dump them on the next flight — this is driven by HARVEST, not by
+// upload success (a slow/failed upload must never strand the cookie) and NOT by
+// whether an operator staged a starting cookie this boot. An operator-staged S3
+// cookie sets only the *starting* point (and still suppresses the boot
+// manifest-sync); gating this forward advance on it was a bug: a staged cookie
+// then made the unit re-dump its whole retained history on EVERY subsequent
+// flight (found in the field on EA500.000243, 2026-07-09). A truncated
+// boot-recovery harvest is excluded — recoveryCookieFlight handles its back-off.
+inline bool harvestShouldAdvanceCookie(int filesHarvested, bool harvestIncomplete,
+                                       uint32_t maxFlight, bool hasDsuSerial) {
+    return filesHarvested > 0 && !harvestIncomplete && maxFlight > 0 && hasDsuSerial;
+}
+
 // HAL filesys adapter for lastRecordFromLog. Wraps a HAL file handle so the
 // content parser can do random-access reads via the same I/O abstraction.
 struct HalLogReader {

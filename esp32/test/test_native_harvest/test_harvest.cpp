@@ -280,12 +280,35 @@ void test_recovery_cookie_backoff(void) {
     TEST_ASSERT_EQUAL_UINT32(0,    recoveryCookieFlight(0,    false));
 }
 
+// harvestShouldAdvanceCookie: after a real completed harvest the cookie MUST move
+// forward so the aircraft doesn't re-dump captured flights — driven by harvest, not
+// upload success, and NOT blocked by an operator-staged cookie (the field re-dump bug).
+void test_harvest_should_advance_cookie(void) {
+    // Normal completed harvest of real flights → advance.
+    TEST_ASSERT_TRUE(harvestShouldAdvanceCookie(3, /*incomplete*/false, /*maxFlight*/1257, /*hasSerial*/true));
+    TEST_ASSERT_TRUE(harvestShouldAdvanceCookie(1, false, 1, true));
+
+    // Regression: advancement is independent of any staged cookie. There is no
+    // g_s3CookieActive parameter by design — staging must never block the forward
+    // advance (staging a cookie previously made the unit re-dump every flight).
+
+    // No files harvested → nothing to acknowledge → don't touch the cookie.
+    TEST_ASSERT_FALSE(harvestShouldAdvanceCookie(0, false, 1257, true));
+    // Incomplete/truncated harvest → let the retry reconcile first.
+    TEST_ASSERT_FALSE(harvestShouldAdvanceCookie(3, true, 1257, true));
+    // No parseable flight number → can't build a meaningful cookie.
+    TEST_ASSERT_FALSE(harvestShouldAdvanceCookie(3, false, 0, true));
+    // No DSU serial → can't address the cookie to an aircraft.
+    TEST_ASSERT_FALSE(harvestShouldAdvanceCookie(3, false, 1257, false));
+}
+
 // ── Test runner ─────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
     UNITY_BEGIN();
 
     RUN_TEST(test_recovery_cookie_backoff);
+    RUN_TEST(test_harvest_should_advance_cookie);
     RUN_TEST(test_harvest_empty_dir);
     RUN_TEST(test_harvest_single_file);
     RUN_TEST(test_harvest_skips_system_files);

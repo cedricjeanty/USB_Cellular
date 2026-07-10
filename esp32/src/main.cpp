@@ -379,7 +379,9 @@ static float    g_sdTotalMb      = 0.0f;
 static float    g_sdUsedMb       = 0.0f; // updated periodically for display
 static volatile bool g_splashActive = true; // hold splash screen on boot
 static volatile bool g_otaActive    = false; // suppress display during OTA download
-static bool          g_s3CookieActive = false; // S3 cookie overrides harvest cookie this session
+static bool          g_s3CookieActive = false; // operator staged an S3 cookie this boot: sets the
+                                               // STARTING point + suppresses boot manifest-sync;
+                                               // does NOT block the post-harvest forward advance
 static volatile bool g_preUsbDone   = false; // upload task signals OTA+cookie done → present USB
 static float    g_uploadingMb    = 0.0f; // in-flight file: bytes moved THIS power session
 static float    g_uploadFileDoneMb = 0.0f; // in-flight file: FILE-cumulative bytes (drives SD drain)
@@ -3626,8 +3628,11 @@ static void uploadTask(void* param) {
             const char* bareFname = uploadFname;
             for (const char* p = uploadFname; p[0] && p[1]; p++)
                 if (p[0] == '_' && p[1] == '_') bareFname = p + 2;
+            // Only the .eaofh classification matters here — cookie advancement
+            // moved to the harvest path, so the parsed serial/flight are unused.
             char eaSerial[44] = ""; uint32_t eaLast = 0;
             bool isEaofh = parseEaofhFilename(bareFname, eaSerial, sizeof(eaSerial), &eaLast);
+            (void)eaSerial; (void)eaLast;
 
             cdc_printf("Uploading: %s (%.1f MB) heap=%lu min=%lu\r\n", relPath, fileMb,
                        (unsigned long)esp_get_free_heap_size(),
@@ -3657,25 +3662,13 @@ static void uploadTask(void* param) {
             }
             log_write("Uploaded %s %.0f KB/s (%s)", relPath, ur.kbps, ur.error);
 
-            // .eaofh: advance the DSU cookie to the confirmed S3 high-water-mark.
-            // halS3UploadEaofh updates the manifest + NVS mfst/hwm but does NOT
-            // write the cookie — the firmware does, so the aircraft DSU resumes
-            // from the right flight. Idempotent on a manifest-skip.
-            if (isEaofh && eaSerial[0]) {
-                uint32_t hwm = 0;
-                nvs_handle_t nh;
-                if (nvs_open("mfst", NVS_READONLY, &nh) == ESP_OK) {
-                    nvs_get_u32(nh, "hwm", &hwm); nvs_close(nh);
-                }
-                if (hwm > 0) {
-                    uint8_t newCookie[78];
-                    buildDsuCookie(eaSerial, hwm, newCookie);
-                    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-                    write_cookie_to_dsu(newCookie, 78);
-                    xSemaphoreGive(g_sd_mutex);
-                    log_write("Cookie updated: %s flight %lu", eaSerial, (unsigned long)hwm);
-                }
-            }
+            // NOTE: the DSU cookie is NOT advanced here. Cookie advancement is
+            // driven entirely by HARVEST (harvestShouldAdvanceCookie → the write
+            // near the end of doHarvest): once a flight is safely on the SD the
+            // aircraft need never re-send it, regardless of upload state. Tying it
+            // to upload success (as this block used to) stranded the cookie when a
+            // large upload stalled on a weak link, so the next flight re-dumped the
+            // whole history (EA500.000243 field incident, 2026-07-09).
 
             // Delete the uploaded file + remove the subfolder if now empty.
             xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
@@ -3799,7 +3792,7 @@ static void doHarvest() {
     if (cookieFlight != hr.maxFlight)
         log_write("Boot recovery: last flight %lu may be a partial transfer — cookie backed off to %lu (re-request)",
                   (unsigned long)hr.maxFlight, (unsigned long)cookieFlight);
-    if (count > 0 && !harvestIncomplete && !g_s3CookieActive && hr.maxFlight > 0 && hr.dsuSerial[0]) {
+    if (harvestShouldAdvanceCookie(count, harvestIncomplete, hr.maxFlight, hr.dsuSerial[0])) {
         uint8_t cookie[78];
         buildDsuCookie(hr.dsuSerial, cookieFlight, cookie);
         if (g_dual_partition && dsu_mounted) {

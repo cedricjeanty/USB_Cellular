@@ -1219,6 +1219,65 @@ else
     skip "TEST 25: manifest gap-fill / bootstrap — emulator-only"
 fi
 
+log ""; log "TEST 26: staged cookie does NOT block post-harvest advance (field re-dump regression)"
+# Field bug 2026-07-09 (EA500.000243): an operator-staged S3 cookie set
+# g_s3CookieActive, which suppressed the harvest-time cookie advance — so after a
+# flight the cookie stayed at the staged (old) value and the aircraft re-dumped its
+# whole history on the NEXT flight. Regression: after harvesting a NEW flight, the
+# cookie must advance past the staged value regardless of staging.
+if [ "$TARGET" = "emulator" ]; then
+    rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory"
+    rm -f "$SD_EMU"/*.easdf "$FW_DIR/emu_nvs.dat"
+    cleanup_aircraft_s3 "$SERIAL"
+
+    # Stage an S3 cookie at a LOW flight (100) — the device fetches + applies it at
+    # boot (pre-USB) and sets g_s3CookieActive.
+    python3 -c "
+serial=b'$SERIAL'; cookie=bytearray(78)
+cookie[0]=0xEA;cookie[1]=0x1E;cookie[3]=78;cookie[4]=0xD1
+cookie[9:9+min(42,len(serial))]=serial[:42]; cookie[60]=0x01
+cookie[62:66]=(100).to_bytes(4,'big')
+crc=0xFFFF
+for b in cookie[:76]:
+    crc^=b<<8
+    for _ in range(8): crc=((crc<<1)^0x8005)&0xFFFF if crc&0x8000 else (crc<<1)&0xFFFF
+cookie[76]=(crc>>8)&0xFF;cookie[77]=crc&0xFF
+open('/tmp/staged_cookie.bin','wb').write(bytes(cookie))"
+    aws s3 cp /tmp/staged_cookie.bin "s3://$BUCKET/firmware/cookies/$DEVICE/dsuCookie.easdf" >/dev/null 2>&1
+    log "  Staged cookie flight=100 for $SERIAL"
+
+    start_device 5
+    # Confirm the staged cookie was applied (proves g_s3CookieActive is set this boot).
+    wait_for_log "S3 cookie applied" "$(log_mark)" 60 >/dev/null 2>&1
+    CK_STAGED=$(read_cookie_flight)
+    if [ "${CK_STAGED:-0}" -eq 100 ]; then
+        pass "Staged cookie applied on SD (flight=100)"
+    else
+        fail "Staged cookie not applied (cookie flight=$CK_STAGED, want 100)"
+    fi
+
+    # Now harvest a NEW, higher flight. With the bug present the cookie stays at 100;
+    # fixed, it advances to 1600.
+    m=$(log_mark)
+    write_dsu_file "01600" 200
+    if wait_for_upload_complete "01600" "$m" 180 "01600 upload"; then
+        CK_ADV=$(read_cookie_flight)
+        if [ "${CK_ADV:-0}" -ge 1600 ]; then
+            pass "Staged cookie advanced to $CK_ADV after harvest (not stranded at 100)"
+        else
+            fail "Cookie STRANDED at $CK_ADV after harvest — staged cookie blocked advance (re-dump bug)"
+        fi
+    else
+        fail "TEST 26: harvest/upload of 01600 did not complete"
+    fi
+
+    stop_device
+    cleanup_aircraft_s3 "$SERIAL"
+    aws s3 rm "s3://$BUCKET/firmware/cookies/$DEVICE/dsuCookie.easdf" 2>/dev/null >/dev/null
+else
+    skip "TEST 26: staged-cookie advance — emulator-only"
+fi
+
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 log ""; log "Cleaning up..."
 if [ "$TARGET" = "emulator" ]; then

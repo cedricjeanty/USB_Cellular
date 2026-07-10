@@ -1358,7 +1358,9 @@ int main(int argc, char* argv[]) {
                 printf("[Harvest] Boot recovery: last flight %u may be partial — cookie backed off to %u\n",
                        r.maxFlight, cookieFlight);
             s_bootRecoveryHarvest = false;  // consumed (this harvest completed past the retry guard)
-            if (r.maxFlight > 0 && r.dsuSerial[0]) {
+            // Incomplete harvests already `continue`d above, so this is a completed one —
+            // shared predicate keeps the emulator and firmware cookie-advance rule identical.
+            if (harvestShouldAdvanceCookie(r.count, false, r.maxFlight, r.dsuSerial[0])) {
                 uint8_t cookie[78];
                 buildDsuCookie(r.dsuSerial, cookieFlight, cookie);
                 char cookiePath[256];
