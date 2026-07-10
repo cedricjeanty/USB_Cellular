@@ -423,9 +423,17 @@ wait_for_manifest() {  # <serial> <min_hwm> [timeout_sec]
 }
 
 get_manifest_hwm() {  # <serial>
-    local serial="$1"
-    aws s3 cp "s3://$BUCKET/aircraft/$serial/manifest.json" - 2>/dev/null \
-        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('high_water_mark',0))" 2>/dev/null || echo 0
+    local serial="$1" hwm=0
+    # Retry: a transient `aws s3 cp` failure trips the `|| echo 0` fallback and
+    # returns a spurious 0 even when the manifest is populated (caused a flaky
+    # "hwm -> 0" in the monotonic check). A real absent manifest still settles to 0.
+    for _ in 1 2 3; do
+        hwm=$(aws s3 cp "s3://$BUCKET/aircraft/$serial/manifest.json" - 2>/dev/null \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('high_water_mark',0))" 2>/dev/null || echo 0)
+        [ "${hwm:-0}" -gt 0 ] 2>/dev/null && break
+        sleep 1
+    done
+    echo "${hwm:-0}"
 }
 
 # Seed a manifest to a given hwm (simulates previous AirBridge uploads).

@@ -746,14 +746,16 @@ print(struct.unpack('>I', data[62:66])[0])
     rm -rf "$SD_EMU/flightHistory"
     start_device
     write_dsu_file "01701" 50
-    sleep 30  # scanner detects at ~2s, harvest at ~17s
+    # State-triggered wait (NOT a fixed sleep — that raced: the cookie advances
+    # 1699→1700→1701 across harvest cycles and a fixed sleep could catch 1700).
+    FLIGHT2=0
+    for _ in $(seq 1 40); do
+        FLIGHT2=$(read_cookie_flight)
+        [ "${FLIGHT2:-0}" -ge 1701 ] && break
+        sleep 1
+    done
     if [ -f "$SD_EMU/dsuCookie.easdf" ]; then
-        FLIGHT2=$(python3 -c "
-import struct
-data = open('$SD_EMU/dsuCookie.easdf', 'rb').read()
-print(struct.unpack('>I', data[62:66])[0])
-")
-        if [ "$FLIGHT2" = "1701" ]; then
+        if [ "${FLIGHT2:-0}" -ge 1701 ]; then
             pass "Power-loss recovery: next transfer advances cookie to flight=$FLIGHT2"
         else
             fail "Power-loss recovery: next transfer cookie=$FLIGHT2 (want 1701)"
