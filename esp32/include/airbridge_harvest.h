@@ -74,17 +74,10 @@ inline bool harvestShouldAdvanceCookie(int filesHarvested, bool harvestIncomplet
     return filesHarvested > 0 && !harvestIncomplete && maxFlight > 0 && hasDsuSerial;
 }
 
-// HAL filesys adapter for lastRecordFromLog. Wraps a HAL file handle so the
-// content parser can do random-access reads via the same I/O abstraction.
-struct HalLogReader {
-    void* fh;            // HAL file handle (g_hal->filesys->open result)
-};
-inline uint32_t hal_read_at(void* ctx, uint64_t off, uint8_t* buf, uint32_t len) {
-    HalLogReader* r = (HalLogReader*)ctx;
-    if (!g_hal || !g_hal->filesys || !r->fh) return 0;
-    if (!g_hal->filesys->seek(r->fh, (long)off, 0 /* SEEK_SET */)) return 0;
-    return (uint32_t)g_hal->filesys->read(r->fh, buf, len);
-}
+// HAL filesys adapter for the record parsers — moved to hal/log_reader.h so
+// airbridge_s3.h can share it (delta split's firstRecordFromLog) without a
+// harvest.h ↔ s3.h include cycle.
+#include "hal/log_reader.h"
 
 // Scan srcDir (root + one subdirectory level) for any harvestable files.
 // Returns true immediately on the first non-empty, non-skipped file found.

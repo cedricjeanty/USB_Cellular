@@ -4,6 +4,7 @@
 // All I/O through HAL interfaces — works on ESP32 and native emulator.
 
 #include "hal/hal.h"
+#include "hal/log_reader.h"  // HalLogReader/hal_read_at for the delta-split first-flight scan
 #include "airbridge_utils.h"
 #include "airbridge_http.h"
 #include "airbridge_log.h"   // ULDBG breadcrumbs reach CDC+S3 on firmware, stdout on emulator
@@ -828,12 +829,41 @@ inline UploadResult halS3UploadEaofh(const char* harvestDir, const char* relPath
         return res;
     }
 
-    // Read .meta for first_flight
+    // First flight in this file — needed for the delta split that trims a file
+    // straddling the manifest HWM down to only its new flights. The .meta sidecar
+    // is written by the test harness/host_dsu; REAL DSU dumps have none, so fall
+    // back to scanning the file's FIRST record (firstRecordFromLog, mirror of the
+    // lastRecordFromLog we already use). Without this fallback firstFlight stayed 0
+    // on real files, the split was skipped, and a re-dump re-uploaded flights
+    // already on S3 whole (EA500.000243 162MB, 2026-07-09). Gzip files can't be
+    // byte-split, so skip the scan for them (the split is bypassed below anyway).
     uint32_t firstFlight = 0;
     {
         char metaPath[272];
         snprintf(metaPath, sizeof(metaPath), "%s.meta", fullpath);
         firstFlight = halReadMetaFirstFlight(metaPath);
+    }
+    if (firstFlight == 0 && lastFlight > 0) {
+        uint32_t fsz = 0; bool fdir = false;
+        if (g_hal->filesys->stat(fullpath, &fsz, &fdir) && fsz >= 28) {
+            void* ff = g_hal->filesys->open(fullpath, "rb");
+            if (ff) {
+                // Skip a compressed file — its magic isn't an .eaofh record.
+                uint8_t magic[2] = {0, 0};
+                g_hal->filesys->read(ff, magic, 2);
+                bool gz = (magic[0] == 0x1f && magic[1] == 0x8b);
+                if (!gz) {
+                    HalLogReader rdr = { ff };
+                    uint32_t ff_flight = 0; char ff_serial[16] = "";
+                    if (firstRecordFromLog(hal_read_at, &rdr, fsz, &ff_flight,
+                                           ff_serial, sizeof(ff_serial)) && ff_flight > 0) {
+                        firstFlight = ff_flight;
+                        ULDBG("ULDBG firstFlight from file scan: %u", firstFlight);
+                    }
+                }
+                g_hal->filesys->close(ff);
+            }
+        }
     }
 
     // Is the harvested file gzip-compressed? (compress directive). A gzip stream is an

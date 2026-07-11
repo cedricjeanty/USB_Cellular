@@ -478,6 +478,47 @@ void test_multipart_progress_resume_starts_at_base(void) {
     TEST_ASSERT_EQUAL_UINT32(SZ, s_progLog.back());
 }
 
+// A real DSU .eaofh has NO .meta sidecar, so firstFlight must be recovered by
+// scanning the file's first record — otherwise the delta split is skipped and a
+// straddling file re-uploads flights already on S3 whole (EA500.000243 162MB
+// field re-dump, 2026-07-09). Build 5 flights (1..5), hwm=3, no .meta: only the
+// tail (flights 4-5) must upload.
+static void appendRec(std::string& s, uint16_t flight) {
+    size_t b = s.size();
+    s.resize(b + 32, '\0');
+    s[b+0] = (char)0xEA; s[b+1] = (char)0x4C; s[b+2] = 0x00; s[b+3] = 32;  // 0x4C, rlen=32
+    memcpy(&s[b+9], "EA500.DEDUP1", 12);        // serial at body[5:17]
+    s[b+24] = (char)(flight >> 8); s[b+25] = (char)(flight & 0xFF);        // flight at body[20:22]
+}
+void test_eaofh_delta_from_file_scan_no_meta(void) {
+    s_nvs.set_str("s3", "api_host", "api.ex.com");
+    s_nvs.set_str("s3", "api_key", "key");
+    s_nvs.set_str("s3", "device_id", "D1");
+    s_fs.add_dir("/sd/upload"); s_fs.add_dir("/sd/upload/0001");
+    std::string content;
+    for (uint16_t fl = 1; fl <= 5; fl++) appendRec(content, fl);   // 5*32 = 160 bytes
+    // Unique serial so halS3UploadEaofh's static manifest cache MISSES and the
+    // mock manifest response below is actually consumed (a shared serial would
+    // hit the cache from a prior test and desync the response queue).
+    const char* fp = "/sd/upload/0001/EA500.DEDUP1_00005_20260628.eaofh";
+    s_fs.add_file(fp, content.data(), content.size());
+    // NOTE: deliberately NO .meta sidecar (real DSU files have none).
+
+    s_net.push_response("HTTP/1.1 200 OK\r\n\r\n{\"high_water_mark\":3}");                                   // manifest
+    s_net.push_response("HTTP/1.1 200 OK\r\n\r\n{\"url\":\"https://s3/o?s=a\",\"key\":\"aircraft/EA500.DEDUP1/EA500.DEDUP1_00005_20260628.eaofh\",\"parts\":1}"); // delta presign
+    s_net.push_response("HTTP/1.1 200 OK\r\nETag: \"e\"\r\n\r\n");                                            // PUT
+
+    halS3UploadEaofh("/sd/upload", "0001/EA500.DEDUP1_00005_20260628.eaofh");
+    // Split at end of flight-3 record (offset 96) → delta = 160-96 = 64 bytes.
+    bool delta = false, whole = false;
+    for (auto& req : s_net.requests) {
+        if (req.find("size=64")  != std::string::npos) delta = true;
+        if (req.find("size=160") != std::string::npos) whole = true;
+    }
+    TEST_ASSERT_TRUE_MESSAGE(delta,  "no .meta: firstFlight from file scan must enable the delta (size=64 tail)");
+    TEST_ASSERT_FALSE_MESSAGE(whole, "must NOT re-upload the whole straddling file (size=160)");
+}
+
 // ── findNextUploadFile tests ────────────────────────────────────────────────
 
 void test_find_next_empty(void) {
@@ -680,6 +721,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_upload_non200_put_fails);
     RUN_TEST(test_presign_feeds_link_rtt);
     RUN_TEST(test_eaofh_gzip_uploaded_whole);
+    RUN_TEST(test_eaofh_delta_from_file_scan_no_meta);
     RUN_TEST(test_upload_skip_if_exists);
 
     // Multipart part-PUT retry
