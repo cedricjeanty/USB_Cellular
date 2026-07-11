@@ -300,8 +300,9 @@ inline bool cmdWriteFile(const char* path, const char* text) {
 // core build- and target-independent.
 
 // Compress flag is shared state (HAL-independent): toggled by the `compress` directive,
-// read by the harvest. Single writer (command path) / single reader (harvest task).
-inline bool g_compress = false;
+// read by the upload path (post-dedup gzip). DEFAULT ON — flights upload as gzip deltas
+// (~1.8x fewer cellular bytes); the S3 consumer gunzips. `compress off` disables it.
+inline bool g_compress = true;
 
 struct CmdRunResult {
     bool ran;        // at least one directive executed

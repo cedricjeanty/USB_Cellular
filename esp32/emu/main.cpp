@@ -105,9 +105,10 @@ static time_t      s_cellFileMtime = 0;
 // device can upload it. See dsuTransferThread() + scripts/flight_cycle_test.sh.
 static volatile bool s_dsuStop = false;  // one-shot power-off flag (main thread → DSU thread)
 
-// EMU_COMPRESS=1: gzip .eaofh files into the upload queue at harvest (~3x fewer
-// bytes on the cellular PUT). Mirrors the firmware's opt-in compression.
-static bool s_compress = false;
+// Compression mirrors the firmware default (g_compress = ON): gzip the post-dedup
+// bytes at UPLOAD. EMU_COMPRESS=0 disables it for an uncompressed A/B; the shared
+// `compress off` command also clears it (bridged via g_compress).
+static bool s_compress = true;
 
 // Modeled on-device gzip throughput (bytes/sec). The emulator gzips on the host CPU
 // (effectively instant), which would OVERSTATE compression's benefit vs hardware where
@@ -628,9 +629,9 @@ int main(int argc, char* argv[]) {
         printf("Cellular profile: scripted via %s\n", s_cellFilePath.c_str());
     }
     if (const char* e = getenv("EMU_CELL_SEED"); e && e[0]) srand((unsigned)atoi(e));
-    if (const char* e = getenv("EMU_COMPRESS"); e && e[0] == '1') {
-        s_compress = true;
-        printf("Harvest compression: ON (gzip .eaofh into upload queue)\n");
+    if (const char* e = getenv("EMU_COMPRESS"); e && e[0]) {
+        s_compress = (e[0] != '0');   // default ON; EMU_COMPRESS=0 forces the uncompressed A/B
+        printf("Upload compression: %s (post-dedup gzip)\n", s_compress ? "ON" : "OFF");
     }
     if (const char* e = getenv("EMU_GZIP_KBPS"); e && atoi(e) > 0) {
         s_gzipBps = (uint32_t)atoi(e) * 1000u;
@@ -1325,7 +1326,7 @@ int main(int argc, char* argv[]) {
             g_hal->nvs->get_u32("harvest", "count", &hnum);
             hnum++;
             g_hal->nvs->set_u32("harvest", "count", hnum);
-            HarvestResult r = harvestFiles(SD_ROOT, destDir, (uint16_t)hnum, s_compress);
+            HarvestResult r = harvestFiles(SD_ROOT, destDir, (uint16_t)hnum, /*compress=*/false);
             printf("[Harvest] Done: %u file(s), %.1f MB → %s\n", r.count, r.usedMb, r.folder);
             modelGzipTime(r.inBytes);   // charge modeled on-device gzip CPU time
 
