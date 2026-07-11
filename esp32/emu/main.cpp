@@ -413,7 +413,7 @@ static void uploadThread(DisplayState* ds) {
         bool isEaofh = ext && strcmp(ext, ".eaofh") == 0;
 
         UploadResult r = isEaofh
-            ? halS3UploadEaofh(harvestDir, relPath, uploadProgressCb)
+            ? halS3UploadEaofh(harvestDir, relPath, uploadProgressCb, s_compress)
             : halS3UploadFile(fullpath, relPath, uploadProgressCb);
         float sessionShippedMb = ds->uploadingMb;   // this session's bytes for this file
         ds->uploadingMb = 0; ds->uploadFileDoneMb = 0;
@@ -890,7 +890,7 @@ int main(int argc, char* argv[]) {
                     g_hal->nvs->get_u32("harvest", "count", &hnum);
                     hnum++;
                     g_hal->nvs->set_u32("harvest", "count", hnum);
-                    HarvestResult r = harvestFiles(SD_ROOT, destDir, (uint16_t)hnum, s_compress);
+                    HarvestResult r = harvestFiles(SD_ROOT, destDir, (uint16_t)hnum, /*compress=*/false);
                     printf("Harvested: %u file(s), %.1f MB → %s\n", r.count, r.usedMb, r.folder);
                     modelGzipTime(r.inBytes);
                     ds.mbQueued += r.usedMb;

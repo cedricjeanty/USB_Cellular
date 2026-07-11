@@ -12,15 +12,7 @@
 // the cellular PUT). Gated by -DAIRBRIDGE_COMPRESS so contexts that don't link zlib
 // (e.g. a firmware build before zlib is wired) are unaffected; the `compress` arg
 // is simply ignored when the macro is off.
-#ifdef AIRBRIDGE_COMPRESS
-#include "airbridge_compress.h"
-inline size_t cz_hal_read(void* ctx, void* buf, size_t n) {
-    return g_hal->filesys->read(ctx, buf, n);
-}
-inline size_t cz_hal_write(void* ctx, const void* buf, size_t n) {
-    return g_hal->filesys->write(ctx, (void*)buf, n);
-}
-#endif
+#include "hal/gzip_io.h"   // cz_hal_read/write + airbridge_compress.h (AIRBRIDGE_COMPRESS)
 
 // Opt-in harvest tracing (-DHARVEST_TRACE): logs every directory opened and every
 // entry the walk sees (name / is_dir / stat size / skip), so a serial capture shows

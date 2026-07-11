@@ -519,6 +519,58 @@ void test_eaofh_delta_from_file_scan_no_meta(void) {
     TEST_ASSERT_FALSE_MESSAGE(whole, "must NOT re-upload the whole straddling file (size=160)");
 }
 
+// compress=true must run AFTER dedup: gzip only the delta tail, and the uploaded
+// object must gunzip back to exactly those new-flight records (not the whole
+// straddling file). Proves the reorder — dedup then compress — end to end.
+#include <zlib.h>
+static std::string gunzip_(const std::string& in) {
+    z_stream zs; memset(&zs, 0, sizeof(zs));
+    if (inflateInit2(&zs, 15 + 16) != Z_OK) return "";
+    zs.next_in = (Bytef*)in.data(); zs.avail_in = (uInt)in.size();
+    std::string out; char buf[512]; int ret;
+    do {
+        zs.next_out = (Bytef*)buf; zs.avail_out = sizeof(buf);
+        ret = inflate(&zs, Z_NO_FLUSH);
+        out.append(buf, sizeof(buf) - zs.avail_out);
+    } while (ret == Z_OK);
+    inflateEnd(&zs);
+    return (ret == Z_STREAM_END) ? out : "";
+}
+void test_eaofh_dedup_then_compress(void) {
+    s_nvs.set_str("s3", "api_host", "api.ex.com");
+    s_nvs.set_str("s3", "api_key", "key");
+    s_nvs.set_str("s3", "device_id", "D1");
+    s_fs.add_dir("/sd/upload"); s_fs.add_dir("/sd/upload/0001");
+    std::string content;
+    for (uint16_t fl = 1; fl <= 5; fl++) appendRec(content, fl);   // 160 bytes, no .meta
+    const char* fp = "/sd/upload/0001/EA500.DEDUP2_00005_20260628.eaofh";
+    s_fs.add_file(fp, content.data(), content.size());
+
+    s_net.push_response("HTTP/1.1 200 OK\r\n\r\n{\"high_water_mark\":3}");                                   // manifest
+    s_net.push_response("HTTP/1.1 200 OK\r\n\r\n{\"url\":\"https://s3/o?s=a\",\"key\":\"aircraft/EA500.DEDUP2/EA500.DEDUP2_00005_20260628.eaofh\",\"parts\":1}"); // temp presign (halS3UploadFile)
+    s_net.push_response("HTTP/1.1 200 OK\r\nETag: \"e\"\r\n\r\n");                                            // PUT
+
+    UploadResult r = halS3UploadEaofh("/sd/upload", "0001/EA500.DEDUP2_00005_20260628.eaofh",
+                                      nullptr, /*compress=*/true);
+    TEST_ASSERT_TRUE_MESSAGE(r.success, r.error);
+
+    // Find the PUT body (gzip), gunzip it, and check it is the 64-byte delta.
+    std::string body;
+    for (auto& req : s_net.requests) {
+        if (req.rfind("PUT ", 0) != 0) continue;
+        size_t h = req.find("\r\n\r\n");
+        if (h != std::string::npos) body = req.substr(h + 4);
+    }
+    TEST_ASSERT_TRUE_MESSAGE(body.size() >= 2 && (uint8_t)body[0] == 0x1f && (uint8_t)body[1] == 0x8b,
+        "uploaded object must be gzip (compress ran)");
+    std::string plain = gunzip_(body);
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(64, plain.size(),
+        "gunzip must yield the 2-flight DELTA (64B), not the whole 160B file — compress ran AFTER dedup");
+    // First record of the delta is flight 4 (the first flight > hwm=3).
+    uint16_t f0 = ((uint8_t)plain[24] << 8) | (uint8_t)plain[25];
+    TEST_ASSERT_EQUAL_UINT16(4, f0);
+}
+
 // ── findNextUploadFile tests ────────────────────────────────────────────────
 
 void test_find_next_empty(void) {
@@ -722,6 +774,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_presign_feeds_link_rtt);
     RUN_TEST(test_eaofh_gzip_uploaded_whole);
     RUN_TEST(test_eaofh_delta_from_file_scan_no_meta);
+    RUN_TEST(test_eaofh_dedup_then_compress);
     RUN_TEST(test_upload_skip_if_exists);
 
     // Multipart part-PUT retry

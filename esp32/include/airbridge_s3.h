@@ -5,6 +5,7 @@
 
 #include "hal/hal.h"
 #include "hal/log_reader.h"  // HalLogReader/hal_read_at for the delta-split first-flight scan
+#include "hal/gzip_io.h"     // cz_hal_read/write + gzipStream — compress AFTER dedup (AIRBRIDGE_COMPRESS)
 #include "airbridge_utils.h"
 #include "airbridge_http.h"
 #include "airbridge_log.h"   // ULDBG breadcrumbs reach CDC+S3 on firmware, stdout on emulator
@@ -773,11 +774,17 @@ inline uint64_t halFindSplitOffset(void* f, uint64_t fileSize,
 // 1. Parse filename for (serial, last_flight).
 // 2. Fetch/cache manifest → skip if last_flight <= hwm.
 // 3. If first_flight <= hwm, extract delta (upload tail only).
-// 4. Upload to aircraft/{serial}/{barename} S3 path.
-// 5. Update manifest + write DSU cookie.
+// 4. compress=true: gzip the post-dedup bytes → upload the (small) gzip WHOLE.
+//    Compress runs AFTER dedup so both apply — the delta drops already-uploaded
+//    flights, then gzip shrinks what remains (~1.8x). Object keeps the .eaofh
+//    name with gzip content; the S3 consumer gunzips. (Harvest no longer
+//    compresses — that foreclosed the record-boundary split dedup needs.)
+// 5. Upload to aircraft/{serial}/{barename} S3 path.
+// 6. Update manifest + write DSU cookie.
 // Returns: success (true) or failure (false). skip is also reported as success.
 inline UploadResult halS3UploadEaofh(const char* harvestDir, const char* relPath,
-                                      UploadProgressFn progress = nullptr) {
+                                      UploadProgressFn progress = nullptr,
+                                      bool compress = false) {
     UploadResult res = {};
     if (!g_hal) { strlcpy(res.error, "HAL null", sizeof(res.error)); return res; }
 
@@ -915,6 +922,39 @@ inline UploadResult halS3UploadEaofh(const char* harvestDir, const char* relPath
         return res;
     }
 
+    // ── Compress AFTER dedup ─────────────────────────────────────────────────
+    // gzip the post-dedup byte range [splitOffset..end] into a temp, then upload
+    // that WHOLE (a gzip stream is indivisible — no further split). Dotfile name so
+    // findNextUploadFile never re-scans it. On gzip failure, fall through to the
+    // uncompressed path so a flight is NEVER dropped.
+    bool uploaded = false;
+#ifdef AIRBRIDGE_COMPRESS
+    if (compress) {
+        char tmpGz[300];
+        snprintf(tmpGz, sizeof(tmpGz), "%s/.compress.gztmp", harvestDir);
+        void* sf = g_hal->filesys->open(fullpath, "rb");
+        void* tf = g_hal->filesys->open(tmpGz, "wb");
+        bool gzok = false;
+        if (sf && tf) {
+            g_hal->filesys->seek(sf, (long)splitOffset, 0);  // start at the delta tail
+            GzipResult gr = gzipStream(cz_hal_read, sf, cz_hal_write, tf);
+            gzok = gr.ok && gr.outBytes > 0;
+            ULDBG("ULDBG eaofh gzip delta in=%u out=%lu ok=%d",
+                  uploadSize, (unsigned long)gr.outBytes, (int)gzok);
+        }
+        if (sf) g_hal->filesys->close(sf);
+        if (tf) g_hal->filesys->close(tf);
+        if (gzok) {
+            // Upload the compressed temp WHOLE (multipart + NVS resume via
+            // halS3UploadFile; aircraft key preserved, .eaofh name / gzip content).
+            res = halS3UploadFile(tmpGz, bareName, progress, s3Key);
+            uploaded = true;
+        }
+        g_hal->filesys->remove(tmpGz);
+    }
+#endif
+
+    if (!uploaded) {
     S3Creds creds = loadS3Creds();
     if (!creds.valid) { strlcpy(res.error, "no creds", sizeof(res.error)); return res; }
 
@@ -991,6 +1031,7 @@ inline UploadResult halS3UploadEaofh(const char* harvestDir, const char* relPath
             res = halS3UploadFile(fullpath, bareName, progress, s3Key);
         }
     }
+    }  // end if (!uploaded) — the compress path already uploaded above
 
     if (res.success) {
         // Update manifest + cookie

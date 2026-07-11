@@ -3645,7 +3645,7 @@ static void uploadTask(void* param) {
             // a plain single/multipart PUT. SD reads inside hold g_sd_mutex via the
             // Esp32Filesys lock() hook; TLS uses the same tls_connect() as before.
             UploadResult ur = isEaofh
-                ? halS3UploadEaofh(harvBase, relPath, uploadProgressCb)
+                ? halS3UploadEaofh(harvBase, relPath, uploadProgressCb, g_compress)
                 : halS3UploadFile(path, relPath, uploadProgressCb);
 
             g_tlsActive = false;  // re-enable +++ after upload
@@ -3751,7 +3751,7 @@ static void doHarvest() {
     g_hal->nvs->get_u32("harvest", "count", &harvestNum);
     harvestNum++;
     g_hal->nvs->set_u32("harvest", "count", harvestNum);
-    HarvestResult hr = harvestFiles(harvestSrc, harvDir, (uint16_t)harvestNum, g_compress);
+    HarvestResult hr = harvestFiles(harvestSrc, harvDir, (uint16_t)harvestNum, /*compress=*/false);
     uint16_t count = hr.count;
     float usedMb = hr.usedMb;
 
