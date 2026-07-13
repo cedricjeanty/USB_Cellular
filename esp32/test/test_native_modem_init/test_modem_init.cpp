@@ -22,6 +22,7 @@ int mdm_read(void* buf, size_t len, uint32_t timeout_ms) {
 }
 void mdm_flush() { s_uart_ptr->flush(); }
 void mdm_set_baudrate(uint32_t baud) { s_uart_ptr->set_baudrate(baud); }
+void mdm_set_flow_control(bool enable) { s_uart_ptr->set_flow_control(enable); }
 
 int modem_at_cmd(const char* cmd, char* resp, int resp_size, int timeout_ms) {
     mdm_write(cmd, strlen(cmd));
@@ -310,6 +311,43 @@ void test_stranded_carrier_recovered_by_cops(void) {
     TEST_ASSERT_TRUE(rr.connected);
 }
 
+// ── Baud recovery after radio / factory resets ──────────────────────────────
+
+void test_radio_reset_reconnect_restores_baud(void) {
+    // A CFUN=0/1 radio reset drops the SIM7600 UART to 115200. The reconnect
+    // must negotiate back to full speed itself — leaving it "for the next boot"
+    // meant every post-reset session uploaded at ~10 KB/s instead of 73-167 KB/s
+    // (the post-landing taxi-in window, after a flight full of failed attempts,
+    // is exactly such a session).
+    modemAtSync();
+    ModemBaudResult br = modemUpgradeBaud();          // boot-time upgrade
+    TEST_ASSERT_EQUAL_UINT32(3000000, br.baud);
+    TEST_ASSERT_EQUAL_INT(3000000, s_modem->baudRate);
+
+    ModemReconnectResult rr = modemReconnect(true);   // radio-reset reconnect
+    TEST_ASSERT_TRUE(rr.registered);
+    TEST_ASSERT_TRUE(rr.connected);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(3000000, s_modem->baudRate,
+        "radio-reset reconnect must re-upgrade the baud, not stay at 115200");
+}
+
+void test_factory_reset_recover_full_speed(void) {
+    // modemFactoryReset reboots the module to factory defaults (115200, echo on);
+    // modemFactoryRecover must resync, turn echo back off, and re-upgrade baud.
+    modemAtSync();
+    modemUpgradeBaud();
+    TEST_ASSERT_EQUAL_INT(3000000, s_modem->baudRate);
+
+    modemFactoryReset();
+    TEST_ASSERT_EQUAL_INT_MESSAGE(115200, s_modem->baudRate, "module rebooted to defaults");
+    TEST_ASSERT_TRUE_MESSAGE(s_modem->echoEnabled, "factory default is echo on");
+
+    TEST_ASSERT_TRUE(modemFactoryRecover());
+    TEST_ASSERT_FALSE_MESSAGE(s_modem->echoEnabled, "recover re-applies ATE0");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(3000000, s_modem->baudRate,
+        "recover re-upgrades to full speed");
+}
+
 // ── Signal-gated reconnect wait ──────────────────────────────────────────────
 
 void test_wait_for_signal_returns_when_registered(void) {
@@ -331,6 +369,22 @@ void test_wait_for_signal_times_out_when_unregistered(void) {
     TEST_ASSERT_FALSE_MESSAGE(sw.registered, "no coverage → not registered");
     TEST_ASSERT_GREATER_OR_EQUAL_UINT32_MESSAGE(300, dt, "polled up to maxWait");
     TEST_ASSERT_LESS_THAN_UINT32_MESSAGE(2000, dt, "but capped — didn't hang");
+}
+
+void test_wait_for_signal_reports_rssi_while_unregistered(void) {
+    // CSQ is read on every poll, registered or not: a visible cell without
+    // registration is the "stranded, not out-of-coverage" evidence that keeps
+    // the factory-reset cadence aggressive (modemReconnectPlan signalSeen).
+    s_modem->regStat = 2;   // searching, never registers…
+    s_modem->rssi = 17;     // …but a cell is visible
+    ModemSignalWait sw = modemWaitForSignal(300, 100);
+    TEST_ASSERT_FALSE(sw.registered);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(17, sw.rssi, "visible-cell RSSI reported unregistered");
+
+    s_modem->rssi = 99;     // deep out of coverage — nothing visible
+    sw = modemWaitForSignal(300, 100);
+    TEST_ASSERT_FALSE(sw.registered);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(99, sw.rssi, "no cells → rssi stays 99");
 }
 
 // ── Test runner ─────────────────────────────────────────────────────────────
@@ -357,8 +411,11 @@ int main(int argc, char** argv) {
     RUN_TEST(test_reconnect_sets_apn);
     RUN_TEST(test_reconnect_without_apn_fails);
     RUN_TEST(test_stranded_carrier_recovered_by_cops);
+    RUN_TEST(test_radio_reset_reconnect_restores_baud);
+    RUN_TEST(test_factory_reset_recover_full_speed);
     RUN_TEST(test_wait_for_signal_returns_when_registered);
     RUN_TEST(test_wait_for_signal_times_out_when_unregistered);
+    RUN_TEST(test_wait_for_signal_reports_rssi_while_unregistered);
 
     return UNITY_END();
 }

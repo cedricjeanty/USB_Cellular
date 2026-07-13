@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260711080000"
+#define FW_VERSION "20260713085000"
 
 #include <cstring>
 #include <ctime>
@@ -2078,6 +2078,18 @@ void mdm_set_baudrate(uint32_t baud) {
     if (g_hal && g_hal->uart) { g_hal->uart->set_baudrate(baud); return; }
     uart_set_baudrate(UART_NUM_1, baud);
 }
+void mdm_set_flow_control(bool enable) {
+    if (g_hal && g_hal->uart) { g_hal->uart->set_flow_control(enable); return; }
+    if (enable) {
+        uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
+                     PIN_MODEM_RTS, PIN_MODEM_CTS);
+        uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_CTS_RTS, 122);
+    } else {
+        uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_DISABLE, 0);
+        uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
+                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    }
+}
 
 // Send AT command, wait for response, return response string
 int modem_at_cmd(const char* cmd, char* resp, int resp_size, int timeout_ms) {
@@ -2327,76 +2339,16 @@ static void modemTask(void* param) {
         log_write("Modem: time synced from CCLK (epoch=%lu)", (unsigned long)g_bootEpoch);
     }
 
-    // ── Increase baud rate (try highest first, fall back) ─────────────
+    // ── Increase baud rate (shared ladder — also re-run after every radio /
+    // factory reset, which drops the SIM7600 back to 115200) ──────────────
     {
-        const int bauds[] = { 3000000, 2000000, 921600 };
-        const int nBauds = sizeof(bauds) / sizeof(bauds[0]);
-        bool upgraded = false;
-        for (int i = 0; i < nBauds && !upgraded; i++) {
-            cdc_printf("Modem: trying %d baud...\r\n", bauds[i]);
-            char cmd[32];
-            snprintf(cmd, sizeof(cmd), "AT+IPR=%d", bauds[i]);
-            modem_at_cmd(cmd, resp, sizeof(resp), 2000);
-            // Modem responds OK at old baud, THEN switches
-
-            vTaskDelay(pdMS_TO_TICKS(200));
-            mdm_set_baudrate(bauds[i]);
-            vTaskDelay(pdMS_TO_TICKS(200));
-            mdm_flush();
-
-            // Verify at new baud (multiple attempts)
-            bool ok = false;
-            for (int j = 0; j < 5; j++) {
-                int len = modem_at_cmd("AT", resp, sizeof(resp), 1000);
-                if (len > 0 && strstr(resp, "OK")) {
-                    ok = true;
-                    break;
-                }
-                vTaskDelay(pdMS_TO_TICKS(100));
-            }
-
-            if (ok) {
-                cdc_printf("Modem: baud upgraded to %d\r\n", bauds[i]);
-                log_write("Modem: baud %d", bauds[i]);
-                upgraded = true;
-
-                // Now try enabling HW flow control at the new baud
-                modem_at_cmd("AT+IFC=2,2", resp, sizeof(resp), 2000);
-                if (strstr(resp, "OK")) {
-                    uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
-                                 PIN_MODEM_RTS, PIN_MODEM_CTS);
-                    uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_CTS_RTS, 122);
-                    vTaskDelay(pdMS_TO_TICKS(100));
-
-                    // Verify flow control works
-                    int len = modem_at_cmd("AT", resp, sizeof(resp), 2000);
-                    if (len > 0 && strstr(resp, "OK")) {
-                        cdc_printf("Modem: HW flow control enabled at %d\r\n", bauds[i]);
-                        log_write("Modem: HW FC enabled at %d", bauds[i]);
-                    } else {
-                        // Flow control broke things — disable it
-                        cdc_printf("Modem: HW flow control failed at %d, disabling\r\n", bauds[i]);
-                        uart_set_hw_flow_ctrl(UART_NUM_1, UART_HW_FLOWCTRL_DISABLE, 0);
-                        uart_set_pin(UART_NUM_1, PIN_MODEM_TX, PIN_MODEM_RX,
-                                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-                        modem_at_cmd("AT+IFC=0,0", resp, sizeof(resp), 2000);
-                        log_write("Modem: HW FC failed at %d", bauds[i]);
-                    }
-                }
-            } else {
-                // Failed — modem is at new baud but ESP can't talk to it
-                // Try to reset modem baud: send AT+IPR=115200 at the failed baud
-                cdc_printf("Modem: %d failed, resetting to 115200...\r\n", bauds[i]);
-                modem_at_cmd("AT+IPR=115200", resp, sizeof(resp), 2000);
-                vTaskDelay(pdMS_TO_TICKS(200));
-                mdm_set_baudrate(115200);
-                vTaskDelay(pdMS_TO_TICKS(200));
-                mdm_flush();
-                // Verify recovery
-                modem_at_cmd("AT", resp, sizeof(resp), 2000);
-            }
-        }
-        if (!upgraded) {
+        ModemBaudResult br = modemUpgradeBaud();
+        if (br.baud > 115200) {
+            cdc_printf("Modem: baud upgraded to %u (HW FC %s)\r\n",
+                       (unsigned)br.baud, br.hwFlow ? "on" : "off");
+            log_write("Modem: baud %u%s", (unsigned)br.baud,
+                      br.hwFlow ? " + HW FC" : " (no HW FC)");
+        } else {
             cdc_printf("Modem: staying at 115200\r\n");
             log_write("Modem: baud 115200 (upgrade failed)");
         }
@@ -2590,6 +2542,11 @@ static void modemTask(void* param) {
     // g_pppConnected fires (IP obtained) — not on CONNECT alone — so the CFUN
     // backoff engages when stuck in the "no IP after CONNECT" loop all night.
     static int s_reconnect_failures = 0;
+    // Any network evidence (registration, or CSQ != 99) seen since the last good
+    // session. Picks the factory-reset cadence in modemReconnectPlan: aggressive
+    // when the radio can see a network yet gets no service (stranded), backed
+    // way off when it sees nothing at all (likely airborne out of coverage).
+    static bool s_signal_seen = false;
     static char urcBuf[128];
     static int urcLen = 0;
 
@@ -2663,6 +2620,7 @@ static void modemTask(void* param) {
         if (g_pppConnected && !test_launched) {
             test_launched = true;
             s_reconnect_failures = 0;  // IP obtained — full session up, reset counter
+            s_signal_seen = false;     // fresh outage evidence from here on
 
             esp_netif_ip_info_t ip_info;
             if (esp_netif_get_ip_info(g_ppp_netif, &ip_info) == ESP_OK) {
@@ -2736,6 +2694,11 @@ static void modemTask(void* param) {
             g_pppConnected = false;
             modemFactoryReset();
             vTaskDelay(pdMS_TO_TICKS(20000));   // module reboots ~15-30s
+            // Resync at 115200, echo off, re-upgrade baud/flow control (the
+            // rebooted module is at factory defaults). Failure just falls
+            // through to the reconnect ladder.
+            if (!modemFactoryRecover())
+                log_write("Modem: no AT after factory reset — reconnect ladder will escalate");
             g_pppNeedsReconnect = true;
             continue;
         }
@@ -2758,18 +2721,21 @@ static void modemTask(void* param) {
             // a +++ guard so it handles the "modem stuck in PPP data mode" case.
             // CFUN=0/1 (full radio reset) starts at attempt 5 and every 5th after.
             // Escalation/backoff is the shared, unit-tested modemReconnectPlan().
-            ModemReconnectPlan plan = modemReconnectPlan(s_reconnect_failures);
+            ModemReconnectPlan plan = modemReconnectPlan(s_reconnect_failures, s_signal_seen);
             // Deepest escalation: a full modem factory reset clears a stale band/operator
             // lock (which CFUN can't) and reboots the module. The module reboot makes the
             // modem task's PPP pump irrelevant, so just trigger it + let the next loop
             // iteration re-init from AT sync.
             if (plan.factoryReset) {
-                log_write("Modem: STRANDED after %d attempts — full factory reset (clear band/operator lock)",
-                          s_reconnect_failures);
+                log_write("Modem: STRANDED after %d attempts (signal_seen=%d) — full factory reset (clear band/operator lock)",
+                          s_reconnect_failures, s_signal_seen ? 1 : 0);
                 cdc_printf("Modem: factory reset (clearing band/operator lock)...\r\n");
                 modemFactoryReset();
                 s_reconnect_failures++;
                 vTaskDelay(pdMS_TO_TICKS(20000));  // module reboots ~15-30s
+                // Resync + baud/flow re-upgrade (module is at factory defaults).
+                if (!modemFactoryRecover())
+                    log_write("Modem: no AT after factory reset — reconnect ladder will escalate");
                 g_pppNeedsReconnect = true;        // re-attempt after the module comes back
                 continue;
             }
@@ -2793,6 +2759,7 @@ static void modemTask(void* param) {
             ModemReconnectResult rr = modemReconnect(doRadioReset);
 
             if (rr.registered) {
+                s_signal_seen = true;
                 g_modemRssi = rr.rssi;
                 strlcpy(g_modemOp, rr.operatorName, sizeof(g_modemOp));
                 log_write("Reconnect: rssi=%d op=%s", rr.rssi, rr.operatorName);
@@ -2822,6 +2789,7 @@ static void modemTask(void* param) {
                 cdc_printf("Modem: not registered — polling coverage every 10s\r\n");
                 log_write("Modem: not registered — signal-gated retry");
                 ModemSignalWait sw = modemWaitForSignal(60000, 10000);
+                if (sw.registered || sw.rssi != 99) s_signal_seen = true;
                 if (sw.registered && sw.rssi != 99) g_modemRssi = sw.rssi;
                 g_pppNeedsReconnect = true;
             } else {
@@ -2831,6 +2799,7 @@ static void modemTask(void* param) {
                 // Registered but redial failed → modemWaitForSignal returns ~immediately
                 // (already registered) → fast retry, no wasted minute.
                 ModemSignalWait sw = modemWaitForSignal(60000, 10000);
+                if (sw.registered || sw.rssi != 99) s_signal_seen = true;
                 if (sw.registered && sw.rssi != 99) g_modemRssi = sw.rssi;
                 g_pppNeedsReconnect = true;
             }

@@ -58,12 +58,35 @@ attempt. The `+++` guard (added fw 20260527160000) fixes this.
 
 ## Reconnect backoff (s_reconnect_failures counter in modem task pump loop)
 
+Decision logic is `modemReconnectPlan(failures, signalSeen)` in `airbridge_modem.h`
+(shared + unit-tested). There is no progressive/long backoff: the loop is
+signal-gated (`modemWaitForSignal` polls CEREG+CSQ every ~10s between attempts and
+retries the instant coverage returns), so a redial fires within seconds of the
+network reappearing — this is what makes the post-landing taxi-in upload window
+usable.
+
 - Attempts 1-4 (failures 0-3): soft reconnect (no CFUN) — handles carrier termination
-- Attempt 5 (failures=4): first full CFUN=0/1 reset
-- Attempts 6-9 (failures 5-8): soft
-- Attempt 10 (failures=9): second CFUN reset, with progressive backoff
-- After 2+ CFUN resets: wait 30s × reset_count (max 300s) before each reset
-- Counter resets only when PPP gets IP (g_pppConnected=true), not on CONNECT alone
+- Attempt 5 (failures=4) and every 5th after: full CFUN=0/1 radio reset, with a
+  flat 10s settle before it (never longer)
+- Factory reset (AT&F + CRESET — clears band/operator locks CFUN can't), cadence
+  gated on signal evidence (ADR 0006):
+  - every 12th failure if any cell was visible (CSQ != 99) or registration
+    succeeded since the last good session — the genuinely-stranded case
+  - every 36th failure if the radio has seen nothing at all — most likely
+    airborne out of coverage, where resets don't help; the guarantee that a
+    band-locked unit eventually self-recovers is preserved
+- Counter (and signal-seen flag) reset only when PPP gets IP
+  (g_pppConnected=true), not on CONNECT alone
+
+## Baud recovery after resets
+
+AT+CFUN=0 and AT+CRESET drop the SIM7600 UART to 115200. The baud/flow-control
+upgrade ladder (`modemUpgradeBaud()`: 3M → 2M → 921600, then AT+IFC=2,2 + RTS/CTS,
+each step AT-verified) runs at boot AND after every radio reset (inside
+`modemReconnect(resetRadio=true)`) and factory reset (`modemFactoryRecover()`,
+which also re-syncs AT and re-sends ATE0 after the module reboot). Before this,
+a post-reset session stayed at 115200 (~10 KB/s) until the next device reboot —
+exactly the session that uploads the backlog after landing.
 
 ## pppStale detection
 

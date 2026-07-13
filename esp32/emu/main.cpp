@@ -222,6 +222,7 @@ int mdm_write(const void* data, size_t len) { return g_hal->uart->write(data, le
 int mdm_read(void* buf, size_t len, uint32_t timeout_ms) { return g_hal->uart->read(buf, len, timeout_ms); }
 void mdm_flush() { g_hal->uart->flush(); }
 void mdm_set_baudrate(uint32_t baud) { g_hal->uart->set_baudrate(baud); }
+void mdm_set_flow_control(bool enable) { g_hal->uart->set_flow_control(enable); }
 
 int modem_at_cmd(const char* cmd, char* resp, int resp_size, int timeout_ms) {
     mdm_write(cmd, strlen(cmd));

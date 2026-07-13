@@ -221,58 +221,81 @@ void test_full_init_sequence(void) {
 // ── Reconnect escalation plan (pure decision logic) ─────────────────────────
 
 void test_reconnect_plan_soft_first_four(void) {
-    // Failures 0-3 = attempts 1-4: soft, no backoff.
+    // Failures 0-3 = attempts 1-4: soft, no backoff (regardless of signal evidence).
     for (int f = 0; f < 4; f++) {
-        ModemReconnectPlan p = modemReconnectPlan(f);
-        TEST_ASSERT_FALSE_MESSAGE(p.radioReset, "attempts 1-4 are soft");
-        TEST_ASSERT_EQUAL_UINT32(0, p.backoffSeconds);
+        for (int sig = 0; sig <= 1; sig++) {
+            ModemReconnectPlan p = modemReconnectPlan(f, sig != 0);
+            TEST_ASSERT_FALSE_MESSAGE(p.radioReset, "attempts 1-4 are soft");
+            TEST_ASSERT_EQUAL_UINT32(0, p.backoffSeconds);
+        }
     }
 }
 
 void test_reconnect_plan_first_cfun_at_five(void) {
-    ModemReconnectPlan p = modemReconnectPlan(4);   // attempt 5
+    ModemReconnectPlan p = modemReconnectPlan(4, true);   // attempt 5
     TEST_ASSERT_TRUE(p.radioReset);
     TEST_ASSERT_EQUAL_UINT32_MESSAGE(10, p.backoffSeconds, "radio reset has a short 10s settle");
+    // Same with no signal evidence — CFUN resets are not signal-gated.
+    TEST_ASSERT_TRUE(modemReconnectPlan(4, false).radioReset);
 }
 
 void test_reconnect_plan_soft_between_resets(void) {
     for (int f = 5; f < 9; f++)                     // attempts 6-9
-        TEST_ASSERT_FALSE(modemReconnectPlan(f).radioReset);
+        TEST_ASSERT_FALSE(modemReconnectPlan(f, true).radioReset);
 }
 
 void test_reconnect_plan_backoff_is_flat_short(void) {
     // No escalating/300s backoff anymore — a radio reset gets a flat 10s settle, soft
     // attempts get 0; the reconnect loop is signal-gated (poll every ~10s), so we never
     // burn minutes idle. Every radio-reset failure count → exactly 10s.
-    ModemReconnectPlan p9  = modemReconnectPlan(9);          // 2nd reset
-    ModemReconnectPlan p14 = modemReconnectPlan(14);         // 3rd reset
-    ModemReconnectPlan pHi = modemReconnectPlan(4 + 5 * 11); // very high
+    ModemReconnectPlan p9  = modemReconnectPlan(9, true);          // 2nd reset
+    ModemReconnectPlan p14 = modemReconnectPlan(14, true);         // 3rd reset
+    ModemReconnectPlan pHi = modemReconnectPlan(4 + 5 * 11, true); // very high
     TEST_ASSERT_TRUE(p9.radioReset && p14.radioReset && pHi.radioReset);
     TEST_ASSERT_EQUAL_UINT32(10, p9.backoffSeconds);
     TEST_ASSERT_EQUAL_UINT32(10, p14.backoffSeconds);
     TEST_ASSERT_EQUAL_UINT32(10, pHi.backoffSeconds);
     // Soft attempts never wait, and nothing ever exceeds the 10s settle.
-    TEST_ASSERT_EQUAL_UINT32(0, modemReconnectPlan(1000).backoffSeconds);  // 1000: not a reset
-    for (int f = 0; f < 200; f++)
-        TEST_ASSERT_LESS_OR_EQUAL_UINT32(10, modemReconnectPlan(f).backoffSeconds);
+    TEST_ASSERT_EQUAL_UINT32(0, modemReconnectPlan(1000, true).backoffSeconds);  // 1000: not a reset
+    for (int f = 0; f < 200; f++) {
+        TEST_ASSERT_LESS_OR_EQUAL_UINT32(10, modemReconnectPlan(f, true).backoffSeconds);
+        TEST_ASSERT_LESS_OR_EQUAL_UINT32(10, modemReconnectPlan(f, false).backoffSeconds);
+    }
 }
 
 void test_reconnect_plan_factory_reset_escalation(void) {
-    // Deepest tier: after sustained failure, escalate to a full modem factory reset
-    // (clears a band/operator lock CFUN can't) — at 12, 24, 36... It supersedes the
-    // radio reset on those attempts.
-    ModemReconnectPlan p12 = modemReconnectPlan(12);
+    // Deepest tier with signal evidence (cells visible yet no service = genuinely
+    // stranded): full factory reset at 12, 24, 36... It supersedes the radio reset
+    // on those attempts.
+    ModemReconnectPlan p12 = modemReconnectPlan(12, true);
     TEST_ASSERT_TRUE_MESSAGE(p12.factoryReset, "factory reset at 12 failures");
     TEST_ASSERT_FALSE_MESSAGE(p12.radioReset, "factory reset supersedes radio reset");
-    TEST_ASSERT_TRUE(modemReconnectPlan(24).factoryReset);
-    TEST_ASSERT_TRUE(modemReconnectPlan(36).factoryReset);
+    TEST_ASSERT_TRUE(modemReconnectPlan(24, true).factoryReset);
+    TEST_ASSERT_TRUE(modemReconnectPlan(36, true).factoryReset);
     // Not on the radio-reset / soft attempts.
-    TEST_ASSERT_FALSE(modemReconnectPlan(4).factoryReset);
-    TEST_ASSERT_FALSE(modemReconnectPlan(9).factoryReset);
-    TEST_ASSERT_FALSE(modemReconnectPlan(14).factoryReset);
-    TEST_ASSERT_FALSE(modemReconnectPlan(0).factoryReset);
+    TEST_ASSERT_FALSE(modemReconnectPlan(4, true).factoryReset);
+    TEST_ASSERT_FALSE(modemReconnectPlan(9, true).factoryReset);
+    TEST_ASSERT_FALSE(modemReconnectPlan(14, true).factoryReset);
+    TEST_ASSERT_FALSE(modemReconnectPlan(0, true).factoryReset);
     // 4/9/14 stay radio resets (factory reset only at the 12-multiples).
-    TEST_ASSERT_TRUE(modemReconnectPlan(4).radioReset && modemReconnectPlan(9).radioReset);
+    TEST_ASSERT_TRUE(modemReconnectPlan(4, true).radioReset && modemReconnectPlan(9, true).radioReset);
+}
+
+void test_reconnect_plan_factory_reset_gated_on_signal(void) {
+    // No signal evidence at all since the last good session = most likely airborne
+    // out of coverage, where a factory reset can't help (and being mid-reset at
+    // touchdown delays the taxi-in upload). Cadence backs off to every 36th failure
+    // — kept (not removed) so a unit band-locked onto a dead band still recovers.
+    TEST_ASSERT_FALSE_MESSAGE(modemReconnectPlan(12, false).factoryReset,
+                              "no factory reset at 12 without signal evidence");
+    TEST_ASSERT_FALSE(modemReconnectPlan(24, false).factoryReset);
+    TEST_ASSERT_TRUE_MESSAGE(modemReconnectPlan(36, false).factoryReset,
+                             "recovery guarantee: factory reset still fires at 36");
+    TEST_ASSERT_TRUE(modemReconnectPlan(72, false).factoryReset);
+    // The periodic CFUN radio resets are NOT signal-gated — a no-coverage outage
+    // still gets its every-5th radio reset (cheap, clears wedged radio state).
+    TEST_ASSERT_TRUE(modemReconnectPlan(24, false).radioReset);   // (24-4)%5==0
+    TEST_ASSERT_TRUE(modemReconnectPlan(14, false).radioReset);
 }
 
 // ── Flaky-link injection (marginal cellular) ────────────────────────────────
@@ -412,6 +435,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_reconnect_plan_soft_between_resets);
     RUN_TEST(test_reconnect_plan_backoff_is_flat_short);
     RUN_TEST(test_reconnect_plan_factory_reset_escalation);
+    RUN_TEST(test_reconnect_plan_factory_reset_gated_on_signal);
 
     // Flaky-link injection
     RUN_TEST(test_flaky_never_drops_control_frames);

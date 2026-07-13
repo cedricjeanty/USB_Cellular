@@ -381,6 +381,20 @@ private:
             // reselect a working carrier so a subsequent ATD*99# succeeds.
             if (stranded) { stranded = false; operatorName = "SimCellular"; }
             respond("OK");
+        } else if (upper == "AT&F") {
+            // Factory profile — E1 (echo on) is the SIM7600 factory default.
+            echoEnabled = true;
+            respond("OK");
+        } else if (upper == "AT+CRESET") {
+            // Module reboot to factory defaults: 115200 baud, echo on, PDP gone.
+            // The firmware's modemFactoryRecover() must resync + re-upgrade after.
+            respond("OK");
+            baudRate = 115200;
+            saveState();
+            echoEnabled = true;
+            apnSet = false;
+            dataMode_ = false;
+            printf("[SimModem] CRESET: module reboot (baud 115200, echo on)\n");
         } else if (upper.find("AT") == 0) {
             respond("OK");
         }

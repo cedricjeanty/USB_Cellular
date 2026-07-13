@@ -22,6 +22,9 @@ extern int mdm_write(const void* data, size_t len);
 extern int mdm_read(void* buf, size_t len, uint32_t timeout_ms);
 extern void mdm_flush();
 extern void mdm_set_baudrate(uint32_t baud);
+// Enable/disable RTS/CTS hardware flow control on the host UART. The firmware
+// wraps uart_set_pin + uart_set_hw_flow_ctrl; emulator/tests use the PTY no-op.
+extern void mdm_set_flow_control(bool enable);
 
 // ── Bounded UART TX ──────────────────────────────────────────────────────────
 // A UART TX with hardware flow control can block FOREVER if the modem holds CTS
@@ -76,22 +79,34 @@ struct ModemReconnectResult {
 // Attempts 1-4 (failures 0-3): soft reconnect (no CFUN) — handles the common
 // carrier-terminated drop where the radio stays registered.
 // Attempt 5 (failures=4) and every 5th after: full CFUN=0/1 radio reset.
-// After the 2nd reset (failures>=9): a progressive backoff (30s * reset#, capped
-// at 300s) precedes each reset.
-// Documented in CLAUDE.md "Reconnect backoff".
+// Factory reset (deepest): every 12th failure while the radio can SEE a network
+// (signalSeen), every 36th when it can't — see the cadence comment below.
+// The only wait is a flat 10s settle before a radio/factory reset; soft attempts
+// retry immediately (the loop is signal-gated via modemWaitForSignal, so being
+// out of coverage never burns minutes idle).
+// Documented in docs/modem.md "Reconnect backoff".
 struct ModemReconnectPlan {
     bool     radioReset;       // do a CFUN=0/1 reset this attempt
     bool     factoryReset;     // do a full modem factory reset this attempt (deepest)
     uint32_t backoffSeconds;   // wait before the attempt (0 = none)
 };
-inline ModemReconnectPlan modemReconnectPlan(int failures) {
+inline ModemReconnectPlan modemReconnectPlan(int failures, bool signalSeen) {
     ModemReconnectPlan p = {};
-    // Deepest tier: after several CFUN resets STILL can't register, the modem is likely
-    // stranded on persistent NVS state a radio reset can't clear — a stale survey band-
-    // lock (CNMP=38/CNBP) or a manual operator selection. Escalate to a full factory
-    // reset (clears CNMP/CNBP/COPS + reboots the module), then retry it periodically. So
-    // a unit can NEVER stay stranded off-network with no way to recover it.
-    p.factoryReset = (failures >= 12 && failures % 12 == 0);
+    // Deepest tier: after several CFUN resets STILL no service, a full factory reset
+    // clears the persistent modem NVS a radio reset can't — a stale survey band-lock
+    // (CNMP=38/CNBP) or manual operator selection — so a unit can NEVER stay stranded
+    // off-network with no way to recover it. The cadence depends on what the radio
+    // has seen since the last good session (ADR 0006):
+    //  - signalSeen: cells are visible (or registration succeeded) yet service still
+    //    fails — the classic stranded state (band-lock, manual COPS, dead-carrier
+    //    PLMN). Reset aggressively: every 12th failure.
+    //  - no signal at all: most likely genuinely out of coverage (e.g. airborne — the
+    //    counter climbs for the whole flight). A factory reset only helps the rare
+    //    self-inflicted band-lock, so back off to every 36th (~90 min): the recovery
+    //    guarantee stays, without rebooting the module over and over mid-flight or
+    //    being mid-reset right when coverage returns at touchdown.
+    int cadence = signalSeen ? 12 : 36;
+    p.factoryReset = (failures >= cadence && failures % cadence == 0);
     p.radioReset   = !p.factoryReset && (failures >= 4 && (failures - 4) % 5 == 0);
     // Only a short settle before a radio reset (CFUN=0/1 itself takes ~15s) — NO long
     // backoff. The reconnect loop is signal-gated (modemWaitForSignal polls coverage
@@ -99,6 +114,72 @@ inline ModemReconnectPlan modemReconnectPlan(int failures) {
     // idle: in good coverage the device reconnects within seconds of a drop.
     p.backoffSeconds = (p.radioReset || p.factoryReset) ? 10u : 0u;
     return p;
+}
+
+// Negotiate the highest working UART baud (+ HW flow control) with the modem.
+// Tries 3M/2M/921600 in order: AT+IPR, switch the host baud, verify with AT;
+// on success also try AT+IFC=2,2 + host RTS/CTS (reverted if AT then fails).
+// Falls back to (and re-syncs at) 115200 if nothing verifies.
+//
+// Called at boot AND after every CFUN=0/1 radio reset / factory reset: CFUN=0
+// drops the SIM7600 UART back to 115200, and staying there until the next boot
+// costs ~10 KB/s uploads instead of 73-167 KB/s. The reconnect that follows a
+// long out-of-coverage stretch (a flight) must come back at full speed — that
+// session is the post-landing taxi-in upload window.
+struct ModemBaudResult {
+    uint32_t baud;     // final verified baud (115200 if no upgrade stuck)
+    bool     hwFlow;   // HW flow control active at that baud
+};
+inline ModemBaudResult modemUpgradeBaud() {
+    ModemBaudResult res = { 115200, false };
+    char resp[256];
+    const uint32_t bauds[] = { 3000000, 2000000, 921600 };
+    for (int i = 0; i < 3 && res.baud == 115200; i++) {
+        char cmd[24];
+        snprintf(cmd, sizeof(cmd), "AT+IPR=%u", (unsigned)bauds[i]);
+        modem_at_cmd(cmd, resp, sizeof(resp), 2000);
+        // Modem responds OK at the old baud, THEN switches.
+        g_hal->clock->delay_ms(200);
+        mdm_set_baudrate(bauds[i]);
+        g_hal->clock->delay_ms(200);
+        mdm_flush();
+
+        // Verify at the new baud (multiple attempts).
+        bool ok = false;
+        for (int j = 0; j < 5 && !ok; j++) {
+            if (modem_at_cmd("AT", resp, sizeof(resp), 1000) > 0 && strstr(resp, "OK"))
+                ok = true;
+            else
+                g_hal->clock->delay_ms(100);
+        }
+
+        if (ok) {
+            res.baud = bauds[i];
+            // Try enabling HW flow control at the new baud.
+            modem_at_cmd("AT+IFC=2,2", resp, sizeof(resp), 2000);
+            if (strstr(resp, "OK")) {
+                mdm_set_flow_control(true);
+                g_hal->clock->delay_ms(100);
+                if (modem_at_cmd("AT", resp, sizeof(resp), 2000) > 0 && strstr(resp, "OK")) {
+                    res.hwFlow = true;
+                } else {
+                    // Flow control broke the link — disable it on both sides.
+                    mdm_set_flow_control(false);
+                    modem_at_cmd("AT+IFC=0,0", resp, sizeof(resp), 2000);
+                }
+            }
+        } else {
+            // Modem is at the new baud but the host can't talk to it — reset
+            // both sides to 115200 and try the next (lower) candidate.
+            modem_at_cmd("AT+IPR=115200", resp, sizeof(resp), 2000);
+            g_hal->clock->delay_ms(200);
+            mdm_set_baudrate(115200);
+            g_hal->clock->delay_ms(200);
+            mdm_flush();
+            modem_at_cmd("AT", resp, sizeof(resp), 2000);
+        }
+    }
+    return res;
 }
 
 // Full modem factory reset — clears the persistent modem NVS that a CFUN=0/1 radio reset
@@ -115,13 +196,39 @@ inline void modemFactoryReset() {
     modem_at_cmd("AT+COPS=0", r, sizeof(r), 10000);                                   // auto operator
     modem_at_cmd("AT&F", r, sizeof(r), 3000);                                         // factory profile
     modem_at_cmd("AT+CRESET", r, sizeof(r), 3000);                                    // reboot the module
+    // The module reboots to factory defaults: 115200 baud, no flow control, echo
+    // on. Match the host side NOW so the post-reboot resync (modemFactoryRecover)
+    // can talk to it — leaving the host at 3 Mbaud + RTS/CTS after the reboot made
+    // every subsequent AT command time out until a later radio-reset attempt
+    // happened to downgrade the baud.
+    mdm_set_flow_control(false);
+    mdm_set_baudrate(115200);
+}
+
+// Post-factory-reset (or remote modem_reset) recovery — call after the module's
+// ~15-30s reboot delay: resync AT at 115200, turn echo back off (AT&F re-enabled
+// it), and negotiate the baud/flow-control upgrade again so the session resumes
+// at full speed instead of limping at 115200 until the next device reboot.
+// Returns false if the modem never answered AT (the caller just lets the normal
+// reconnect ladder escalate).
+inline bool modemAtSync();  // defined below
+inline bool modemFactoryRecover() {
+    if (!modemAtSync()) return false;
+    char resp[64];
+    modem_at_cmd("ATE0", resp, sizeof(resp), 1000);
+    modemUpgradeBaud();
+    return true;
 }
 
 // Poll LTE registration (AT+CEREG, with AT+CGREG fallback) every pollMs until the
-// network is available, up to maxWaitMs — then read RSSI (AT+CSQ). Safe to call while
-// disconnected (no PPP, so AT commands don't collide). This replaces fixed dead-waits
-// in the reconnect loop: a redial fires the MOMENT coverage returns, not after a timer.
+// network is available, up to maxWaitMs. Safe to call while disconnected (no PPP,
+// so AT commands don't collide). This replaces fixed dead-waits in the reconnect
+// loop: a redial fires the MOMENT coverage returns, not after a timer.
 // Returns as soon as registered (registered=true) or when maxWaitMs elapses.
+// rssi is read (AT+CSQ) on every poll — it is valid even before registration (a
+// camped cell reports RSSI), and a non-99 value while unregistered is the "can
+// the radio see ANY network" evidence the reconnect loop feeds into the
+// factory-reset cadence (modemReconnectPlan signalSeen).
 struct ModemSignalWait { bool registered; int rssi; };  // rssi: CSQ 0-31, 99/NA unknown
 inline ModemSignalWait modemWaitForSignal(uint32_t maxWaitMs, uint32_t pollMs) {
     ModemSignalWait r = { false, 99 };
@@ -132,15 +239,13 @@ inline ModemSignalWait modemWaitForSignal(uint32_t maxWaitMs, uint32_t pollMs) {
             (strstr(resp, ",1") || strstr(resp, ",5"))) r.registered = true;
         else if (modem_at_cmd("AT+CGREG?", resp, sizeof(resp), 2000) > 0 &&
                  (strstr(resp, ",1") || strstr(resp, ",5"))) r.registered = true;
-        if (r.registered) {
-            if (modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000) > 0) {
-                char* p = strstr(resp, "+CSQ:");
-                int rssi = 99;
-                if (p) sscanf(p, "+CSQ: %d", &rssi);
-                r.rssi = rssi;
-            }
-            return r;  // coverage is back — retry immediately
+        if (modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000) > 0) {
+            char* p = strstr(resp, "+CSQ:");
+            int rssi = 99;
+            if (p) sscanf(p, "+CSQ: %d", &rssi);
+            if (rssi != 99) r.rssi = rssi;
         }
+        if (r.registered) return r;  // coverage is back — retry immediately
         if (waited >= maxWaitMs) return r;
         if (g_hal && g_hal->clock) g_hal->clock->delay_ms(pollMs);
         waited += pollMs;
@@ -185,8 +290,12 @@ inline ModemReconnectResult modemReconnect(bool resetRadio = true) {
         g_hal->clock->delay_ms(10000);
         modem_at_cmd("AT+CFUN=1", resp, sizeof(resp), 5000);
         g_hal->clock->delay_ms(5000);
-        // Both modem and host are now at 115200. The baud upgrade will happen
-        // on the next boot (modemAtSync + baud upgrade sequence in modemTask).
+        // Both modem and host are now at 115200. Negotiate back to full speed
+        // NOW — this used to wait for the next boot, which left every session
+        // after a radio reset limping at 115200 (~10 KB/s). After a long
+        // out-of-coverage stretch (a flight), the session that follows this
+        // reconnect is exactly the one that must upload fast (taxi-in).
+        modemUpgradeBaud();
     } else {
         // Soft reconnect — no radio reset, but always escape PPP data mode first.
         // After a reconnect attempt that got CONNECT but failed IPCP, the modem
