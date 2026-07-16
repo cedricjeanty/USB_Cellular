@@ -45,6 +45,9 @@ public:
                                    // apnSet (the "T-Mobile, no bars, no data" field failure). Cleared
                                    // by AT+COPS=0 (automatic operator reselection) — the firmware's remedy.
     int         baudRate = 115200;  // tracks actual baud (persisted via AT+IPR, like real SIM7600 NVS)
+    int         csq99Count = 0;     // answer the next N AT+CSQ with 99 (models the real
+                                    // SIM7600's brief unknown-RSSI window right after
+                                    // registration that stuck rssi=99 for a whole session)
 
     // Flaky-link injection (marginal-cellular simulation, e.g. an approach window).
     // When >0, that percentage of forwarded IP packets are dropped in BOTH
@@ -284,7 +287,9 @@ private:
             respond("OK");
         } else if (upper == "AT+CSQ") {
             char buf[32];
-            snprintf(buf, sizeof(buf), "+CSQ: %d,%d", rssi, ber);
+            int reported = rssi;
+            if (csq99Count > 0) { csq99Count--; reported = 99; }
+            snprintf(buf, sizeof(buf), "+CSQ: %d,%d", reported, ber);
             respond(buf);
             respond("OK");
         } else if (upper == "AT+CESQ") {

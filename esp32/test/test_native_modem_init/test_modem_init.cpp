@@ -213,6 +213,19 @@ void test_init_weak_signal(void) {
     TEST_ASSERT_TRUE(r.connected);
 }
 
+void test_init_csq99_retried(void) {
+    // Real SIM7600: the first CSQ right after registration can read 99 even on
+    // a strong link. Without the retry the bogus 99 stuck for the whole session
+    // (2026-07-15 flight: rssi=99 all day, RSRP -74). One retry must recover it.
+    s_modem->rssi = 21;
+    s_modem->csq99Count = 1;   // first CSQ query answers 99, then real value
+
+    modemAtSync();
+    ModemInitResult r = modemRunInit();
+    TEST_ASSERT_EQUAL_INT_MESSAGE(21, r.rssi, "retry must pick up the real RSSI");
+    TEST_ASSERT_TRUE(r.connected);
+}
+
 void test_init_different_operator(void) {
     s_modem->operatorName = "AT&T";
 
@@ -250,6 +263,25 @@ void test_reconnect_sets_apn(void) {
     TEST_ASSERT_TRUE(rr.connected);  // would FAIL without AT+CGDCONT in reconnect
     TEST_ASSERT_TRUE(rr.rssi > 0 && rr.rssi < 99);
     TEST_ASSERT_TRUE(rr.operatorName[0] != '\0');
+}
+
+void test_reconnect_reports_link_metrics(void) {
+    // The landing reconnect must record WHAT link it got (band/RSRP/SINR) —
+    // the 2026-07-15 flight log only had CSQ, leaving the descent link quality
+    // unknowable. Metrics are read in command mode before the redial.
+    s_modem->rsrpIdx = 45;   // -96 dBm
+    s_modem->rsrqIdx = 20;   // -10 dB
+    s_modem->sinr    = 5;
+    s_modem->band    = "EUTRAN-BAND12";
+
+    modemAtSync();
+    ModemReconnectResult rr = modemReconnect(false);   // soft reconnect
+    TEST_ASSERT_TRUE(rr.registered);
+    TEST_ASSERT_EQUAL_INT(45 - 141, rr.rsrp);          // -96 dBm
+    TEST_ASSERT_EQUAL_INT((20 / 2) - 20, rr.rsrq);     // -10 dB
+    TEST_ASSERT_EQUAL_INT(5, rr.sinr);
+    TEST_ASSERT_EQUAL_STRING("EUTRAN-BAND12", rr.band);
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, rr.baud, "soft reconnect leaves UART untouched");
 }
 
 void test_reconnect_without_apn_fails(void) {
@@ -329,6 +361,8 @@ void test_radio_reset_reconnect_restores_baud(void) {
     TEST_ASSERT_TRUE(rr.connected);
     TEST_ASSERT_EQUAL_INT_MESSAGE(3000000, s_modem->baudRate,
         "radio-reset reconnect must re-upgrade the baud, not stay at 115200");
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(3000000, rr.baud,
+        "result must report the renegotiated baud for the log");
 }
 
 void test_factory_reset_recover_full_speed(void) {
@@ -397,6 +431,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_init_no_registration);
     RUN_TEST(test_init_roaming);
     RUN_TEST(test_init_weak_signal);
+    RUN_TEST(test_init_csq99_retried);
     RUN_TEST(test_init_different_operator);
     RUN_TEST(test_init_time_sync);
     RUN_TEST(test_init_signal_metrics_custom);
@@ -409,6 +444,7 @@ int main(int argc, char** argv) {
 
     // Reconnect
     RUN_TEST(test_reconnect_sets_apn);
+    RUN_TEST(test_reconnect_reports_link_metrics);
     RUN_TEST(test_reconnect_without_apn_fails);
     RUN_TEST(test_stranded_carrier_recovered_by_cops);
     RUN_TEST(test_radio_reset_reconnect_restores_baud);

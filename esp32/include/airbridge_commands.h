@@ -46,6 +46,7 @@ enum CmdType {
     CMD_COMPRESS,    // gzip .eaofh into the upload queue        — runtime-safe (takes effect next harvest)
     CMD_MODEM_RESET, // full modem factory reset (clear band/operator lock + reboot module) — runtime-safe
     CMD_FLASH,       // download firmware from S3 to P2 + SD-flash (OTA-independent remote reflash) — runtime-safe
+    CMD_REPRESENT,   // re-present USB after a successful harvest (DSU re-dump trigger) — runtime-safe
 };
 
 struct Command {
@@ -71,6 +72,7 @@ inline CmdType cmdVerbType(const char* verb, bool* runtimeSafe) {
         { "modem_reset", CMD_MODEM_RESET, true },
         { "flash",     CMD_FLASH,     true  },
         { "modemreset",  CMD_MODEM_RESET, true },
+        { "represent", CMD_REPRESENT, true  },
     };
     for (auto& e : table) {
         if (strcmp(verb, e.v) == 0) { if (runtimeSafe) *runtimeSafe = e.rt; return e.t; }
@@ -304,6 +306,13 @@ inline bool cmdWriteFile(const char* path, const char* text) {
 // (~1.8x fewer cellular bytes); the S3 consumer gunzips. `compress off` disables it.
 inline bool g_compress = true;
 
+// Re-present flag: after a harvest that moved >=1 file, drop + re-present the USB
+// drive so the DSU re-enumerates, re-reads the (just-advanced) cookie, and may dump
+// the NEXT flight in the same power session — the DSU only initiates a transfer at
+// enumeration, so without this the just-flown flight waits for the next avionics
+// power cycle (2026-07-15 flight). DEFAULT ON; `represent off` is the kill-switch.
+inline bool g_represent = true;
+
 struct CmdRunResult {
     bool ran;        // at least one directive executed
     bool reboot;     // a reboot directive ran (caller esp_restart)
@@ -378,6 +387,11 @@ inline CmdRunResult runCommandTextBuffer(const char* text, bool runtimeOnly,
                 g_compress = (strstr(c.args, "off") == nullptr);
                 airbridge_log("CMD: compress %s (gzip .eaofh into upload queue)",
                               g_compress ? "ON" : "OFF");
+                break;
+            case CMD_REPRESENT:
+                g_represent = (strstr(c.args, "off") == nullptr);
+                airbridge_log("CMD: represent %s (USB re-present after harvest)",
+                              g_represent ? "ON" : "OFF");
                 break;
             default: airbridge_log("CMD: unknown directive '%s'", c.verb); break;
         }

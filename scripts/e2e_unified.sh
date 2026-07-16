@@ -1280,6 +1280,48 @@ else
     skip "TEST 26: staged-cookie advance — emulator-only"
 fi
 
+# ── TEST 27: Post-harvest USB re-present (DSU re-dump in one session) ─────────
+log ""; log "TEST 27: post-harvest USB re-present invites a second DSU dump (same session)"
+# The DSU only initiates a transfer at enumeration, so a flight flown after
+# power-on waits for the NEXT avionics power cycle (2026-07-15 flight). After a
+# harvest that moved files the firmware drops + re-presents USB so the DSU
+# re-reads the just-advanced cookie and may dump the next flight immediately.
+# Emulator model: the re-present marker fires after the harvest; this harness
+# plays the DSU by answering the marker with the next flight. The `represent
+# off` kill-switch and self-termination (0 files → no re-present) are covered
+# by test_native_harvest/test_native_commands.
+if [ "$TARGET" = "emulator" ]; then
+    rm -rf "$SD_INT/upload" "$SD_EMU/flightHistory"
+    rm -f "$SD_EMU"/*.easdf "$FW_DIR/emu_nvs.dat"
+    cleanup_aircraft_s3 "$SERIAL"
+    start_device 5
+
+    # Flight A → harvest → the re-present marker must fire.
+    m=$(log_mark)
+    write_dsu_file "01710" 200
+    if wait_for_log "Re-presenting drive after harvest" "$m" 120 "re-present marker"; then
+        pass "Re-present: fired after a harvest that moved files"
+    else
+        fail "Re-present: no marker after a successful harvest"
+    fi
+
+    # Play the DSU: answer the fresh enumeration with the next flight — it must
+    # harvest AND upload in the SAME power session.
+    m2=$(log_mark)
+    write_dsu_file "01711" 200
+    if wait_for_upload_complete "01711" "$m2" 180 "01711 upload" \
+       && [ "$(get_manifest_hwm "$SERIAL")" -ge 1711 ]; then
+        pass "Re-present: second dump harvested + uploaded same session (hwm=$(get_manifest_hwm "$SERIAL"))"
+    else
+        fail "Re-present: second dump did not upload (hwm=$(get_manifest_hwm "$SERIAL"))"
+    fi
+
+    stop_device
+    cleanup_aircraft_s3 "$SERIAL"
+else
+    skip "TEST 27: DSU re-dump response is the hardware/field experiment itself"
+fi
+
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 log ""; log "Cleaning up..."
 if [ "$TARGET" = "emulator" ]; then

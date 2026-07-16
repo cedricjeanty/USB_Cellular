@@ -302,6 +302,22 @@ void test_harvest_should_advance_cookie(void) {
     TEST_ASSERT_FALSE(harvestShouldAdvanceCookie(3, false, 1257, false));
 }
 
+// harvestShouldRepresentUsb: a completed harvest that moved data invites the DSU
+// to re-enumerate and dump the NEXT flight in the same power session (the DSU only
+// initiates transfers at enumeration — 2026-07-15 flight). Must self-terminate
+// (0 files → no re-present) or an up-to-date DSU would loop forever.
+void test_harvest_should_represent_usb(void) {
+    // Completed harvest with files → re-present.
+    TEST_ASSERT_TRUE(harvestShouldRepresentUsb(1, /*incomplete*/false, /*enabled*/true));
+    TEST_ASSERT_TRUE(harvestShouldRepresentUsb(5, false, true));
+    // Nothing moved (DSU had nothing newer) → cycle ends.
+    TEST_ASSERT_FALSE(harvestShouldRepresentUsb(0, false, true));
+    // Incomplete harvest → the retry path still owns the volume.
+    TEST_ASSERT_FALSE(harvestShouldRepresentUsb(3, true, true));
+    // `represent off` kill-switch.
+    TEST_ASSERT_FALSE(harvestShouldRepresentUsb(3, false, false));
+}
+
 // ── Test runner ─────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -309,6 +325,7 @@ int main(int argc, char** argv) {
 
     RUN_TEST(test_recovery_cookie_backoff);
     RUN_TEST(test_harvest_should_advance_cookie);
+    RUN_TEST(test_harvest_should_represent_usb);
     RUN_TEST(test_harvest_empty_dir);
     RUN_TEST(test_harvest_single_file);
     RUN_TEST(test_harvest_skips_system_files);

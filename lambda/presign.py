@@ -82,6 +82,7 @@ def respond(status, body):
 _CMD_VERBS = {
     "cdc", "dump_logs", "dumplogs", "reboot", "format_sd",
     "wifi", "s3", "survey", "compress", "modem_reset", "modemreset", "flash",
+    "represent",
 }
 # Directives that mutate/erase or need USB re-enumeration — surfaced to the UI so the
 # operator gets a confirm prompt. Not a security boundary (WAF/IP is), just guardrails.

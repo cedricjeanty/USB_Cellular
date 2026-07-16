@@ -64,13 +64,25 @@ inline ModemTxResult modemBoundedTx(const ModemTxOps& ops, const void* data,
     return r;
 }
 
-// Result of modem reconnect
+// Result of modem reconnect. Link metrics (rsrp/rsrq/sinr/band) are read once
+// registered — a real flight's landing reconnect must leave evidence of what
+// link it actually got (2026-07-15 flight: log only had CSQ, so band/quality of
+// the descent reconnect was unknowable). baud is 0 for a soft reconnect (UART
+// untouched) and the negotiated rate after a radio-reset re-upgrade.
 struct ModemReconnectResult {
     bool connected;
     int  rssi;
     char operatorName[32];
     bool registered;
+    int  rsrp, rsrq, sinr;   // dBm/dB, MODEM_SIG_NA = unavailable
+    char band[16];           // LTE band token from CPSI (empty = unknown)
+    uint32_t baud;           // post-radio-reset negotiated baud (0 = soft, unchanged)
+    bool hwFlow;             // HW flow control active at that baud
 };
+
+// Defined below (parse helpers shared with init/survey paths).
+inline void parseCesq(const char* resp, int* rsrpOut, int* rsrqOut);
+inline void parseCpsi(const char* resp, char* band, size_t bandSz, int* sinrOut);
 
 // Reconnect escalation plan derived from the consecutive-failure count — the
 // pure decision logic the modem task's pump loop runs (the AT sequence itself
@@ -270,6 +282,7 @@ inline ModemSignalWait modemWaitForSignal(uint32_t maxWaitMs, uint32_t pollMs) {
 // always time out on T-Mobile/Hologram LTE-only SIMs.
 inline ModemReconnectResult modemReconnect(bool resetRadio = true) {
     ModemReconnectResult r = {};
+    r.rsrp = r.rsrq = r.sinr = MODEM_SIG_NA;
     char resp[256];
 
     if (resetRadio) {
@@ -295,7 +308,9 @@ inline ModemReconnectResult modemReconnect(bool resetRadio = true) {
         // after a radio reset limping at 115200 (~10 KB/s). After a long
         // out-of-coverage stretch (a flight), the session that follows this
         // reconnect is exactly the one that must upload fast (taxi-in).
-        modemUpgradeBaud();
+        ModemBaudResult br = modemUpgradeBaud();
+        r.baud = br.baud;
+        r.hwFlow = br.hwFlow;
     } else {
         // Soft reconnect — no radio reset, but always escape PPP data mode first.
         // After a reconnect attempt that got CONNECT but failed IPCP, the modem
@@ -352,6 +367,14 @@ inline ModemReconnectResult modemReconnect(bool resetRadio = true) {
             if (rssi != 99) r.rssi = rssi;
         }
     }
+
+    // Read richer LTE link metrics — RSRP/RSRQ (CESQ) + band/SINR (CPSI).
+    // Command mode, pre-redial, so no PPP disruption. Best-effort: stays
+    // MODEM_SIG_NA / empty if unsupported.
+    if (modem_at_cmd("AT+CESQ", resp, sizeof(resp), 2000) > 0)
+        parseCesq(resp, &r.rsrp, &r.rsrq);
+    if (modem_at_cmd("AT+CPSI?", resp, sizeof(resp), 2000) > 0)
+        parseCpsi(resp, r.band, sizeof(r.band), &r.sinr);
 
     // Read operator
     if (modem_at_cmd("AT+COPS?", resp, sizeof(resp), 2000) > 0) {
@@ -563,12 +586,22 @@ inline void modemRegisterAndReadSignal(ModemInitResult& r) {
         g_hal->clock->delay_ms(1000);
     }
 
-    // Read RSSI
+    // Read RSSI. CSQ=99 can appear briefly right after registration (the first
+    // read races AUTOCSQ) — without a retry the bogus 99 sticks for the whole
+    // session (2026-07-15 flight: STATUS showed rssi=99 all day while RSRP was
+    // a healthy -74). Retry once after a short settle, like modemReconnect.
     modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000);
     {
         char* p = strstr(resp, "+CSQ:");
         if (p) sscanf(p, "+CSQ: %d", &r.rssi);
         else r.rssi = 99;
+        if (r.rssi == 99) {
+            g_hal->clock->delay_ms(3000);
+            if (modem_at_cmd("AT+CSQ", resp, sizeof(resp), 2000) > 0) {
+                p = strstr(resp, "+CSQ:");
+                if (p) sscanf(p, "+CSQ: %d", &r.rssi);
+            }
+        }
     }
 
     // Read richer LTE signal quality — RSRP/RSRQ (CESQ) + band/SINR (CPSI).

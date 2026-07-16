@@ -84,6 +84,24 @@ void test_parse_compress(void) {
     TEST_ASSERT_EQUAL_STRING("off", c.args);
 }
 
+void test_parse_represent(void) {
+    Command c;
+    TEST_ASSERT_TRUE(cmdParseLine("represent", &c));
+    TEST_ASSERT_EQUAL(CMD_REPRESENT, c.type);
+    TEST_ASSERT_TRUE(c.runtimeSafe);   // takes effect at the next harvest, no reboot
+    TEST_ASSERT_TRUE(cmdParseLine("represent off", &c));
+    TEST_ASSERT_EQUAL(CMD_REPRESENT, c.type);
+    TEST_ASSERT_EQUAL_STRING("off", c.args);
+    // Executor parity with `compress`: bare = on, "off" = off. Default is ON.
+    TEST_ASSERT_TRUE(g_represent);
+    CmdRunResult r = runCommandTextBuffer("represent off\n", false, "", "", "", nullptr, 0, false);
+    TEST_ASSERT_TRUE(r.ran);
+    TEST_ASSERT_FALSE(g_represent);
+    r = runCommandTextBuffer("represent on\n", false, "", "", "", nullptr, 0, false);
+    TEST_ASSERT_TRUE(r.ran);
+    TEST_ASSERT_TRUE(g_represent);
+}
+
 void test_parse_modem_reset(void) {
     Command c;
     TEST_ASSERT_TRUE(cmdParseLine("modem_reset", &c));
@@ -249,6 +267,7 @@ int main(int, char**) {
     RUN_TEST(test_parse_args_with_once);
     RUN_TEST(test_parse_survey);
     RUN_TEST(test_parse_compress);
+    RUN_TEST(test_parse_represent);
     RUN_TEST(test_parse_modem_reset);
     RUN_TEST(test_parse_flash);
     RUN_TEST(test_parse_unknown_verb);

@@ -4,7 +4,7 @@
 // Build: cd esp32 && ~/.local/bin/pio run
 // Flash: 1200-baud touch on CDC port, then pio run -t upload
 
-#define FW_VERSION "20260713085000"
+#define FW_VERSION "20260716073500"
 
 #include <cstring>
 #include <ctime>
@@ -367,6 +367,8 @@ static volatile uint32_t g_lastIoMs         = 0;
 static volatile uint32_t g_lastWriteMs      = 0;
 static volatile bool     g_writeDetected    = false;
 static volatile bool     g_harvesting       = false;
+static volatile bool     g_usbRepresentReq  = false;   // harvest asks the main loop to drop +
+                                                       // re-present USB (DSU re-dump trigger)
 static volatile bool     g_msc_ejected      = false;  // soft eject for harvest
 
 static uint16_t g_filesQueued    = 0;
@@ -2758,12 +2760,28 @@ static void modemTask(void* param) {
                        s_reconnect_failures + 1, doRadioReset ? "full reset" : "soft");
             ModemReconnectResult rr = modemReconnect(doRadioReset);
 
+            // A radio-reset attempt renegotiated the UART — record what it got
+            // (proves the post-flight session is at full speed, not 115200).
+            if (rr.baud) {
+                log_write("Modem: post-reset baud %lu%s", (unsigned long)rr.baud,
+                          rr.hwFlow ? " + HW FC" : " (no HW FC)");
+                cdc_printf("Modem: post-reset baud %lu (HW FC %s)\r\n",
+                           (unsigned long)rr.baud, rr.hwFlow ? "on" : "off");
+            }
             if (rr.registered) {
                 s_signal_seen = true;
                 g_modemRssi = rr.rssi;
+                // Refresh the link metrics too — STATUS lines and the display
+                // otherwise show boot-time values for the rest of the session.
+                g_modemRsrp = rr.rsrp; g_modemRsrq = rr.rsrq; g_modemSinr = rr.sinr;
+                if (rr.band[0]) strlcpy(g_modemBand, rr.band, sizeof(g_modemBand));
                 strlcpy(g_modemOp, rr.operatorName, sizeof(g_modemOp));
-                log_write("Reconnect: rssi=%d op=%s", rr.rssi, rr.operatorName);
-                cdc_printf("Modem: reconnect rssi=%d op=%s\r\n", rr.rssi, rr.operatorName);
+                log_write("Reconnect: rssi=%d rsrp=%d rsrq=%d sinr=%d band=%s op=%s",
+                          rr.rssi, rr.rsrp, rr.rsrq, rr.sinr,
+                          rr.band[0] ? rr.band : "?", rr.operatorName);
+                cdc_printf("Modem: reconnect rssi=%d rsrp=%d sinr=%d band=%s op=%s\r\n",
+                           rr.rssi, rr.rsrp, rr.sinr,
+                           rr.band[0] ? rr.band : "?", rr.operatorName);
             }
 
             if (rr.connected) {
@@ -3844,6 +3862,17 @@ static void doHarvest() {
              count, g_harvestCoolMs / 1000);
 
     if (count > 0 && g_upload_task) xTaskNotifyGive(g_upload_task);
+
+    // Post-harvest USB re-present (DSU re-dump trigger): request the main loop
+    // drop + re-raise D+ so the DSU re-enumerates and re-reads the advanced
+    // cookie. MSC-only builds only — a CDC bench unit re-enumerating would cut
+    // the serial tap mid-E2E. Shared predicate (self-terminating, `represent
+    // off` kill-switch); the media eject/re-insert above is apparently NOT a
+    // strong enough signal for the DSU to start a new dump cycle.
+    if (g_msc_only && g_sd_ready &&
+        harvestShouldRepresentUsb((int)count, harvestIncomplete, g_represent)) {
+        g_usbRepresentReq = true;
+    }
 }
 
 static void harvestTask(void* param) {
@@ -4178,6 +4207,31 @@ static void main_loop_task(void* param) {
                 if (g_harvest_task) xTaskNotifyGive(g_harvest_task);
             }
         }
+        // ── Post-harvest USB re-present (DSU re-dump trigger) ────────────
+        // Drop D+ for a few seconds, then re-raise it: the host sees a fresh
+        // device, re-enumerates, and the DSU re-reads the cookie the harvest
+        // just advanced — inviting it to dump the NEXT flight in the same
+        // power session. Requested by doHarvest (MSC-only, successful harvest,
+        // `represent` on). The gap must be long enough for the host to fully
+        // register the unplug.
+        {
+            #define USB_REPRESENT_GAP_MS 3000
+            static uint32_t representDropMs = 0;
+            if (g_usbRepresentReq && representDropMs == 0 && g_sd_ready && !g_harvesting) {
+                g_usbRepresentReq = false;
+                log_write("USB: dropping for post-harvest re-present");
+                cdc_printf("USB: re-present drop\r\n");
+                tud_disconnect();
+                representDropMs = now;
+            }
+            if (representDropMs != 0 && now - representDropMs >= USB_REPRESENT_GAP_MS) {
+                representDropMs = 0;
+                tud_connect();
+                log_write("USB: re-presented after harvest — DSU may dump next flight");
+                cdc_printf("USB: re-presented (post-harvest)\r\n");
+            }
+        }
+
         // Periodic STATUS log (every 60s) — replaces CLI STATUS command
         {
             static uint32_t lastStatusMs = 0;

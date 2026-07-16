@@ -1382,6 +1382,17 @@ int main(int argc, char* argv[]) {
             s_harvestCoolMs = QUIET_WINDOW_MS;
             s_harvesting = false;
 
+            // Post-harvest USB re-present (DSU re-dump trigger) — emulator model:
+            // there's no real D+ to toggle, so emit the same marker the firmware
+            // logs after tud_connect(). The E2E harness plays the DSU: on this
+            // marker it may write the next flight (which the file watcher above
+            // picks up like any host write). Shared predicate = same gating as
+            // the firmware (successful harvest only, `represent off` disables).
+            if (harvestShouldRepresentUsb((int)r.count, false, g_represent)) {
+                printf("[USB] Re-presenting drive after harvest (DSU re-dump window)\n");
+                airbridge_log("USB: re-presented after harvest — DSU may dump next flight");
+            }
+
             // Auto-upload if connected (new harvest or pending from previous session)
             if (ds.pppConnected && (r.count > 0 || ds.mbQueued > 0.001f) && !s_uploading) {
                 s_uploading = true;

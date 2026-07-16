@@ -61,6 +61,7 @@ lives in `esp32/include/airbridge_commands.h` (unit-tested in `test/test_native_
 | `s3 <api_host> <api_key>` | Save S3 creds (NVS) | runtime-safe |
 | `survey` | Antenna signal-survey mode (see below) | boot-only |
 | `compress [on\|off]` | gzip `.eaofh` into the upload queue at harvest (~3x fewer bytes over cellular; ROM miniz `tdefl` in PSRAM). Default OFF — the S3 consumer must `gunzip` the objects | runtime-safe (next harvest) |
+| `represent [on\|off]` | Re-present the USB drive (drop + re-raise D+ for ~3s) after every harvest that moved files, so the DSU re-enumerates, re-reads the advanced cookie, and may dump the NEXT flight in the same power session (post-landing taxi-in upload of the just-flown flight). Default ON; self-terminating — a harvest that moves nothing doesn't re-present. MSC-only builds only (CDC builds skip: re-enumeration would cut the bench serial tap) | runtime-safe (next harvest) |
 | `flash` | **OTA-independent remote reflash.** Downloads the staged `firmware/latest.bin` (same as OTA — bump `latest.json` version to force it) into P2 `firmware.bin`, then reboots into the boot-time SD-flash path, which writes the sibling of the *running* partition. Survives a wedged `ota_data` / dead OTA slot that breaks the normal OTA path — so a unit reachable over cellular can always be reflashed without USB/BOOT. Acks `"flash":true` | runtime-safe |
 
 The file is processed at **boot** (`check_p1_magic()` for P1, the P2 magic block) **and during

@@ -66,6 +66,20 @@ inline bool harvestShouldAdvanceCookie(int filesHarvested, bool harvestIncomplet
     return filesHarvested > 0 && !harvestIncomplete && maxFlight > 0 && hasDsuSerial;
 }
 
+// Should the USB drive be dropped + re-presented after this harvest? The DSU only
+// initiates a transfer at enumeration (cookie read), so a completed harvest that
+// moved data invites a re-dump: the DSU re-enumerates, sees the just-advanced
+// cookie, and may send the NEXT flight in the same power session — without this,
+// a flight flown after power-on waits for the next avionics power cycle
+// (2026-07-15 flight). Self-terminating: a harvest that moved nothing (DSU had
+// nothing newer) does not re-present, so an up-to-date DSU ends the cycle. An
+// incomplete harvest must NOT re-present — its retry path still owns the volume.
+// `enabled` is the `represent` directive (g_represent, default on).
+inline bool harvestShouldRepresentUsb(int filesHarvested, bool harvestIncomplete,
+                                      bool enabled) {
+    return enabled && filesHarvested > 0 && !harvestIncomplete;
+}
+
 // HAL filesys adapter for the record parsers — moved to hal/log_reader.h so
 // airbridge_s3.h can share it (delta split's firstRecordFromLog) without a
 // harvest.h ↔ s3.h include cycle.
