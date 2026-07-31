@@ -43,18 +43,30 @@ Device→aircraft mapping relies on the **`serial` field added to the heartbeat*
 (`main.cpp`, from NVS `mfst/serial`). Until a device ships that firmware, its aircraft
 shows "unassigned" — everything else works.
 
-## Security model — private by network, not by secret
+## Hosting modes
 
-A purely static SPA has no server to hold a secret, so the operator API key lives in the
-browser (localStorage). That is only safe because **access is locked to your network**:
-WAF IP-allowlists gate *both* CloudFront (the page) and the API Gateway (the data) to your
-Tailscale exit / home egress IP. Off-network, the key is inert. Do **not** make either the
-CloudFront distribution or the API stage openly public with this model — add Cognito first
-if you ever need public access.
+### Proxy mode (deployed, 2026-07-31) — behind the EA500 platform
 
-> Recommended: mint a **separate operator API key** in the API Gateway usage plan (distinct
-> from the device firmware key) so you can revoke dashboard access without reflashing the
-> fleet.
+The production deployment serves this SPA from the EA500 Flight Data Platform
+(ea500data.com) at `/fleet`. The page itself is public (EA500 idiom: public page shells,
+auth on the data); all authority lives on the proxy API, which requires the EA500 bearer
+token plus admin-allowlist membership. The vendored copy (`EA500/templates/fleet.html`)
+adds two meta tags:
+`<meta name="airbridge-api-base" content="/api/airbridge">` (switches the SPA to keyless
+same-origin calls) and `<meta name="airbridge-bearer-key" content="ea500_token">` (SPA
+sends `Authorization: Bearer <localStorage token>` and redirects to `/login` when signed
+out). A Flask proxy (`EA500/ea500/fleet_proxy.py`) forwards whitelisted paths (`/fleet`,
+`/admin/*`) to API Gateway and holds the operator key server-side (`airbridge-operator`
+key, revocable independently of the device firmware key). To update the deployed
+dashboard: re-copy `index.html` over `EA500/templates/fleet.html` and re-add the meta
+tags.
+
+### Standalone mode — private by network, not by secret
+
+Without the meta tag, the SPA runs standalone: the operator API key lives in the browser
+(localStorage). That is only safe if **access is locked to your network** (e.g. WAF
+IP-allowlists gating both the page and the API Gateway stage). Do **not** host it openly
+public in this mode.
 
 ## Deploy
 

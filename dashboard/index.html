@@ -249,7 +249,7 @@ select{background:var(--ground); color:var(--ink); border:1px solid var(--line);
 <div class="modal" id="cfgmodal">
   <div class="card">
     <h2>Connection settings</h2>
-    <p class="hint">Stored in this browser only. Because the fleet API is locked to your network (WAF / VPN), the key is safe here.</p>
+    <p class="hint" id="cfg-hint">Stored in this browser only. Because the fleet API is locked to your network (WAF / VPN), the key is safe here.</p>
     <div class="field"><label for="cfg-base">API base URL</label>
       <input type="text" id="cfg-base" placeholder="https://xxxx.execute-api.us-west-2.amazonaws.com/prod"></div>
     <div class="field"><label for="cfg-key">x-api-key</label>
@@ -266,9 +266,22 @@ select{background:var(--ground); color:var(--ink); border:1px solid var(--line);
 
 <script>
 /* ============================== config ============================== */
+/* Proxy mode: a host page (e.g. the EA500 server) injects
+   <meta name="airbridge-api-base" content="/api/airbridge"> and holds the
+   operator key server-side. The meta wins over any stored standalone config.
+   If the host's API authenticates with a bearer token kept in localStorage
+   (EA500 style), it also injects <meta name="airbridge-bearer-key"
+   content="ea500_token"> (+ optional airbridge-login-path, default /login):
+   the SPA then sends Authorization: Bearer <token> and bounces to the login
+   page when the token is missing or rejected. */
+const META=n=>(document.querySelector('meta[name="'+n+'"]')||{}).content||"";
+const PROXY_BASE=META("airbridge-api-base");
+const PROXY_BEARER_KEY=META("airbridge-bearer-key");
+const PROXY_LOGIN=META("airbridge-login-path")||"/login";
 const CFG_KEY="airbridge_dash_cfg";
 let CONFIG=Object.assign({apiBase:"",apiKey:"",refreshMs:30000},
   JSON.parse(localStorage.getItem(CFG_KEY)||"{}"));
+if(PROXY_BASE){CONFIG.apiBase=PROXY_BASE; CONFIG.apiKey="";}
 const MOCK=()=>CONFIG.apiBase.trim()==="";
 
 /* directive catalog — mirrors airbridge_commands.h verbs */
@@ -315,7 +328,16 @@ function sigLevel(rsrp){
 async function api(path,opts={}){
   if(MOCK()) return mockApi(path,opts);
   const url=CONFIG.apiBase.replace(/\/$/,"")+path;
-  const r=await fetch(url,Object.assign({headers:{"x-api-key":CONFIG.apiKey,"Content-Type":"application/json"}},opts));
+  const headers={"Content-Type":"application/json"};
+  if(CONFIG.apiKey)headers["x-api-key"]=CONFIG.apiKey;
+  if(PROXY_BEARER_KEY){
+    const t=localStorage.getItem(PROXY_BEARER_KEY);
+    if(!t){location.href=PROXY_LOGIN; throw new Error("signed out");}
+    headers["Authorization"]="Bearer "+t;
+  }
+  const r=await fetch(url,Object.assign({headers},opts));
+  if(r.status===401&&PROXY_BEARER_KEY){location.href=PROXY_LOGIN; throw new Error("signed out");}
+  if(r.status===403&&PROXY_BEARER_KEY)throw new Error("This account is not authorized for fleet access");
   if(!r.ok){let e; try{e=(await r.json()).error;}catch{} throw new Error(e||("HTTP "+r.status));}
   return r.json();
 }
@@ -607,14 +629,20 @@ async function pollAck(device,dr){
 
 /* ============================== config modal ============================== */
 function openCfg(){$("#cfg-base").value=CONFIG.apiBase; $("#cfg-key").value=CONFIG.apiKey;
-  $("#cfg-refresh").value=(CONFIG.refreshMs/1000); $("#cfgmodal").classList.add("open");}
+  $("#cfg-refresh").value=(CONFIG.refreshMs/1000);
+  $("#cfg-base").disabled=$("#cfg-key").disabled=!!PROXY_BASE;
+  if(PROXY_BASE)$("#cfg-hint").textContent="Served through the host site's sign-in — the API key stays on the server. Only auto-refresh is configurable here.";
+  $("#cfgmodal").classList.add("open");}
 $("#btn-config").onclick=openCfg; $("#demo-config").onclick=openCfg;
 $("#cfg-cancel").onclick=()=>$("#cfgmodal").classList.remove("open");
 $("#cfg-save").onclick=()=>{
-  CONFIG.apiBase=$("#cfg-base").value.trim();
-  CONFIG.apiKey=$("#cfg-key").value.trim();
+  if(!PROXY_BASE){
+    CONFIG.apiBase=$("#cfg-base").value.trim();
+    CONFIG.apiKey=$("#cfg-key").value.trim();
+  }
   CONFIG.refreshMs=Math.max(5,parseInt($("#cfg-refresh").value)||30)*1000;
-  localStorage.setItem(CFG_KEY,JSON.stringify(CONFIG));
+  localStorage.setItem(CFG_KEY,JSON.stringify(
+    PROXY_BASE?{refreshMs:CONFIG.refreshMs}:CONFIG));
   $("#cfgmodal").classList.remove("open");
   startPolling();
 };
